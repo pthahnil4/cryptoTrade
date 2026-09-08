@@ -1,0 +1,63 @@
+# ============================================================
+# cryptoTrade 版本控制忽略清单
+# 原则：源码 + 配置 + 文档入库；运行期产物（日志/缓存/状态）不入库
+# ============================================================
+
+# ---------- Python 运行缓存 ----------
+# 不带斜杠：同时覆盖目录形式和被误写成文件的 __pycache__
+__pycache__
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---------- 日志（运行期持续追加，会淹没 diff）----------
+*.log
+crypto/logs/
+logs/
+crypto/strategy.log
+
+# ---------- 运行期状态 / 可重建缓存 ----------
+# 交易执行器防重签名（进程运行时自己维护，误 checkout 会影响下单判断）
+crypto/task/utils/trade_state.json
+*.state.json
+# 合约规格 24h TTL 缓存
+data/instrument_spec_cache.json
+# 回测从交易所拉取的 K 线缓存（可重新下载）
+crypto/backtest/data_cache/
+# 邮件 HTML 预览生成物
+data/mail_preview/
+
+# ---------- 敏感连接串 / 实盘凭据 ----------
+# 远端 MySQL 完整连接串（含账号密码）。本地/服务器保留，不进版本库。
+# 若确实需要入库，删除下面这一行即可。
+data/db_url.txt
+# OKX 实盘 API 密钥（api_key/secret_key/passphrase 全明文）。这两份是运行必需
+# 文件，只不入库、不删除、不改名，程序照旧 import api_config。
+# 新环境搭配置请看脱敏模板：crypto/api_config.example.py 与
+# crypto/MACD_Smoothed_ADX_Pro3_Project/api_config.example.py（拷成 api_config.py 再填）。
+# 注意：这两份是两套独立结构（多账号注册表 / 单账号字典），要填两处。
+crypto/api_config.py
+crypto/MACD_Smoothed_ADX_Pro3_Project/api_config.py
+# SMTP 发件配置：内含发件邮箱 + QQ 邮箱授权码。本文件由 Web 页面生成——
+# 在「任务系统 → 邮件配置」保存一次就会整体重建（见 app.py POST
+# /api/task/config/email），因此只存本机不入库；模板见 email_config.example.py。
+crypto/task/config/email_config.py
+# InfluxDB 连接配置：两处硬写了长期有效的 API token + 服务器公网 IP。
+# ① influxdb_config.py 被 demo51~demo65 共 11 个脚本 import，是 demo 链路的配置
+#    入口，文件留本机不动；新环境按 influxdb_config.example.py 拷一份填 token。
+# ② influxdb2_fixed.py 是同一 token 的另一份拷贝，全项目 0 处引用（旧版自包含 demo）。
+# 交易运行链路完全不依赖这两份，不入库不影响实盘；如需入库，换占位符后 git add -f。
+crypto/demo/influxdb_config.py
+crypto/demo/influxdb2_fixed.py
+
+# ---------- 编辑器 / 系统 ----------
+.idea/
+.vscode/
+.qoder/
+.DS_Store
+Thumbs.db
+desktop.ini

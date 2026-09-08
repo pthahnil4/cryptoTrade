@@ -1,0 +1,100 @@
+<nav class="main-nav">
+    <div class="nav-inner">
+        <a href="/" class="nav-brand">MACD &amp; ADX Pro3</a>
+        <div class="nav-links">
+            {#- 行情类 -#}
+            <a href="/" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">📊 监控台</a>
+            <a href="/market-scan" class="nav-link {% if active_page == 'market-scan' %}active{% endif %}">🚀 趋势扫描</a>
+            <a href="/star-market" class="nav-link {% if active_page == 'star-market' %}active{% endif %}">⭐ 星标行情</a>
+            {#- 交易分析类 -#}
+            <a href="/analysis" class="nav-link {% if active_page == 'analysis' %}active{% endif %}">📝 分析记录</a>
+            <a href="/task" class="nav-link {% if active_page == 'task' %}active{% endif %}">⏰ 定时任务</a>
+            <a href="/alert" class="nav-link {% if active_page == 'alert' %}active{% endif %}">🚨 风险警报</a>
+            {#- 记录类 -#}
+            <a href="/plan" class="nav-link {% if active_page == 'plan' %}active{% endif %}">📋 任务计划</a>
+            <a href="/journal" class="nav-link {% if active_page == 'journal' %}active{% endif %}">✍️ 随笔复盘</a>
+            <a href="/calorie" class="nav-link {% if active_page == 'calorie' %}active{% endif %}">🔥 热量缺口</a>
+            {#- 系统类（低频，窄屏自动收进「更多▾」） -#}
+            <a href="/api-console" class="nav-link {% if active_page == 'api-console' %}active{% endif %}">🔌 API 接口</a>
+            <a href="/system-status" class="nav-link {% if active_page == 'system-status' %}active{% endif %}">🖥️ 系统状态</a>
+        </div>
+        <div class="nav-more" style="display:none">
+            <button type="button" class="nav-more-btn">更多 <span class="nav-more-caret">▼</span></button>
+            <div class="nav-more-menu"></div>
+        </div>
+    </div>
+</nav>
+
+{#- 分析纪律（批次11）全站注入点：nav.html 被所有页面 include，
+    在这里引入即可让「角标倒计时 / 贴顶横幅 / 声音通知」与
+    「一键批量快照弹窗」在任何页面都可用。两个模块均自包含：
+    自带样式、不依赖 MDialog（mdialog.js 并非每页都在 body 顶部加载）。 -#}
+<script src="{{ url_for('static', filename='js/analysis_quick.js') }}"></script>
+<script src="{{ url_for('static', filename='js/discipline.js') }}"></script>
+
+<script>
+(function () {
+    function initNavCollapse() {
+        var linksWrap = document.querySelector('.nav-links');
+        var moreBox = document.querySelector('.nav-more');
+        if (!linksWrap || !moreBox) return;
+        var moreBtn = moreBox.querySelector('.nav-more-btn');
+        var moreMenu = moreBox.querySelector('.nav-more-menu');
+        var allLinks = Array.prototype.slice.call(linksWrap.querySelectorAll('.nav-link'));
+        var GAP = 2; /* 与 .nav-links 的 gap 保持一致 */
+
+        function layout() {
+            /* 1. 全部恢复到主行，重新测量可用宽度 */
+            allLinks.forEach(function (a) { linksWrap.appendChild(a); });
+            moreBox.style.display = 'none';
+            moreBox.classList.remove('has-active');
+            var avail = linksWrap.getBoundingClientRect().width;
+            var widths = allLinks.map(function (a) { return a.getBoundingClientRect().width; });
+            var total = widths.reduce(function (s, w) { return s + w; }, 0) + GAP * (allLinks.length - 1);
+            if (total <= avail + 0.5) return; /* 全部放得下，无需收纳 */
+
+            /* 2. 空间不足：预留「更多」按钮位置后，计算主行能放几项 */
+            moreBox.style.display = '';
+            var btnW = moreBtn.getBoundingClientRect().width;
+            var linkAvail = avail - btnW - 10;
+            var used = 0, keep = 0;
+            for (var i = 0; i < allLinks.length; i++) {
+                var need = widths[i] + (keep > 0 ? GAP : 0);
+                if (used + need > linkAvail) break;
+                used += need;
+                keep++;
+            }
+
+            /* 3. 放不下的移入「更多」下拉菜单 */
+            allLinks.slice(keep).forEach(function (a) { moreMenu.appendChild(a); });
+            if (moreMenu.querySelector('.nav-link.active')) {
+                moreBox.classList.add('has-active'); /* 当前页被收纳，高亮按钮 */
+            }
+        }
+
+        moreBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            moreBox.classList.toggle('open');
+        });
+        document.addEventListener('click', function (e) {
+            if (!moreBox.contains(e.target)) moreBox.classList.remove('open');
+        });
+        moreMenu.addEventListener('click', function () { moreBox.classList.remove('open'); });
+
+        var t = null;
+        window.addEventListener('resize', function () {
+            clearTimeout(t);
+            t = setTimeout(layout, 100);
+        });
+
+        layout();
+        window.addEventListener('load', layout); /* 字体加载完成后重新校正 */
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initNavCollapse);
+    } else {
+        initNavCollapse();
+    }
+})();
+</script>

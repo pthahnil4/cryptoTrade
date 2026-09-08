@@ -1,0 +1,2766 @@
+import io
+from flask import Flask, render_template, jsonify, request, send_file
+from .real_strategy_adapter import (
+    calculate_strategy_data, 
+    calculate_single_coin_data, 
+    calculate_multi_period_data,
+    get_all_coins, 
+    get_selected_coins, 
+    set_selected_coins,
+    sync_coin_list,
+    get_starred_coins,
+    set_starred_coins,
+    clear_starred_coins,
+    clear_all_selections,
+    get_fixed_coins,
+    get_floating_coins,
+    add_floating_coins,
+    remove_floating_coin,
+    clear_floating_coins,
+    last_save_db_ok
+)
+from .api_routes import api_bp
+from .plan_routes import plan_bp
+from .calorie_routes import calorie_bp
+from .journal_routes import journal_bp
+from .alert_routes import alert_bp
+from .discipline_routes import discipline_bp
+from .strategy_util import get_strategy_detail
+import traceback
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+# =====================================================================
+# 注册 API 路由蓝图（将 demo 封装为 HTTP 接口）
+# =====================================================================
+app.register_blueprint(api_bp)
+
+# =====================================================================
+# 注册任务计划蓝图（游戏化自我激励模块）
+# =====================================================================
+app.register_blueprint(plan_bp)
+
+# =====================================================================
+# 注册热量缺口管理蓝图（健康管理模块）
+# =====================================================================
+app.register_blueprint(calorie_bp)
+
+# =====================================================================
+# 注册随笔与复盘蓝图（思考沉淀模块）
+# =====================================================================
+app.register_blueprint(journal_bp)
+
+# =====================================================================
+# 注册监控告警蓝图（异常行情与持仓盈亏监控报警）
+# =====================================================================
+app.register_blueprint(alert_bp)
+
+# =====================================================================
+# 注册分析纪律蓝图（小时槽合格判定/打卡闸门/反懈怠看板）
+# =====================================================================
+app.register_blueprint(discipline_bp)
+
+# =====================================================================
+# 启动加速：DB 后台预热 + 调度器后台启动
+# ---------------------------------------------------------------------
+# 1. warmup_async：在守护线程内完成 init_db（探活 + 种子补全），
+#    不阻塞 app.run()，首个 DB 请求到达时若未完成会自动重试。
+# 2. register_default_jobs 会读 kv_store 告警配置并拉起监控引擎
+#    依赖链（含 OKX 客户端），导入期同步执行会显著拖慢启动，
+#    移入后台线程；交易调度本就是用户手动启动，晚几秒就绪无影响。
+# =====================================================================
+import threading as _threading
+import os as _os_env
+
+from .database import warmup_async as _db_warmup_async
+_db_warmup_async()
+
+# 后台任务总开关：导入 crypto.app 会顺带拉起调度器与两个监控线程，
+# 它们会真发告警邮件、真调 OKX、真写台账。冒烟脚本与 CLI 工具用
+# test_client 只想打接口，不应该在生产收件箱里留下测试信、也不应该让
+# 巡检线程与测试互相干扰，因此留一个环境变量把这三处后台启动一起关掉。
+# 默认不设置 = 行为与以前完全一致。
+_NO_BACKGROUND = str(_os_env.environ.get('CRYPTO_NO_BACKGROUND', '')).strip().lower() \
+    in ('1', 'true', 'yes', 'on')
+if _NO_BACKGROUND:
+    print('[Boot] CRYPTO_NO_BACKGROUND 已设置：跳过调度器与监控线程启动')
+
+
+def _boot_scheduler_background():
+    try:
+        from .task.scheduler import task_scheduler, register_default_jobs
+        register_default_jobs()
+        task_scheduler.start()
+    except Exception as _sched_err:
+        import traceback as _tb
+        _tb.print_exc()
+        print(f"[Warning] 定时任务调度器启动失败: {_sched_err}")
+        return
+
+    # 重启自愈：内存看门狗严重超限时会主动 os._exit 交给 supervisord 拉起，
+    # 而交易调度器原本“只注册不启动”，所以每自愈一次实盘就静默停摆一次。
+    # 下面只在「上次确实是希望它跑着」且页面上打开了 auto_resume 开关时才拉起，
+    # 成/败都发邮件；开关默认关 → 行为与改造前一致。
+    try:
+        task_scheduler.schedule_auto_resume()
+    except Exception as _ar_err:
+        print(f"[Warning] 实盘重启自愈任务未能登记: {_ar_err}")
+
+
+if not _NO_BACKGROUND:
+    _threading.Thread(target=_boot_scheduler_background, daemon=True,
+                      name='scheduler-boot').start()
+
+# =====================================================================
+# 稳定性监控（方案一 + 方案二）
+# ---------------------------------------------------------------------
+# 1. memory_watchdog：进程内内存自监控，每 5 分钟检查 RSS 并写入
+#    logs/memory_history.jsonl，超阈值邮件预警，严重超限主动退出由
+#    外部管理器（supervisord autorestart）自动拉起。
+# 2. system_monitor：系统级健康检查（进程/内存/磁盘），每 60s 一轮，
+#    异常邮件告警；进程崩溃时该线程随之消亡，完整兜底需另配 cron 独立运行
+#    （python crypto/system_monitor.py，详见文件头说明）。
+# =====================================================================
+if not _NO_BACKGROUND:
+    try:
+        from .memory_watchdog import start_memory_watchdog
+        start_memory_watchdog()
+    except Exception as _mem_err:
+        print(f"[Warning] 内存监控启动失败: {_mem_err}")
+
+    try:
+        from .system_monitor import start_system_monitor
+        start_system_monitor()
+    except Exception as _sysmon_err:
+        print(f"[Warning] 系统监控启动失败: {_sysmon_err}")
+
+# =====================================================================
+# 【前端页面路由】
+# 返回前端 HTML 页面
+# =====================================================================
+@app.route('/')
+def index():
+    return render_template('index.html', active_page='dashboard')
+
+
+@app.route('/detail/<symbol>')
+def coin_detail(symbol):
+    """币种详情页：历史交易 + 策略回测"""
+    return render_template('detail.html', symbol=symbol, active_page='dashboard')
+
+
+@app.route('/multi-period/<symbol>')
+def multi_period_overview(symbol):
+    """多周期方向总览页：展示多个周期的趋势方向对比"""
+    return render_template('multi_period.html', symbol=symbol, active_page='dashboard')
+
+
+@app.route('/api-console')
+def api_console():
+    """API 接口控制台：市场/账户/资金/交易"""
+    return render_template('api_console.html', active_page='api-console')
+
+
+@app.route('/system-status')
+def system_status_page():
+    """系统状态页：内存自监控概况 + 内存历史趋势图"""
+    return render_template('system_status.html', active_page='system-status')
+
+
+@app.route('/task')
+def task_page():
+    """定时任务管理页"""
+    return render_template('task.html', active_page='task')
+
+
+@app.route('/analysis')
+def analysis_page():
+    """实盘分析记录页（从定时任务页提升为独立一级页面，全宽布局，与 Tab 共用 analysis.js）"""
+    return render_template('analysis.html', active_page='analysis')
+
+
+@app.route('/plan')
+def plan_page():
+    """任务计划页"""
+    return render_template('task_plan.html', active_page='plan')
+
+# =====================================================================
+# 【后端数据 API 接口】
+# =====================================================================
+
+@app.route('/api/strategy/coins')
+def get_coin_list():
+    """返回所有可用币种列表"""
+    return jsonify({
+        "code": 200,
+        "message": "success",
+        "data": get_all_coins()
+    })
+
+@app.route('/api/strategy/config', methods=['GET'])
+def get_config():
+    """获取当前配置（全部币种 + 已选中币种 + 星标币种）"""
+    return jsonify({
+        "code": 200,
+        "message": "success",
+        "data": {
+            "all_coins": get_all_coins(),
+            "fixed_coins": get_fixed_coins(),
+            "floating_coins": get_floating_coins(),
+            "selected_coins": get_selected_coins(),
+            "starred_coins": get_starred_coins()
+        }
+    })
+
+def _coin_cfg_warn():
+    """币种自选配置的写库失败提示后缀。
+
+    DB 是主存、本地文件只是兜底，因此写库失败时界面必须说清楚“可能回到
+    旧值”，不能让用户拿着一个其实没生效的配置继续监控。
+    """
+    return '' if last_save_db_ok() else '（⚠️ 数据库主存写入失败，仅本地文件已更新，刷新后可能回到旧值）'
+
+
+@app.route('/api/strategy/config', methods=['POST'])
+def save_config():
+    """保存用户选择的币种"""
+    try:
+        data = request.get_json()
+        selected = data.get('selected_coins', [])
+        # 校验：只能选 all_coins 里存在的
+        all_coins = get_all_coins()
+        valid = [c for c in selected if c in all_coins]
+        if not valid:
+            valid = all_coins[:3] if all_coins else []
+        set_selected_coins(valid)
+        return jsonify({
+            "code": 200,
+            "message": "success" + _coin_cfg_warn(),
+            "data": get_selected_coins()
+        })
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/strategy/sync-coins', methods=['POST'])
+def sync_coins():
+    """从CSV同步币种列表到config"""
+    try:
+        merged = sync_coin_list()
+        return jsonify({
+            "code": 200,
+            "message": f"同步完成，共 {len(merged)} 个币种" + _coin_cfg_warn(),
+            "data": {
+                "all_coins": get_all_coins(),
+                "fixed_coins": get_fixed_coins(),
+                "floating_coins": get_floating_coins(),
+                "selected_coins": get_selected_coins(),
+                "starred_coins": get_starred_coins()
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/strategy/floating-coins/add', methods=['POST'])
+def add_floating_coins_route():
+    """批量添加浮动币种（从趋势扫描页勾选后加入监控）"""
+    try:
+        data = request.get_json(silent=True) or {}
+        coins = data.get('coins', [])
+        if not isinstance(coins, list) or not coins:
+            return jsonify({"code": 400, "message": "请传入至少一个币种", "data": None})
+        floating, added = add_floating_coins(coins)
+        return jsonify({
+            "code": 200,
+            "message": f"已添加 {added} 个浮动币种（{len(coins) - added} 个已存在）" + _coin_cfg_warn(),
+            "data": {
+                "floating_coins": floating,
+                "added": added,
+                "all_coins": get_all_coins()
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/floating-coins/remove', methods=['POST'])
+def remove_floating_coin_route():
+    """删除单个浮动币种"""
+    try:
+        data = request.get_json(silent=True) or {}
+        coin = (data.get('coin') or '').strip()
+        if not coin:
+            return jsonify({"code": 400, "message": "缺少 coin 参数", "data": None})
+        floating = remove_floating_coin(coin)
+        return jsonify({
+            "code": 200,
+            "message": "已移除" + _coin_cfg_warn(),
+            "data": {
+                "floating_coins": floating,
+                "all_coins": get_all_coins(),
+                "selected_coins": get_selected_coins()
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/floating-coins/clear', methods=['POST'])
+def clear_floating_coins_route():
+    """批量清空所有浮动币种（监控台一键清理）"""
+    try:
+        removed = clear_floating_coins()
+        return jsonify({
+            "code": 200,
+            "message": (f"已清空 {removed} 个浮动币种" if removed else "当前没有浮动币种")
+                       + (_coin_cfg_warn() if removed else ''),
+            "data": {
+                "floating_coins": get_floating_coins(),
+                "all_coins": get_all_coins(),
+                "selected_coins": get_selected_coins(),
+                "removed": removed
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/starred', methods=['GET'])
+def get_starred():
+    """获取星标币种列表"""
+    try:
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": get_starred_coins()
+        })
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/strategy/starred', methods=['POST'])
+def set_starred():
+    """保存星标币种列表，同时同步星标行情 CSV"""
+    try:
+        data = request.get_json()
+        coins = data.get('starred_coins', [])
+        set_starred_coins(coins)
+
+        # 同步星标行情 CSV
+        try:
+            from .star_market import sync_from_starred_config
+            sync_from_starred_config()
+        except Exception:
+            pass  # 同步失败不影响主流程
+
+        return jsonify({
+            "code": 200,
+            "message": "success" + _coin_cfg_warn(),
+            "data": get_starred_coins()
+        })
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/strategy/starred/clear', methods=['POST'])
+def clear_starred():
+    """清除所有星标，同时同步星标行情 CSV"""
+    try:
+        clear_starred_coins()
+
+        # 同步星标行情 CSV
+        try:
+            from .star_market import sync_from_starred_config
+            sync_from_starred_config()
+        except Exception:
+            pass
+
+        return jsonify({
+            "code": 200,
+            "message": "所有星标已清除" + _coin_cfg_warn(),
+            "data": []
+        })
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/strategy/clear-selections', methods=['POST'])
+def clear_selections():
+    """清除所有币种选择状态"""
+    try:
+        clear_all_selections()
+        return jsonify({
+            "code": 200,
+            "message": "所有选择已清除" + _coin_cfg_warn(),
+            "data": get_selected_coins()
+        })
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/strategy/coin/<symbol>')
+def get_single_coin_data(symbol):
+    try:
+        bar = request.args.get('bar', '1H')
+        data = calculate_single_coin_data(symbol, bar=bar)
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": data
+        })
+    except Exception as e:
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+@app.route('/api/strategy/detail/<symbol>')
+def get_strategy_detail_api(symbol):
+    """
+    策略详情页 API —— 返回完整策略运行结果。
+    支持参数：
+      - bar:         短周期K线，默认 1H
+      - strategy:    策略类型，single / dual / boll，默认 single
+      - long_bar:    长周期（仅dual/boll使用），默认自动映射
+      - entry_price: 开仓价格取值 open/close（仅single/dual），默认 close
+      - exit_price:  平仓价格取值 open/close（仅single/dual），默认 open
+      - signal_algo: 短周期信号算法 diff（平滑差，灵敏）/hybrid（状态机，稳定）（仅single/dual），默认 diff
+    """
+    try:
+        bar = request.args.get('bar', '1H')
+        strategy = request.args.get('strategy', 'single')
+        long_bar = request.args.get('long_bar', None)
+        entry_price = request.args.get('entry_price', None)
+        exit_price = request.args.get('exit_price', None)
+        signal_algo = request.args.get('signal_algo', None)
+        data = get_strategy_detail(symbol, bar=bar, strategy=strategy, long_bar=long_bar,
+                                   entry_price=entry_price, exit_price=exit_price,
+                                   signal_algo=signal_algo)
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": data
+        })
+    except Exception as e:
+        traceback.print_exc()
+        # 网络类异常（TLS握手超时/连接重置等）的 str(e) 常为空，
+        # 统一用 {type}: {e!r} 兄底，并对网络错误给出友好提示，避免前端显示空白错误。
+        err_name = type(e).__name__
+        if any(k in err_name for k in ('Timeout', 'Connect', 'Protocol', 'SSL', 'Network', 'Read')):
+            msg = f"网络连接不稳定，获取 {symbol} 行情数据超时，请稍后重试（{err_name}）"
+        else:
+            msg = str(e) or f"{err_name}: {e!r}"
+        return jsonify({
+            "code": 500,
+            "message": msg,
+            "data": None
+        })
+
+# =====================================================================
+# 【批量多周期趋势分析 API】
+# =====================================================================
+
+@app.route('/api/batch/update', methods=['POST'])
+def batch_update():
+    """启动批量多周期趋势更新（后台线程）"""
+    try:
+        from .batch_trend_updater import BatchTrendAnalyzer, get_progress
+
+        # 检查是否已有任务在运行
+        progress = get_progress()
+        if progress['status'] == 'running':
+            return jsonify({
+                "code": 400,
+                "message": "已有批量分析任务正在运行中，请等待完成后再启动",
+                "data": progress,
+            })
+
+        analyzer = BatchTrendAnalyzer()
+        analyzer.run_in_background()
+
+        return jsonify({
+            "code": 200,
+            "message": "批量趋势分析已启动",
+            "data": get_progress(),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/batch/progress', methods=['GET'])
+def batch_progress():
+    """查询批量更新进度"""
+    try:
+        from .batch_trend_updater import get_progress
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": get_progress(),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/batch/csv-data', methods=['GET'])
+def batch_csv_data():
+    """获取完整 CSV 数据（用于表格展示）"""
+    try:
+        from .batch_trend_updater import read_csv_for_display
+        records = read_csv_for_display()
+
+        # 统计
+        up_count_15m = sum(1 for r in records if r.get('15m_趋势') == '上涨')
+        down_count_15m = sum(1 for r in records if r.get('15m_趋势') == '下跌')
+        up_count_1h = sum(1 for r in records if r.get('1H_趋势') == '上涨')
+        down_count_1h = sum(1 for r in records if r.get('1H_趋势') == '下跌')
+        up_count_4h = sum(1 for r in records if r.get('4H_趋势') == '上涨')
+        down_count_4h = sum(1 for r in records if r.get('4H_趋势') == '下跌')
+        up_count_1d = sum(1 for r in records if r.get('1D_趋势') == '上涨')
+        down_count_1d = sum(1 for r in records if r.get('1D_趋势') == '下跌')
+        wait_count = len(records) - up_count_1d - down_count_1d
+
+        # 一致性统计
+        consistent = [r for r in records
+                      if r.get('4H_趋势') in ('上涨', '下跌')
+                      and r.get('4H_趋势') == r.get('1D_趋势')]
+
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": {
+                "records": records,
+                "total": len(records),
+                "statistics": {
+                    "up_count_15m": up_count_15m,
+                    "down_count_15m": down_count_15m,
+                    "up_count_1h": up_count_1h,
+                    "down_count_1h": down_count_1h,
+                    "up_count_4h": up_count_4h,
+                    "down_count_4h": down_count_4h,
+                    "up_count_1d": up_count_1d,
+                    "down_count_1d": down_count_1d,
+                    "wait_count": wait_count,
+                    "consistent_count": len(consistent),
+                },
+            },
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+@app.route('/api/batch/csv-filtered', methods=['GET'])
+def batch_csv_filtered():
+    """获取筛选后的一致性币种数据（4H 和 1D 趋势相同）"""
+    try:
+        from .batch_trend_updater import get_filtered_records
+        records = get_filtered_records()
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": {
+                "records": records,
+                "total": len(records),
+            },
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+@app.route('/api/strategy/multi-period/<symbol>')
+def get_multi_period_data(symbol):
+    """
+    多周期方向总览 API —— 返回指定币种在多个周期的趋势方向。
+    支持 ?bars=5m,15m,1H,2H,6H,1D,1W 参数指定需要查询的周期列表。
+    """
+    try:
+        bars_param = request.args.get('bars', '5m,15m,1H,2H,6H,1D,1W')
+        bars = [b.strip() for b in bars_param.split(',') if b.strip()]
+        data = calculate_multi_period_data(symbol, bars=bars)
+        return jsonify({
+            "code": 200,
+            "message": "success",
+            "data": data
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "code": 500,
+            "message": str(e),
+            "data": None
+        })
+
+
+# =====================================================================
+# 星标币种行情管理 API
+# =====================================================================
+
+@app.route('/star-market')
+def star_market_page():
+    """星标币种行情展示页"""
+    return render_template('star_market.html', active_page='star-market')
+
+
+@app.route('/api/star-market/data', methods=['GET'])
+def star_market_data():
+    """获取星标币种行情数据"""
+    try:
+        from .star_market import get_data_for_display
+        data = get_data_for_display()
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': data
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/refresh', methods=['POST'])
+def star_market_refresh():
+    """刷新星标币种行情（后台异步执行）"""
+    try:
+        from .star_market import refresh_full_data, get_refresh_progress
+
+        # 检查是否已有任务在运行
+        progress = get_refresh_progress()
+        if progress['status'] == 'running':
+            return jsonify({
+                'code': 200,
+                'message': '已有刷新任务正在运行中',
+                'data': progress
+            })
+
+        refresh_full_data()  # 立即启动后台线程
+
+        return jsonify({
+            'code': 200,
+            'message': '刷新任务已在后台启动',
+            'data': get_refresh_progress()
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/refresh-progress', methods=['GET'])
+def star_market_refresh_progress():
+    """查询星标行情刷新进度（轮询用）"""
+    try:
+        from .star_market import get_refresh_progress
+        progress = get_refresh_progress()
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': progress
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/update', methods=['POST'])
+def star_market_update():
+    """更新星标币种指定字段（预测涨跌、建议操作）"""
+    try:
+        from .star_market import update_record
+        data = request.get_json()
+        if not data:
+            return jsonify({'code': 400, 'message': '请求数据为空', 'data': None})
+
+        code = data.get('code', '').strip()
+        if not code:
+            return jsonify({'code': 400, 'message': '缺少 code 参数', 'data': None})
+
+        updates = data.get('updates', {})
+        if not updates:
+            return jsonify({'code': 400, 'message': '缺少 updates 字段', 'data': None})
+
+        result = update_record(code, updates)
+
+        if result['status'] == 'success':
+            return jsonify({'code': 200, 'message': result['message'], 'data': result})
+        else:
+            return jsonify({'code': 400, 'message': result['message'], 'data': result})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/clear-data', methods=['POST'])
+def star_market_clear_data():
+    """清空所有币种除名称、代码外的其他列数据"""
+    try:
+        from .star_market import clear_all_data
+        result = clear_all_data()
+
+        if result['status'] == 'success':
+            return jsonify({'code': 200, 'message': result['message'], 'data': result})
+        else:
+            return jsonify({'code': 400, 'message': result['message'], 'data': result})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/status', methods=['GET'])
+def star_market_status():
+    """获取最近刷新状态"""
+    try:
+        from .star_market import get_refresh_status
+        status = get_refresh_status()
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': status
+        })
+    except Exception as e:
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/export/<fmt>')
+def star_market_export(fmt):
+    """导出星标币种行情数据
+    fmt: csv 或 xlsx
+    """
+    try:
+        from .star_market import export_as_csv, export_as_xlsx
+
+        if fmt == 'csv':
+            content, filename = export_as_csv()
+            if content is None:
+                return jsonify({'code': 500, 'message': filename or '导出失败', 'data': None})
+            return send_file(
+                io.BytesIO(content),
+                mimetype='text/csv',
+                as_attachment=True,
+                download_name=filename
+            )
+
+        elif fmt == 'xlsx':
+            content, filename_or_err = export_as_xlsx()
+            if content is None:
+                return jsonify({'code': 500, 'message': filename_or_err, 'data': None})
+            return send_file(
+                io.BytesIO(content),
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name=filename_or_err
+            )
+
+        else:
+            return jsonify({'code': 400, 'message': f'不支持的导出格式: {fmt}', 'data': None})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/refresh-trend', methods=['POST'])
+def star_market_refresh_trend():
+    """刷新指定周期的趋势方向列（15分钟或60分钟）"""
+    try:
+        from .star_market import refresh_trend_column
+        data = request.get_json()
+        if not data:
+            return jsonify({'code': 400, 'message': '请求数据为空', 'data': None})
+
+        bar = data.get('bar', '').strip()
+        col = data.get('col', '').strip()
+        if not bar or not col:
+            return jsonify({'code': 400, 'message': '缺少 bar 或 col 参数', 'data': None})
+
+        # 校验支持的周期
+        valid_bars = {'15m': '15分钟', '1H': '60分钟'}
+        if bar not in valid_bars or valid_bars[bar] != col:
+            return jsonify({'code': 400, 'message': f'不支持的周期: bar={bar}, col={col}', 'data': None})
+
+        result = refresh_trend_column(bar, col)
+        return jsonify({
+            'code': 200,
+            'message': result.get('message', '刷新完成'),
+            'data': result
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/reorder', methods=['POST'])
+def star_market_reorder():
+    """保存拖拽排序后的币种顺序"""
+    try:
+        from .star_market import reorder_records
+        data = request.get_json()
+        if not data:
+            return jsonify({'code': 400, 'message': '请求数据为空', 'data': None})
+
+        ordered_codes = data.get('ordered_codes', [])
+        if not ordered_codes:
+            return jsonify({'code': 400, 'message': '缺少 ordered_codes 参数', 'data': None})
+
+        result = reorder_records(ordered_codes)
+        if result['status'] == 'success':
+            return jsonify({'code': 200, 'message': result['message'], 'data': result})
+        else:
+            return jsonify({'code': 400, 'message': result['message'], 'data': result})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+@app.route('/api/star-market/sync', methods=['POST'])
+def star_market_sync():
+    """手动触发星标行情 CSV 与监控台星标列表同步"""
+    try:
+        from .star_market import sync_from_starred_config
+        result = sync_from_starred_config()
+
+        if result['status'] == 'success':
+            return jsonify({'code': 200, 'message': result['message'], 'data': result})
+        else:
+            return jsonify({'code': 400, 'message': result['message'], 'data': result})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            'code': 500,
+            'message': str(e),
+            'data': None
+        })
+
+
+# =====================================================================
+# 全市场涨跌 / 成交量排行 + 趋势识别扫描 API
+# =====================================================================
+
+@app.route('/market-scan')
+def market_scan_page():
+    """全市场趋势扫描页（涨幅榜 / 跌幅榜 / 成交额榜 / 明确趋势币种）"""
+    return render_template('market_scan.html', active_page='market-scan')
+
+
+@app.route('/api/market-scan/data', methods=['GET'])
+def market_scan_data():
+    """获取最近一次扫描结果（缓存）。首次访问返回 has_data=False，由前端触发扫描"""
+    try:
+        from .market_scanner import get_scan_result, get_scan_progress
+        result = get_scan_result()
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': {
+                'has_data': result is not None,
+                'result': result,
+                'progress': get_scan_progress(),
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/market-scan/scan', methods=['POST'])
+def market_scan_start():
+    """启动一次全市场扫描（后台异步执行）"""
+    try:
+        from .market_scanner import run_scan_background, get_scan_progress
+        data = request.get_json(silent=True) or {}
+        account = (data.get('account') or '').strip() or None
+        run_scan_background(account)
+        return jsonify({
+            'code': 200,
+            'message': '扫描任务已在后台启动',
+            'data': get_scan_progress()
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/market-scan/progress', methods=['GET'])
+def market_scan_progress():
+    """查询扫描进度（轮询用）"""
+    try:
+        from .market_scanner import get_scan_progress
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': get_scan_progress()
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/market-scan/rankings', methods=['POST'])
+def market_scan_rankings():
+    """仅获取三大排行榜（涨幅/跌幅/成交额），不做趋势扫描。
+
+    只发 1 次 get_tickers 请求 + 内存排序，速度快，同步返回结果并写入缓存。
+    """
+    try:
+        from .market_scanner import get_market_rankings, set_scan_result
+        data = request.get_json(silent=True) or {}
+        account = (data.get('account') or '').strip() or None
+        result = get_market_rankings(account)
+        set_scan_result(result)
+        return jsonify({
+            'code': 200,
+            'message': '排行榜获取完成',
+            'data': result
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/market-scan/thresholds', methods=['GET'])
+def market_scan_thresholds():
+    """返回当前趋势扫描的筛选参数（供「筛选条件」弹窗展示）"""
+    try:
+        from .market_scanner import get_scan_thresholds
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': get_scan_thresholds()
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 定时任务管理 API
+# =====================================================================
+
+@app.route('/api/task/status', methods=['GET'])
+def task_status():
+    """获取调度器状态和任务列表"""
+    try:
+        from .task.scheduler import task_scheduler
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': task_scheduler.get_status()
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/start', methods=['POST'])
+def task_start():
+    """启动调度器"""
+    try:
+        from .task.scheduler import task_scheduler
+        task_scheduler.start()
+        return jsonify({'code': 200, 'message': '调度器已启动', 'data': None})
+    except Exception as e:
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/stop', methods=['POST'])
+def task_stop():
+    """停止调度器"""
+    try:
+        from .task.scheduler import task_scheduler
+        task_scheduler.shutdown()
+        return jsonify({'code': 200, 'message': '调度器已停止', 'data': None})
+    except Exception as e:
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/job/<job_id>', methods=['DELETE'])
+def task_remove_job(job_id):
+    """移除指定任务"""
+    try:
+        from .task.scheduler import task_scheduler
+        ok = task_scheduler.remove_job(job_id)
+        if ok:
+            return jsonify({'code': 200, 'message': f'任务 {job_id} 已移除', 'data': None})
+        else:
+            return jsonify({'code': 404, 'message': f'任务 {job_id} 不存在', 'data': None})
+    except Exception as e:
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 配置管理 API — 交易配置
+# =====================================================================
+import os as _os
+import json as _json
+import re as _re
+
+_TRADING_CONFIG_PATH = _os.path.join(
+    _os.path.dirname(__file__), 'task', 'config', 'config_trend_range.json'
+)
+
+_EMAIL_CONFIG_PATH = _os.path.join(
+    _os.path.dirname(__file__), 'task', 'config', 'email_config.py'
+)
+
+
+def _load_trading_config():
+    """读取交易配置：迁移批次7a 起 DB 优先（kv_store key='strategy_config'），
+    带 TTL 缓存减少重复往返；DB 不可用/无数据时回退本地文件，
+    保证接口契约与容错行为不变"""
+    try:
+        from . import config_store_repo
+        _cfg = config_store_repo.load_json_config_cached(
+            config_store_repo.KEY_STRATEGY_CONFIG)
+        if _cfg is not None:
+            return _cfg
+    except Exception:
+        pass
+    with open(_TRADING_CONFIG_PATH, 'r', encoding='utf-8') as f:
+        return _json.load(f)
+
+
+def _save_trading_config(config):
+    """写入交易配置：DB 主存 + 本地文件双写（文件保留为兜底数据源）
+
+    返回 (ok, msg)：ok=False 表示改动根本不会生效，调用方必须按失败上报。
+
+    DB 写失败不能再静默吞掉：读取侧（TrendRangeTrader._load_config 与各接口）
+    都是 DB 优先，所以“写库失败 + 写文件成功”= 界面提示已保存、实盘继续用
+    旧杠杆/旧周期跑单。失败时再探一次读，区分两种实质不同的情况：
+    - DB 还读得到（库里仍是旧值）→ 本次改动不会生效 → ok=False；
+    - DB 整个读不到（库挂了）→ 交易端会自动回退读文件 → 改动其实生效，
+      仅属持久化降级 → ok=True + 降级提醒。
+    """
+    from .task.utils.logger import get_task_logger
+    _log = get_task_logger()
+    db_err = None
+    try:
+        from .database import session_scope
+        from . import config_store_repo
+        with session_scope() as _s:
+            config_store_repo.save_json_config(
+                _s, config_store_repo.KEY_STRATEGY_CONFIG, config)
+    except Exception as e:
+        db_err = e
+        _log.error(f"[Config] 交易配置写入数据库失败: {e!r}")
+
+    # 文件兜底照写（与历史行为一致）；写失败则直接抛出给接口的 except 分支
+    with open(_TRADING_CONFIG_PATH, 'w', encoding='utf-8') as f:
+        _json.dump(config, f, indent=2, ensure_ascii=False)
+
+    if db_err is None:
+        return True, None
+
+    # 写失败后重读一次（save_json_config 已在提交前失效缓存，这里不会命中旧缓存）：
+    # 读得到 = DB 健康但本次写没成功，库里仍是旧参数
+    try:
+        from . import config_store_repo as _csr
+        probe = _csr.load_json_config_cached(_csr.KEY_STRATEGY_CONFIG)
+    except Exception:
+        probe = None
+    if probe is not None:
+        return False, (f'交易配置未能写入数据库主存（{db_err}），'
+                       f'本地文件已更新但交易端仍会读到旧参数，请修复数据库后重新保存')
+    return True, '数据库不可用，本次仅写入本地文件兜底，请尽快修复数据库'
+
+
+@app.route('/api/task/config/trading', methods=['GET'])
+def get_trading_config():
+    """获取交易配置"""
+    try:
+        config = _load_trading_config()
+        return jsonify({'code': 200, 'message': 'success', 'data': config})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/contract-spec', methods=['GET'])
+def get_contract_spec():
+    """查询永续合约规格与金额⇄张数换算（公共接口，免鉴权）
+
+    参数:
+        instId:    合约ID（必填，如 GPS-USDT-SWAP）
+        usd:       占用保证金预算（可选）→ 按 张数=floor(金额×杠杆÷每张面值) 返回合规张数
+        contracts: 张数（可选）→ 返回对应持仓名义价值
+        leverage:  杠杆倍数（可选，缺省 1x；0/非法值按 1x），金额→张数为放大因子
+    返回 data: spec(ctVal/lotSz/minSz/tickSz) + price + contract_usd_value(每张面值USDT)
+               + leverage + contracts/notional_usd(持仓价值)/margin_usd(占用保证金) 换算结果
+    """
+    try:
+        inst_id = request.args.get('instId', '').strip()
+        if not inst_id:
+            return jsonify({'code': 400, 'message': '缺少 instId 参数', 'data': None})
+
+        from .api_config import get_api_config
+        from .task.utils.instrument_spec import get_instrument_spec_cache
+        import okx.MarketData as _MarketData
+
+        flag = str(get_api_config().get('flag', '0') or '0')
+        cache = get_instrument_spec_cache(flag)
+
+        # 现价（公共行情接口，失败不阻断，仅换算结果为 0）
+        price = 0.0
+        try:
+            t = _MarketData.MarketAPI(flag=flag).get_ticker(instId=inst_id)
+            if t and t.get('code') == '0' and t.get('data'):
+                price = float(t['data'][0].get('last', 0) or 0)
+        except Exception:
+            pass
+
+        kwargs = {}
+        usd_arg = request.args.get('usd')
+        contracts_arg = request.args.get('contracts')
+        leverage_arg = request.args.get('leverage')
+        if usd_arg is not None:
+            kwargs['usd'] = float(usd_arg or 0)
+        elif contracts_arg is not None:
+            kwargs['contracts'] = float(contracts_arg or 0)
+        if leverage_arg is not None:
+            try:
+                kwargs['leverage'] = float(leverage_arg or 0)
+            except (TypeError, ValueError):
+                kwargs['leverage'] = 1
+        data = cache.preview(inst_id, price=price, **kwargs)
+        if not data.get('spec'):
+            return jsonify({'code': 404,
+                            'message': f'{inst_id} 合约规格获取失败，请检查合约ID是否存在',
+                            'data': data})
+        return jsonify({'code': 200, 'message': 'success', 'data': data})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/trend-compare', methods=['GET'])
+def task_trend_compare():
+    """实盘 vs 趋势策略理论对比
+
+    参数:
+        instId: 合约ID（必填，须在交易配置 currencies 中存在）
+        days:   对比时间范围（近N天，默认1，支持 1/3/7）
+        start/end: 'YYYY-MM-DD HH:MM:SS'，显式指定时覆盖 days
+    策略参数（周期/模式/算法/取价/杠杆）自动从交易配置读取，保证与实盘同源。
+    """
+    try:
+        inst_id = request.args.get('instId', '').strip()
+        if not inst_id:
+            return jsonify({'code': 400, 'message': '缺少 instId 参数', 'data': None})
+
+        config = _load_trading_config()
+        cur = next((c for c in config.get('currencies', [])
+                    if c.get('instId') == inst_id), None)
+        if not cur:
+            return jsonify({'code': 404, 'message': f'交易配置中不存在币种 {inst_id}', 'data': None})
+
+        start = request.args.get('start') or None
+        end = request.args.get('end') or None
+        if not start:
+            try:
+                days = max(1, min(30, int(request.args.get('days', 1))))
+            except (TypeError, ValueError):
+                days = 1
+            start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+        # 惰性导入：对比服务首次调用才加载策略模块，避免拖慢应用启动
+        from .task.trend_compare import get_compare_service
+        result = get_compare_service().compare(
+            inst_id=inst_id,
+            short_period=cur.get('short_period', '5m'),
+            long_period=cur.get('long_period', '4H'),
+            period_mode=(cur.get('trend_position') or {}).get('period_mode', 'dual'),
+            signal_algo=cur.get('signal_algo'),
+            entry_price_type=cur.get('entry_price_type', 'close'),
+            exit_price_type=cur.get('exit_price_type', 'open'),
+            leverage=float(cur.get('leverage', 10) or 10),
+            start=start, end=end,
+        )
+        return jsonify({'code': 200, 'message': 'success', 'data': result})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =============================================================================
+# 实盘分析记录 API（手动快照 + 个人判断 + 事后复盘统计）
+# =============================================================================
+
+_ANALYSIS_JUDGMENTS = ('rise', 'fall', 'watch')
+
+
+def _analysis_grace_minutes() -> int:
+    """分析纪律宽限期（分钟）：决定一条分析记录的 source 判为 live 还是 backfill。
+
+    |now - ts| <= 宽限期 → live（当时就分析了），否则 backfill（事后补记）。
+    判定完全在服务端，前端不可指定 source，避免为绕打卡闸门而伪造时间。
+    """
+    try:
+        from . import discipline_repo
+        return int(discipline_repo.load_config().get('grace_minutes', 15) or 15)
+    except Exception:
+        return 15
+
+
+@app.route('/api/task/analysis/snapshot', methods=['GET'])
+def task_analysis_snapshot():
+    """生成分析快照：实时价格 + 长短周期方向（复用实盘同源的双周期策略引擎）
+
+    参数:
+        instId: 合约ID（必填，须在交易配置 currencies 中存在）
+    策略参数（周期/算法/取价/BOLL）自动从该币种交易配置读取，保证与实盘同源。
+    """
+    try:
+        inst_id = request.args.get('instId', '').strip()
+        if not inst_id:
+            return jsonify({'code': 400, 'message': '缺少 instId 参数', 'data': None})
+
+        config = _load_trading_config()
+        cur = next((c for c in config.get('currencies', [])
+                    if c.get('instId') == inst_id), None)
+        if not cur:
+            return jsonify({'code': 404, 'message': f'交易配置中不存在币种 {inst_id}', 'data': None})
+
+        short_period = cur.get('short_period', '5m')
+        long_period = cur.get('long_period', '4H')
+        rcfg = cur.get('range_position') or {}
+
+        # 惰性导入：首次调用才加载策略模块，避免拖慢应用启动
+        from .task.strategy_adapter import DualPeriodStrategyAdapter
+        analysis = DualPeriodStrategyAdapter().analyze(
+            inst_id, short_period, long_period,
+            boll_period=int(rcfg.get('boll_period', 20) or 20),
+            boll_dev=float(rcfg.get('boll_dev', 2.0) or 2.0),
+            signal_algo=cur.get('signal_algo'),
+            entry_price_type=cur.get('entry_price_type', 'close'),
+            exit_price_type=cur.get('exit_price_type', 'open'))
+        if not analysis:
+            return jsonify({'code': 500, 'message': f'{inst_id} 策略分析失败，请稍后重试', 'data': None})
+
+        return jsonify({'code': 200, 'message': 'success', 'data': {
+            'instId': inst_id,
+            'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'price': analysis.get('last_price', 0),
+            'short_period': short_period,
+            'long_period': long_period,
+            'short_dir': analysis.get('direction') or '',
+            'long_dir': analysis.get('long_direction') or '',
+            'long_dir_prev': analysis.get('long_prev_direction') or '',
+            'atr_pct': analysis.get('atr_percentage', 0),
+            'boll_upper': analysis.get('boll_upper', 0),
+            'boll_middle': analysis.get('boll_middle', 0),
+            'boll_lower': analysis.get('boll_lower', 0),
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/analysis/snapshot_batch', methods=['GET'])
+def task_analysis_snapshot_batch():
+    """批量生成分析快照：遍历交易配置中全部币种，一次返回所有快照。
+
+    为何串行而不是线程池并发：DualPeriodStrategyAdapter.analyze() 内部会
+    临时改写 pro3_singletimeframe 的模块级全局变量（FAST_MODE / PRINT_* 系列）
+    并在 finally 恢复，多线程并发会造成全局状态竞争与恢复错乱，核心策略引擎
+    的 backtrader/pandas 调用未验证线程安全。串行总耗时 ≈ N × 单币耗时，但
+    相比前端逐个发 8 次请求仍是显著改善（省去 8 次 HTTP 往返与 UI 状态切换），
+    且实现简单可靠。
+
+    返回: data.items 为快照数组（字段与单币快照一致），data.errors 为失败币种。
+    """
+    try:
+        config = _load_trading_config()
+        currencies = [c for c in config.get('currencies', []) if str(c.get('instId') or '').strip()]
+        if not currencies:
+            return jsonify({'code': 400, 'message': '交易配置中无币种', 'data': None})
+
+        from .task.strategy_adapter import DualPeriodStrategyAdapter
+        adapter = DualPeriodStrategyAdapter()  # 复用同一实例，避免每次重复模块导入
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        items = []
+        errors = []
+        for cur in currencies:
+            inst_id = str(cur.get('instId') or '').strip()
+            try:
+                short_period = cur.get('short_period', '5m')
+                long_period = cur.get('long_period', '4H')
+                rcfg = cur.get('range_position') or {}
+                analysis = adapter.analyze(
+                    inst_id, short_period, long_period,
+                    boll_period=int(rcfg.get('boll_period', 20) or 20),
+                    boll_dev=float(rcfg.get('boll_dev', 2.0) or 2.0),
+                    signal_algo=cur.get('signal_algo'),
+                    entry_price_type=cur.get('entry_price_type', 'close'),
+                    exit_price_type=cur.get('exit_price_type', 'open'))
+                if not analysis:
+                    errors.append({'instId': inst_id, 'message': '策略分析返回空'})
+                    continue
+                items.append({
+                    'instId': inst_id,
+                    'ts': ts,
+                    'price': analysis.get('last_price', 0),
+                    'short_period': short_period,
+                    'long_period': long_period,
+                    'short_dir': analysis.get('direction') or '',
+                    'long_dir': analysis.get('long_direction') or '',
+                    'long_dir_prev': analysis.get('long_prev_direction') or '',
+                    'atr_pct': analysis.get('atr_percentage', 0),
+                    'boll_upper': analysis.get('boll_upper', 0),
+                    'boll_middle': analysis.get('boll_middle', 0),
+                    'boll_lower': analysis.get('boll_lower', 0),
+                })
+            except Exception as ex:
+                errors.append({'instId': inst_id, 'message': str(ex)})
+        return jsonify({'code': 200, 'message': f'批量快照完成：成功 {len(items)}/{len(currencies)}',
+                        'data': {'items': items, 'errors': errors}})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/analysis/records', methods=['GET'])
+def task_analysis_records_list():
+    """分析记录列表（ts 降序）：查询前惰性回填到期的 1H/4H 复盘价格，
+    响应附带个人判断 vs 策略方向命中率统计。
+
+    参数: instId / start / end（'YYYY-MM-DD HH:MM:SS' 闭区间）/ judgment
+    """
+    try:
+        from .database import session_scope
+        from . import analysis_record_repo as repo
+
+        inst_id = request.args.get('instId', '').strip() or None
+        start = request.args.get('start', '').strip() or None
+        end = request.args.get('end', '').strip() or None
+        judgment = request.args.get('judgment', '').strip() or None
+        if judgment and judgment not in _ANALYSIS_JUDGMENTS:
+            return jsonify({'code': 400, 'message': f'judgment 仅支持 {list(_ANALYSIS_JUDGMENTS)}', 'data': None})
+
+        # 回填与查询分离：K线拉取为网络 I/O，先提交释放连接再查列表
+        with session_scope() as s:
+            repo.backfill_due_reviews(s)
+        with session_scope() as s:
+            records = repo.query_records(s, inst_id=inst_id, start=start,
+                                         end=end, judgment=judgment)
+        return jsonify({'code': 200, 'message': 'success', 'data': {
+            'records': records,
+            'stats': repo.compute_stats(records),
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/analysis/records', methods=['POST'])
+def task_analysis_records_add():
+    """保存分析记录：快照字段 + 个人判断/分析原因"""
+    try:
+        body = request.get_json(silent=True) or {}
+        inst_id = str(body.get('instId') or '').strip()
+        judgment = str(body.get('user_judgment') or '').strip()
+        if not inst_id:
+            return jsonify({'code': 400, 'message': '缺少 instId', 'data': None})
+        if judgment not in _ANALYSIS_JUDGMENTS:
+            return jsonify({'code': 400, 'message': f'判断仅支持 {list(_ANALYSIS_JUDGMENTS)}', 'data': None})
+        try:
+            price = float(body.get('price') or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            return jsonify({'code': 400, 'message': '快照价格无效，请重新生成快照', 'data': None})
+
+        from .database import session_scope
+        from . import analysis_record_repo as repo
+        rec = {
+            'ts': str(body.get('ts') or '').strip()
+                  or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'inst_id': inst_id,
+            'price': price,
+            'short_period': str(body.get('short_period') or ''),
+            'long_period': str(body.get('long_period') or ''),
+            'short_dir': str(body.get('short_dir') or ''),
+            'long_dir': str(body.get('long_dir') or ''),
+            'long_dir_prev': str(body.get('long_dir_prev') or '') or None,
+            'atr_pct': float(body.get('atr_pct') or 0),
+            'user_judgment': judgment,
+            'user_reason': str(body.get('user_reason') or '').strip(),
+            '_grace_minutes': _analysis_grace_minutes(),
+        }
+        with session_scope() as s:
+            rec_id = repo.add_record(s, rec)
+        return jsonify({'code': 200, 'message': '分析记录已保存', 'data': {'id': rec_id}})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/analysis/records_batch', methods=['POST'])
+def task_analysis_records_add_batch():
+    """批量保存分析记录：接收批量快照矩阵中勾选的多条，一次性写入。
+
+    请求体: {'items': [快照字段 + user_judgment + user_reason, ...]}
+    单条校验规则与单条保存一致；校验失败项跳过并计入 errors，成功项同 session 提交。
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        raw_items = body.get('items')
+        if not isinstance(raw_items, list) or not raw_items:
+            return jsonify({'code': 400, 'message': 'items 不能为空数组', 'data': None})
+
+        from .database import session_scope
+        from . import analysis_record_repo as repo
+
+        valid_recs = []
+        errors = []
+        grace = _analysis_grace_minutes()
+        for idx, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                errors.append({'index': idx, 'message': '项格式错误'})
+                continue
+            inst_id = str(item.get('instId') or '').strip()
+            judgment = str(item.get('user_judgment') or '').strip()
+            if not inst_id:
+                errors.append({'index': idx, 'message': '缺少 instId'})
+                continue
+            if judgment not in _ANALYSIS_JUDGMENTS:
+                errors.append({'index': idx, 'instId': inst_id, 'message': f'判断仅支持 {list(_ANALYSIS_JUDGMENTS)}'})
+                continue
+            try:
+                price = float(item.get('price') or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0:
+                errors.append({'index': idx, 'instId': inst_id, 'message': '快照价格无效，请重新生成快照'})
+                continue
+            valid_recs.append({
+                'ts': str(item.get('ts') or '').strip()
+                      or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'inst_id': inst_id,
+                'price': price,
+                'short_period': str(item.get('short_period') or ''),
+                'long_period': str(item.get('long_period') or ''),
+                'short_dir': str(item.get('short_dir') or ''),
+                'long_dir': str(item.get('long_dir') or ''),
+                'long_dir_prev': str(item.get('long_dir_prev') or '') or None,
+                'atr_pct': float(item.get('atr_pct') or 0),
+                'user_judgment': judgment,
+                'user_reason': str(item.get('user_reason') or '').strip(),
+                '_grace_minutes': grace,
+            })
+
+        ids = []
+        if valid_recs:
+            with session_scope() as s:
+                for rec in valid_recs:
+                    ids.append(repo.add_record(s, rec))
+        msg = f'批量保存完成：成功 {len(ids)} 条'
+        if errors:
+            msg += f'，失败 {len(errors)} 条'
+        return jsonify({'code': 200, 'message': msg, 'data': {'ids': ids, 'errors': errors}})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/analysis/records/<int:rec_id>', methods=['PUT'])
+def task_analysis_records_update(rec_id):
+    """修改分析记录的个人判断与分析原因（快照字段不可改）"""
+    try:
+        body = request.get_json(silent=True) or {}
+        judgment = str(body.get('user_judgment') or '').strip()
+        if judgment not in _ANALYSIS_JUDGMENTS:
+            return jsonify({'code': 400, 'message': f'判断仅支持 {list(_ANALYSIS_JUDGMENTS)}', 'data': None})
+
+        from .database import session_scope
+        from . import analysis_record_repo as repo
+        with session_scope() as s:
+            ok = repo.update_user_fields(
+                s, rec_id, judgment, str(body.get('user_reason') or '').strip())
+        if not ok:
+            return jsonify({'code': 404, 'message': f'记录 {rec_id} 不存在', 'data': None})
+        return jsonify({'code': 200, 'message': '已更新', 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/analysis/records/<int:rec_id>', methods=['DELETE'])
+def task_analysis_records_delete(rec_id):
+    """删除分析记录"""
+    try:
+        from .database import session_scope
+        from . import analysis_record_repo as repo
+        with session_scope() as s:
+            ok = repo.delete_record(s, rec_id)
+        if not ok:
+            return jsonify({'code': 404, 'message': f'记录 {rec_id} 不存在', 'data': None})
+        return jsonify({'code': 200, 'message': '已删除', 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/residual-positions', methods=['GET'])
+def task_residual_positions():
+    """智能减仓残留仓位查询接口（供人工“扭亏为盈”操作参考）
+
+    数据来源：
+    - 残留记录：MySQL kv_store key='smart_reduce_residuals'（减仓时登记）
+    - 当前张数/均价：本地账本 pos_book（与调度器同源）
+    - 现价/浮动盈亏 upl/净已实现 realizedPnl：OKX get_positions 实时接口
+      （账号优先取运行中的交易调度器账号，未运行时用默认账号）
+
+    核心字段 target_price（扭亏目标价）：残留仓浮动盈亏刚好抵消整仓
+    净已实现亏损的价格，涨/跌到该价位再手动平仓，整仓 realizedPnl 即转正。
+    账本持仓已清零的过期记录会自动清理。
+    """
+    try:
+        from .database import session_scope
+        from . import config_store_repo, trader_state_repo
+        from .api_config import get_account_api
+        from .task.utils.instrument_spec import get_instrument_spec_cache
+
+        # 1. 残留记录（减仓快照）
+        with session_scope() as s:
+            residuals = config_store_repo.load_json_config(
+                s, config_store_repo.KEY_SMART_REDUCE_RESIDUALS) or {}
+
+        # 2. 本地账本当前持仓（校验残留是否仍存在）
+        with session_scope() as s:
+            pos_state = trader_state_repo.load_position_state(s)
+
+        # 3. 交易所实时持仓：realizedPnl / upl / markPx（按 instId+mgnMode 索引）
+        account = None
+        try:
+            from .task.scheduler import task_scheduler
+            account = getattr(task_scheduler, '_trading_account', None)
+        except Exception:
+            pass
+        ex_map = {}
+        try:
+            r = get_account_api(account).get_positions(instType='SWAP')
+            for p in (r.get('data') or []):
+                if abs(float(p.get('pos') or 0)) <= 0.001:
+                    continue
+                ex_map[(p.get('instId'), p.get('mgnMode'))] = p
+        except Exception as e:
+            return jsonify({'code': 502,
+                            'message': f'OKX 持仓查询失败: {e}', 'data': None})
+
+        flag = '0'
+        try:
+            from .api_config import get_api_config
+            flag = str(get_api_config(account).get('flag', '0') or '0')
+        except Exception:
+            pass
+        spec_cache = get_instrument_spec_cache(flag)
+
+        items, stale_keys = [], []
+        for key, rec in (residuals or {}).items():
+            inst = str(rec.get('inst_id') or '')
+            bucket = str(rec.get('bucket') or '')
+            direction = str(rec.get('direction') or '')
+            bk = (pos_state.get(inst) or {}).get(bucket) or {}
+            held = float((bk.get('held') or {}).get(direction) or 0)
+            if held <= 0.01:
+                stale_keys.append(key)  # 账本已清零（人工平仓/边界单成交）→ 过期
+                continue
+            avg_px = float((bk.get('avg_px') or {}).get(direction) or 0) \
+                or float(rec.get('avg_px') or 0)
+            mode = 'cross' if direction == 'long' else 'isolated'
+            ex = ex_map.get((inst, mode)) or {}
+            mark_px = float(ex.get('markPx') or 0)
+            upl = float(ex.get('upl') or 0)
+            realized_pnl = float(ex.get('realizedPnl')
+                                 or rec.get('realized_pnl_at_reduce') or 0)
+            spec = spec_cache.get_spec(inst)
+            ct_val = float(spec.get('ct_val') or 0) if spec else 0.0
+            # 扭亏目标价：残留 upl 抵消整仓净已实现亏损（rpnl<0）时的价格
+            #   多头 P = avg − rpnl/(held×ctVal)；空头 P = avg + rpnl/(held×ctVal)
+            target_px = 0.0
+            if ct_val > 0 and held > 0 and realized_pnl < 0:
+                sign = 1.0 if direction == 'long' else -1.0
+                target_px = avg_px - sign * realized_pnl / (held * ct_val)
+            items.append({
+                'instId': inst,
+                'bucket': bucket,
+                'direction': direction,
+                'direction_cn': '做多' if direction == 'long' else '做空',
+                'bucket_cn': '趋势仓' if bucket == 'trend' else '区间仓',
+                'held': held,
+                'avg_px': avg_px,
+                'mark_px': mark_px,
+                'upl': round(upl, 6),
+                'realized_pnl': round(realized_pnl, 6),
+                'target_price': round(target_px, 8),
+                'margin_est_usd': round(held * ct_val * mark_px / max(
+                    float(ex.get('lever') or 1), 1e-9), 4)
+                    if ct_val > 0 and mark_px > 0 else 0.0,
+                'reduce_amount': rec.get('reduce_amount'),
+                'keep_amount': rec.get('keep_amount'),
+                'reduce_ts': rec.get('ts'),
+                'scene': rec.get('scene'),
+                'reason': rec.get('reason'),
+            })
+
+        # 4. 清理过期记录（账本持仓已清零的残留）并回写
+        if stale_keys:
+            for k in stale_keys:
+                residuals.pop(k, None)
+            try:
+                with session_scope() as s:
+                    config_store_repo.save_json_config(
+                        s, config_store_repo.KEY_SMART_REDUCE_RESIDUALS, residuals)
+            except Exception:
+                pass
+
+        items.sort(key=lambda x: x['realized_pnl'])  # 亏损最深的排前面，优先处理
+        return jsonify({'code': 200, 'message': 'success', 'data': {
+            'account': account or 'default',
+            'count': len(items),
+            'total_upl': round(sum(i['upl'] for i in items), 6),
+            'total_realized_pnl': round(sum(i['realized_pnl'] for i in items), 6),
+            'positions': items,
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =============================================================================
+# 持仓看板：当前持仓卡片 / 历史持仓查询 / 历史币种库
+# =============================================================================
+
+def _resolve_task_account():
+    """账号解析：优先取运行中的交易调度器账号，未运行时用默认账号"""
+    try:
+        from .task.scheduler import task_scheduler
+        return getattr(task_scheduler, '_trading_account', None)
+    except Exception:
+        return None
+
+
+def _load_coin_library():
+    """读取历史币种库；库为空时用当前配置币种回填（首次兜底建档）"""
+    from .database import session_scope
+    from . import config_store_repo
+    try:
+        with session_scope() as s:
+            lib = config_store_repo.load_json_config(
+                s, config_store_repo.KEY_TASK_COIN_LIBRARY)
+        if isinstance(lib, dict) and lib:
+            return lib
+    except Exception:
+        pass
+    now = datetime.now().timestamp()
+    lib = {}
+    try:
+        for cur in (_load_trading_config().get('currencies') or []):
+            inst = str(cur.get('instId') or '')
+            if inst:
+                lib[inst] = {'first_used': now, 'last_used': now, 'use_count': 1}
+        if lib:
+            with session_scope() as s:
+                config_store_repo.save_json_config(
+                    s, config_store_repo.KEY_TASK_COIN_LIBRARY, lib)
+    except Exception:
+        traceback.print_exc()
+    return lib
+
+
+def _save_coin_library(lib):
+    from .database import session_scope
+    from . import config_store_repo
+    with session_scope() as s:
+        config_store_repo.save_json_config(
+            s, config_store_repo.KEY_TASK_COIN_LIBRARY, lib)
+
+
+def _upsert_coin_library(inst_ids):
+    """保存交易配置时调用：新币种建档 / 存量币种刷新 last_used。
+
+    从配置中移除的币种不删除（仅变为"已停用"，留存历史记录）。
+    """
+    try:
+        from .database import session_scope
+        from . import config_store_repo
+        if not inst_ids:
+            return
+        now = datetime.now().timestamp()
+        try:
+            with session_scope() as s:
+                lib = config_store_repo.load_json_config(
+                    s, config_store_repo.KEY_TASK_COIN_LIBRARY)
+        except Exception:
+            lib = None
+        lib = lib if isinstance(lib, dict) else {}
+        for inst in inst_ids:
+            rec = lib.get(inst)
+            if isinstance(rec, dict):
+                rec['last_used'] = now
+            else:
+                lib[inst] = {'first_used': now, 'last_used': now, 'use_count': 1}
+        _save_coin_library(lib)
+    except Exception:
+        traceback.print_exc()
+
+
+@app.route('/api/task/positions/current', methods=['GET'])
+def task_positions_current():
+    """持仓看板：定时任务配置币种的实时持仓卡片数据
+
+    数据来源：
+    - 任务币种清单：交易配置 currencies（与调度器同源）
+    - 实时持仓：OKX get_positions（净持仓，两篮子合并展示）
+    - 篮子拆分：本地账本 pos_book（趋势仓/区间仓各自张数）
+    """
+    try:
+        from .database import session_scope
+        from . import trader_state_repo
+        from .api_config import get_account_api, get_api_config
+        from .task.utils.instrument_spec import get_instrument_spec_cache
+
+        account = _resolve_task_account()
+        config = _load_trading_config()
+        currencies = config.get('currencies') or []
+
+        # 1. 交易所实时持仓（按 instId 索引，过滤零持仓）
+        try:
+            r = get_account_api(account).get_positions(instType='SWAP')
+        except Exception as e:
+            return jsonify({'code': 502,
+                            'message': f'OKX 持仓查询失败: {e}', 'data': None})
+        pos_map = {}
+        for p in (r.get('data') or []):
+            if abs(float(p.get('pos') or 0)) <= 0.001:
+                continue
+            pos_map[p.get('instId')] = p
+
+        # 2. 本地账本篮子拆分（趋势仓/区间仓）
+        try:
+            with session_scope() as s:
+                pos_state = trader_state_repo.load_position_state(s)
+        except Exception:
+            pos_state = {}
+
+        # 3. 合约规格（面值，用于保证金估算）
+        flag = '0'
+        try:
+            flag = str(get_api_config(account).get('flag', '0') or '0')
+        except Exception:
+            pass
+        spec_cache = get_instrument_spec_cache(flag)
+
+        cards = []
+        for cur in currencies:
+            inst = str(cur.get('instId') or '')
+            tcfg = cur.get('trend_position') or {}
+            rcfg = cur.get('range_position') or {}
+
+            # 篮子张数拆分（本地账本）
+            baskets = {}
+            st = pos_state.get(inst) or {}
+            for bucket in ('trend', 'range'):
+                held = (st.get(bucket) or {}).get('held') or {}
+                baskets[bucket] = {
+                    'long': float(held.get('long') or 0),
+                    'short': float(held.get('short') or 0),
+                }
+
+            card = {
+                'instId': inst,
+                'leverage': cur.get('leverage', 0),
+                'trade_enabled': cur.get('trade_enabled', True),
+                'trend_enabled': bool(tcfg.get('enabled')),
+                'range_enabled': bool(rcfg.get('enabled')),
+                'short_period': cur.get('short_period'),
+                'long_period': cur.get('long_period'),
+                'baskets': baskets,
+                'position': None,
+            }
+
+            ex = pos_map.get(inst)
+            if ex:
+                spec = spec_cache.get_spec(inst)
+                ct_val = float(spec.get('ct_val') or 0) if spec else 0.0
+                pos = float(ex.get('pos') or 0)
+                mark_px = float(ex.get('markPx') or 0)
+                lever = float(ex.get('lever') or cur.get('leverage') or 1) or 1
+                margin = (abs(pos) * ct_val * mark_px / lever
+                          if ct_val > 0 and mark_px > 0 else 0.0)
+                card['position'] = {
+                    'direction': 'long' if pos > 0 else 'short',
+                    'pos': abs(pos),
+                    'avg_px': float(ex.get('avgPx') or 0),
+                    'mark_px': mark_px,
+                    'upl': round(float(ex.get('upl') or 0), 6),
+                    'upl_ratio': float(ex.get('uplRatio') or 0),
+                    'lever': lever,
+                    'liq_px': float(ex.get('liqPx') or 0),
+                    'mgn_mode': ex.get('mgnMode') or '',
+                    'notional': round(float(ex.get('notionalUsd') or 0), 4),
+                    'margin_est': round(margin, 4),
+                    'realized_pnl': round(float(ex.get('realizedPnl') or 0), 6),
+                }
+            cards.append(card)
+
+        return jsonify({'code': 200, 'message': 'success', 'data': {
+            'account': account or 'default',
+            'count': len(cards),
+            'holding': sum(1 for c in cards if c['position']),
+            'cards': cards,
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# OKX 历史持仓平仓类型映射（type 字段）
+_POS_HIST_CLOSE_TYPE = {
+    '1': '强平', '2': '普通平仓', '3': '交割平仓',
+    '4': 'ADL减仓', '5': '对冲平仓',
+}
+
+
+@app.route('/api/task/positions/history', methods=['GET'])
+def task_positions_history():
+    """单币种历史持仓记录（OKX positions-history，仅近约 3 个月）
+
+    参数: instId（必填）/ limit（默认20，上限100）/ after（游标翻页，传上一页最早 uTime）
+    """
+    inst_id = (request.args.get('instId') or '').strip()
+    if not inst_id:
+        return jsonify({'code': 400, 'message': 'instId 参数必填', 'data': None})
+    try:
+        limit = max(1, min(int(request.args.get('limit', 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    after = (request.args.get('after') or '').strip()
+    try:
+        from .api_config import get_account_api
+        account = _resolve_task_account()
+        params = {'instType': 'SWAP', 'instId': inst_id, 'limit': str(limit)}
+        if after:
+            params['after'] = after
+        r = get_account_api(account).get_positions_history(**params)
+        if r.get('code') != '0':
+            return jsonify({'code': 502,
+                            'message': f"OKX 查询失败: {r.get('msg') or '未知错误'}",
+                            'data': None})
+
+        def _f(v, default=0.0):
+            try:
+                return float(v) if v not in (None, '', 'None') else default
+            except (TypeError, ValueError):
+                return default
+
+        items, total_pnl, profit_cnt = [], 0.0, 0
+        total_fee, total_funding = 0.0, 0.0
+        for p in (r.get('data') or []):
+            rpnl = _f(p.get('realizedPnl'))
+            fee = _f(p.get('fee'))
+            funding = _f(p.get('fundingFee'))
+            total_pnl += rpnl
+            total_fee += fee
+            total_funding += funding
+            if rpnl > 0:
+                profit_cnt += 1
+            close_ts = int(_f(p.get('uTime')))
+            open_ts = int(_f(p.get('cTime')))
+            items.append({
+                'close_time': datetime.fromtimestamp(close_ts / 1000).strftime(
+                    '%Y-%m-%d %H:%M') if close_ts > 0 else '-',
+                'open_time': datetime.fromtimestamp(open_ts / 1000).strftime(
+                    '%Y-%m-%d %H:%M') if open_ts > 0 else '-',
+                'direction': p.get('direction') or '',
+                'pos': _f(p.get('pos')),
+                'open_px': _f(p.get('openAvgPx')) or _f(p.get('avgPx')),
+                'close_px': _f(p.get('closeAvgPx')),
+                'pnl': round(rpnl, 6),
+                'fee': round(fee, 6),
+                'funding_fee': round(funding, 6),
+                'lever': _f(p.get('lever')),
+                'mgn_mode': p.get('mgnMode') or '',
+                'close_type': _POS_HIST_CLOSE_TYPE.get(
+                    str(p.get('type') or ''), str(p.get('type') or '')),
+                'close_ts': close_ts,
+            })
+
+        return jsonify({'code': 200, 'message': 'success', 'data': {
+            'instId': inst_id,
+            'account': account or 'default',
+            'count': len(items),
+            'records': items,
+            'summary': {
+                'total_pnl': round(total_pnl, 6),
+                'total_fee': round(total_fee, 6),
+                'total_funding': round(total_funding, 6),
+                'profit_count': profit_cnt,
+                'win_rate': round(profit_cnt / len(items) * 100, 1) if items else 0,
+            },
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/coin-library', methods=['GET'])
+def task_coin_library_list():
+    """历史币种库：所有曾用过的定时任务币种（在用/已停用标记）"""
+    try:
+        lib = _load_coin_library()
+        config = _load_trading_config()
+        active_ids = {str(c.get('instId') or '')
+                      for c in (config.get('currencies') or [])}
+        coins = []
+        for inst, rec in lib.items():
+            rec = rec if isinstance(rec, dict) else {}
+            coins.append({
+                'instId': inst,
+                'first_used': rec.get('first_used') or 0,
+                'last_used': rec.get('last_used') or 0,
+                'use_count': rec.get('use_count', 1),
+                'active': inst in active_ids,
+            })
+        coins.sort(key=lambda x: (x['last_used'], x['instId']), reverse=True)
+        return jsonify({'code': 200, 'message': 'success', 'data': {
+            'count': len(coins),
+            'active_count': sum(1 for c in coins if c['active']),
+            'coins': coins,
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/coin-library', methods=['DELETE'])
+def task_coin_library_delete():
+    """删除历史币种库记录（仅移除留存，不影响交易配置与实际持仓）
+
+    body: {"inst_ids": [...]}；在用币种（仍在当前配置中）拒绝删除。
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        inst_ids = [str(i).strip() for i in (body.get('inst_ids') or [])]
+        inst_ids = [i for i in inst_ids if i]
+        if not inst_ids:
+            return jsonify({'code': 400, 'message': 'inst_ids 不能为空', 'data': None})
+
+        config = _load_trading_config()
+        active_ids = {str(c.get('instId') or '')
+                      for c in (config.get('currencies') or [])}
+        blocked = [i for i in inst_ids if i in active_ids]
+        if blocked:
+            return jsonify({'code': 400,
+                            'message': f"在用币种不可删除：{', '.join(blocked)}",
+                            'data': None})
+
+        lib = _load_coin_library()
+        removed = [i for i in inst_ids if lib.pop(i, None) is not None]
+        if removed:
+            _save_coin_library(lib)
+        return jsonify({'code': 200,
+                        'message': f'已删除 {len(removed)} 个币种记录',
+                        'data': {'removed': removed, 'remaining': len(lib)}})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/config/trading', methods=['POST'])
+def save_trading_config():
+    """保存交易配置"""
+    try:
+        new_config = request.get_json()
+        if not new_config:
+            return jsonify({'code': 400, 'message': '请求数据为空', 'data': None})
+
+        # 基础校验
+        errors = _validate_trading_config(new_config)
+        if errors:
+            return jsonify({'code': 400, 'message': '配置校验失败', 'data': {'errors': errors}})
+
+        cfg_ok, cfg_msg = _save_trading_config(new_config)
+        # 历史币种库留存：新币建档 / 存量刷新最近使用时间（移除币种不删）
+        _upsert_coin_library(
+            [str(c.get('instId') or '') for c in (new_config.get('currencies') or [])
+             if c.get('instId')])
+        if not cfg_ok:
+            # 主存未写入 = 交易端下个周期仍按旧参数跑，不能报成功
+            return jsonify({'code': 500, 'message': cfg_msg, 'data': None})
+        return jsonify({'code': 200,
+                        'message': '交易配置已保存，将在下一个执行周期生效'
+                                   + (f'（注意：{cfg_msg}）' if cfg_msg else ''),
+                        'data': new_config})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+def _validate_trading_config(config):
+    """校验交易配置合法性（双仓位架构 v3.0：趋势跟踪 + 区间波动）"""
+    errors = []
+    valid_short = ['1m', '5m', '15m', '1H', '4H']
+    valid_long = ['5m', '15m', '1H', '4H', '1D', '1W']
+
+    currencies = config.get('currencies', [])
+    if not currencies:
+        errors.append('至少需要一个币种配置')
+
+    seen_inst_ids = set()
+    for i, cur in enumerate(currencies):
+        prefix = f'币种[{i}]'
+        inst_id = cur.get('instId', '')
+        if not inst_id or not _re.match(r'^[A-Z]+-USDT-SWAP$', inst_id):
+            errors.append(f'{prefix}: 合约ID格式不正确')
+        elif inst_id in seen_inst_ids:
+            errors.append(f'{prefix}: 合约ID重复: {inst_id}')
+        seen_inst_ids.add(inst_id)
+
+        if cur.get('short_period') not in valid_short:
+            errors.append(f'{prefix}: 短周期必须是 {valid_short} 之一')
+        if cur.get('long_period') not in valid_long:
+            errors.append(f'{prefix}: 长周期必须是 {valid_long} 之一')
+
+        lev = cur.get('leverage', 0)
+        if not isinstance(lev, int) or isinstance(lev, bool) or lev <= 0:
+            errors.append(f'{prefix}: leverage 必须为正整数')
+        if not isinstance(cur.get('verbose_lifecycle', True), bool):
+            errors.append(f'{prefix}: verbose_lifecycle 必须为布尔值')
+        if not isinstance(cur.get('trade_enabled', True), bool):
+            errors.append(f'{prefix}: trade_enabled 必须为布尔值（缺失视为开启）')
+
+        if cur.get('manual_direction') not in ['auto', 'long', 'short']:
+            errors.append(f'{prefix}: manual_direction 必须是 auto/long/short')
+
+        # 信号算法与价格类型校验（可选字段，仅当存在时校验）
+        if cur.get('signal_algo') is not None and cur.get('signal_algo') not in ['diff', 'hybrid']:
+            errors.append(f'{prefix}: signal_algo 必须是 diff/hybrid')
+        if cur.get('entry_price_type') is not None and cur.get('entry_price_type') not in ['open', 'close']:
+            errors.append(f'{prefix}: entry_price_type 必须是 open/close')
+        if cur.get('exit_price_type') is not None and cur.get('exit_price_type') not in ['open', 'close']:
+            errors.append(f'{prefix}: exit_price_type 必须是 open/close')
+
+        # ── 趋势跟踪仓位（按趋势策略信号限价开平）──
+        tcfg = cur.get('trend_position')
+        if not isinstance(tcfg, dict):
+            errors.append(f'{prefix}: trend_position 必须为对象（趋势跟踪仓位配置）')
+            tcfg = {}
+        else:
+            t_on = tcfg.get('enabled', False)
+            if not isinstance(t_on, bool):
+                errors.append(f'{prefix}: trend_position.enabled 必须为布尔值')
+            if tcfg.get('period_mode') not in ['single', 'dual']:
+                errors.append(f'{prefix}: trend_position.period_mode 必须是 '
+                              'single(单周期双向) / dual(双周期单向)')
+            tct = tcfg.get('contracts', 0)
+            if not isinstance(tct, (int, float)) or tct < 0:
+                errors.append(f'{prefix}: trend_position.contracts 必须为非负数')
+            # 下单量双模式：contracts=按张数（存量）/ usd=按名义价值金额折算
+            t_mode = tcfg.get('size_mode', 'contracts')
+            if t_mode not in ['contracts', 'usd']:
+                errors.append(f'{prefix}: trend_position.size_mode 必须是 contracts/usd')
+            t_usd = tcfg.get('notional_usd', 0)
+            if not isinstance(t_usd, (int, float)) or t_usd < 0:
+                errors.append(f'{prefix}: trend_position.notional_usd 必须为非负数')
+            elif t_on is True and t_mode == 'usd' and t_usd <= 0:
+                errors.append(f'{prefix}: trend_position 已启用且为金额模式，notional_usd 必须为正数')
+            elif t_on is True and t_mode != 'usd' and tct <= 0:
+                errors.append(f'{prefix}: trend_position 已启用且为张数模式，contracts 必须为正数')
+            if not isinstance(tcfg.get('exchange_algo_backup', True), bool):
+                errors.append(f'{prefix}: trend_position.exchange_algo_backup 必须为布尔值')
+
+        # ── 区间波动仓位（BOLL 边界限价往复刷区间）──
+        rcfg = cur.get('range_position')
+        if not isinstance(rcfg, dict):
+            errors.append(f'{prefix}: range_position 必须为对象（区间波动仓位配置）')
+        else:
+            r_on = rcfg.get('enabled', False)
+            if not isinstance(r_on, bool):
+                errors.append(f'{prefix}: range_position.enabled 必须为布尔值')
+            rct = rcfg.get('contracts', 0)
+            if not isinstance(rct, (int, float)) or rct < 0:
+                errors.append(f'{prefix}: range_position.contracts 必须为非负数')
+            # 下单量双模式：contracts=按张数（存量）/ usd=按名义价值金额折算
+            r_mode = rcfg.get('size_mode', 'contracts')
+            if r_mode not in ['contracts', 'usd']:
+                errors.append(f'{prefix}: range_position.size_mode 必须是 contracts/usd')
+            r_usd = rcfg.get('notional_usd', 0)
+            if not isinstance(r_usd, (int, float)) or r_usd < 0:
+                errors.append(f'{prefix}: range_position.notional_usd 必须为非负数')
+            elif r_on is True and r_mode == 'usd' and r_usd <= 0:
+                errors.append(f'{prefix}: range_position 已启用且为金额模式，notional_usd 必须为正数')
+            elif r_on is True and r_mode != 'usd' and rct <= 0:
+                errors.append(f'{prefix}: range_position 已启用且为张数模式，contracts 必须为正数')
+            bp = rcfg.get('boll_period', 20)
+            if not isinstance(bp, int) or isinstance(bp, bool) or bp <= 1:
+                errors.append(f'{prefix}: range_position.boll_period 必须为大于1的整数')
+            bd = rcfg.get('boll_dev', 2.0)
+            if not isinstance(bd, (int, float)) or bd <= 0:
+                errors.append(f'{prefix}: range_position.boll_dev 必须为正数')
+            am = rcfg.get('boll_amend_min_pct', 0.001)
+            if not isinstance(am, (int, float)) or am < 0 or am >= 1:
+                errors.append(f'{prefix}: range_position.boll_amend_min_pct '
+                              '必须在 [0,1) 内（0.001=0.1%）')
+
+        # 止盈止损只对趋势跟踪仓位生效（区间波动自带对侧 BOLL 边界止盈）
+        tp = tcfg.get('take_profit')
+        if tp is not None:
+            if not isinstance(tp, dict):
+                errors.append(f'{prefix}: take_profit 必须为对象')
+            else:
+                if not isinstance(tp.get('enabled', False), bool):
+                    errors.append(f'{prefix}: take_profit.enabled 必须为布尔值')
+                # 主止盈 category 六选一（旧结构 type=fixed/trailing 已废弃）
+                if 'category' in tp:
+                    cat = tp.get('category', 'none')
+                    if cat not in ['none', 'fixed_target', 'trailing', 'momentum', 'channel', 'ladder']:
+                        errors.append(f'{prefix}: take_profit.category 必须是 none/fixed_target/trailing/momentum/channel/ladder')
+                    # 各子块模式与数值参数校验
+                    _num_fields = {
+                        'fixed_target': ('pct', 'r_multiple', 'atr_multiple'),
+                        'trailing': ('activate_pct', 'pullback_pct', 'chandelier_atr'),
+                        'momentum': ('decay_bars', 'lookback', 'min_profit_pct'),
+                        'channel': ('min_profit_pct',),
+                        'time_stop': ('max_bars', 'min_profit_pct'),
+                    }
+                    _valid_modes = {
+                        'fixed_target': ['pct', 'r_multiple', 'atr_multiple'],
+                        'trailing': ['pullback_pct', 'chandelier', 'r_ladder'],
+                        'momentum': ['hist_decay', 'divergence'],
+                        'channel': ['outer', 'middle'],
+                    }
+                    for blk_name, fields in _num_fields.items():
+                        blk = tp.get(blk_name)
+                        if blk is None:
+                            continue
+                        if not isinstance(blk, dict):
+                            errors.append(f'{prefix}: take_profit.{blk_name} 必须为对象')
+                            continue
+                        if blk_name in _valid_modes and blk.get('mode') is not None \
+                                and blk.get('mode') not in _valid_modes[blk_name]:
+                            errors.append(f'{prefix}: take_profit.{blk_name}.mode 必须是 {"/".join(_valid_modes[blk_name])}')
+                        for k in fields:
+                            v = blk.get(k)
+                            if v is not None and (not isinstance(v, (int, float)) or v < 0):
+                                errors.append(f'{prefix}: take_profit.{blk_name}.{k} 必须为非负数')
+                    ts = tp.get('time_stop')
+                    if isinstance(ts, dict) and not isinstance(ts.get('enabled', False), bool):
+                        errors.append(f'{prefix}: take_profit.time_stop.enabled 必须为布尔值')
+                    # 追踪 r_levels：[[reach_r, lock_r], ...]
+                    tr = tp.get('trailing')
+                    if isinstance(tr, dict) and tr.get('r_levels') is not None:
+                        rl = tr.get('r_levels')
+                        if not isinstance(rl, list) or any(
+                                not isinstance(x, list) or len(x) != 2 or
+                                not all(isinstance(y, (int, float)) for y in x) for x in rl):
+                            errors.append(f'{prefix}: take_profit.trailing.r_levels 必须为 [[reach_r,lock_r],..] 数值数组')
+                    # 分批 levels：[{pct, close_ratio}, ...]，pct 递增且 close_ratio ∈ (0,1]
+                    ld = tp.get('ladder')
+                    if isinstance(ld, dict) and ld.get('levels') is not None:
+                        lv = ld.get('levels')
+                        if not isinstance(lv, list) or len(lv) == 0:
+                            errors.append(f'{prefix}: take_profit.ladder.levels 必须为非空数组')
+                        else:
+                            prev_pct = 0
+                            for j, item in enumerate(lv):
+                                if not isinstance(item, dict) \
+                                        or not isinstance(item.get('pct'), (int, float)) \
+                                        or not isinstance(item.get('close_ratio'), (int, float)):
+                                    errors.append(f'{prefix}: take_profit.ladder.levels[{j}] 必须含数值 pct/close_ratio')
+                                    continue
+                                if item['pct'] <= prev_pct:
+                                    errors.append(f'{prefix}: take_profit.ladder.levels[{j}].pct 必须递增且>0')
+                                prev_pct = item['pct']
+                                if not (0 < item['close_ratio'] <= 1):
+                                    errors.append(f'{prefix}: take_profit.ladder.levels[{j}].close_ratio 必须在(0,1]内')
+                            if lv and isinstance(lv[-1], dict) and isinstance(lv[-1].get('close_ratio'), (int, float)) \
+                                    and lv[-1]['close_ratio'] < 1:
+                                errors.append(f'{prefix}: take_profit.ladder.levels 末档 close_ratio 必须为 1.0（清仓档）')
+                else:
+                    errors.append(f'{prefix}: take_profit 缺少 category 字段（旧结构已废弃）')
+        sl = tcfg.get('stop_loss')
+        if sl is not None:
+            if not isinstance(sl, dict):
+                errors.append(f'{prefix}: stop_loss 必须为对象')
+            else:
+                if not isinstance(sl.get('enabled', False), bool):
+                    errors.append(f'{prefix}: stop_loss.enabled 必须为布尔值')
+                if sl.get('type', 'fixed') not in ['fixed', 'atr']:
+                    errors.append(f'{prefix}: stop_loss.type 必须是 fixed/atr')
+                for k in ('fixed_pct', 'atr_multiple'):
+                    v = sl.get(k)
+                    if v is not None and (not isinstance(v, (int, float)) or v <= 0):
+                        errors.append(f'{prefix}: stop_loss.{k} 必须为正数')
+
+    gs = config.get('global_settings', {})
+    rc = gs.get('risk_control', {})
+    if not isinstance(rc.get('max_position_per_currency', 0), (int, float)):
+        errors.append('单币种最大持仓必须为数字')
+    if not isinstance(rc.get('max_position_per_currency_usd', 0), (int, float)):
+        errors.append('单币种最大持仓(USD口径)必须为数字')
+    if not isinstance(rc.get('max_total_position', 0), (int, float)):
+        errors.append('总最大持仓必须为数字')
+
+    # 人工强平后的自动开仓冷却时长（分钟，0=不冷却）
+    mcp = gs.get('manual_close_pause_minutes', 30)
+    if not isinstance(mcp, (int, float)) or isinstance(mcp, bool) or mcp < 0:
+        errors.append('manual_close_pause_minutes 必须为非负数字')
+
+    # 邮件通知同类冷却时长（分钟，范围与前端输入框 min/max 保持一致）
+    ecd = gs.get('email_cooldown_minutes', 30)
+    if not isinstance(ecd, (int, float)) or isinstance(ecd, bool) or not (1 <= ecd <= 1440):
+        errors.append('email_cooldown_minutes 必须为 1~1440 之间的数字（分钟）')
+
+    # 连续执行失败告警阈值（轮数，0=不告警）
+    cfa = gs.get('consecutive_failure_alert_rounds', 5)
+    if not isinstance(cfa, (int, float)) or isinstance(cfa, bool) or cfa < 0:
+        errors.append('consecutive_failure_alert_rounds 必须为非负数字')
+
+    # 睡眠时段强平：长周期反转时用户看不到提醒邮件，改为强平趋势仓
+    nfc = gs.get('night_force_close')
+    if nfc is not None:
+        if not isinstance(nfc, dict):
+            errors.append('night_force_close 必须为对象')
+        else:
+            if not isinstance(nfc.get('enabled', True), bool):
+                errors.append('night_force_close.enabled 必须为布尔值')
+            for k in ('start_hour', 'end_hour'):
+                v = nfc.get(k, 0)
+                if not isinstance(v, int) or isinstance(v, bool) or not (0 <= v <= 23):
+                    errors.append(f'night_force_close.{k} 必须为 0-23 的整数（东八区）')
+
+    # 反向持仓风控（仅趋势仓 period_mode=dual 时实际生效）
+    rg = gs.get('reverse_position_guard')
+    if rg is not None:
+        if not isinstance(rg, dict):
+            errors.append('reverse_position_guard 必须为对象')
+        else:
+            if not isinstance(rg.get('enabled', False), bool):
+                errors.append('reverse_position_guard.enabled 必须为布尔值')
+            gm = rg.get('grace_minutes', 10)
+            if not isinstance(gm, (int, float)) or gm <= 0:
+                errors.append('reverse_position_guard.grace_minutes 必须为正数')
+
+    return errors
+
+
+# =====================================================================
+# 配置管理 API — 邮件配置
+# =====================================================================
+
+@app.route('/api/task/config/email', methods=['GET'])
+def get_email_config():
+    """获取邮件配置（隐藏授权码）"""
+    try:
+        from .task.config.email_config import EMAIL_CONFIG, ADMIN_EMAIL
+        safe_config = {
+            'from_email': EMAIL_CONFIG.get('from_email', ''),
+            'smtp_host': EMAIL_CONFIG.get('smtp_host', ''),
+            'smtp_port': EMAIL_CONFIG.get('smtp_port', 465),
+            'use_ssl': EMAIL_CONFIG.get('use_ssl', True),
+            'admin_email': ADMIN_EMAIL,
+            'password_masked': '****'  # 不暴露真实授权码
+        }
+        return jsonify({'code': 200, 'message': 'success', 'data': safe_config})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/config/email', methods=['POST'])
+def save_email_config():
+    """保存邮件配置"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'code': 400, 'message': '请求数据为空', 'data': None})
+
+        from_email = data.get('from_email', '').strip()
+        smtp_host = data.get('smtp_host', 'smtp.qq.com').strip()
+        smtp_port = int(data.get('smtp_port', 465))
+        use_ssl = bool(data.get('use_ssl', True))
+        admin_email = data.get('admin_email', '').strip()
+        password = data.get('password', '').strip()
+
+        # 校验
+        email_pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+        if not _re.match(email_pattern, from_email):
+            return jsonify({'code': 400, 'message': '发件人邮箱格式不正确', 'data': None})
+        if not _re.match(email_pattern, admin_email):
+            return jsonify({'code': 400, 'message': '收件人邮箱格式不正确', 'data': None})
+        if smtp_port not in [465, 587, 25]:
+            return jsonify({'code': 400, 'message': 'SMTP端口必须是 465/587/25', 'data': None})
+
+        # 读取当前配置，保留旧密码（如果前端传的是 **** 表示不修改）
+        try:
+            from .task.config.email_config import EMAIL_CONFIG as _old_cfg
+            old_password = _old_cfg.get('password', '')
+        except Exception:
+            old_password = ''
+
+        final_password = password if password and password != '****' else old_password
+
+        # 写入 email_config.py
+        content = f'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+邮箱配置
+========
+集中管理邮件通知相关的所有配置项。
+修改此处即可影响 email_tool.py 和 message_notifier.py 的行为。
+"""
+
+# =============================================================================
+# SMTP 发件配置
+# =============================================================================
+EMAIL_CONFIG = {{
+    'from_email':  '{from_email}',
+    'password':    '{final_password}',
+    'smtp_host':   '{smtp_host}',
+    'smtp_port':   {smtp_port},
+    'use_ssl':     {use_ssl},
+}}
+
+# =============================================================================
+# 收件人配置
+# =============================================================================
+ADMIN_EMAIL = '{admin_email}'
+
+
+def get_email_config() -> dict:
+    """返回 SMTP 配置副本"""
+    return EMAIL_CONFIG.copy()
+
+
+def get_admin_email() -> str:
+    """返回管理员邮箱地址"""
+    return ADMIN_EMAIL
+'''
+        with open(_EMAIL_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        return jsonify({'code': 200, 'message': '邮件配置已保存', 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/config/validate', methods=['GET'])
+def validate_config():
+    """校验当前配置文件合法性"""
+    try:
+        config = _load_trading_config()
+        errors = _validate_trading_config(config)
+        if errors:
+            return jsonify({'code': 400, 'message': '配置存在问题', 'data': {'errors': errors}})
+        return jsonify({'code': 200, 'message': '配置校验通过', 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 实盘交易调度器 API
+# =====================================================================
+
+@app.route('/api/task/trading/start', methods=['POST'])
+def trading_start():
+    """启动实盘交易调度器（可指定账号）"""
+    try:
+        from .task.scheduler import task_scheduler
+        data = request.get_json(silent=True) or {}
+        account = (data.get('account') or '').strip() or None
+        ok, msg = task_scheduler.start_trading_scheduler(account)
+        return jsonify({'code': 200 if ok else 400, 'message': msg, 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/trading/accounts', methods=['GET'])
+def trading_accounts():
+    """获取可选 OKX 账号列表（供前端定时任务选择执行账号）"""
+    try:
+        from .api_config import list_accounts
+        return jsonify({'code': 200, 'message': 'success', 'data': list_accounts()})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/trading/stop', methods=['POST'])
+def trading_stop():
+    """停止实盘交易调度器"""
+    try:
+        from .task.scheduler import task_scheduler
+        ok, msg = task_scheduler.stop_trading_scheduler()
+        return jsonify({'code': 200 if ok else 400, 'message': msg, 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/trading/status', methods=['GET'])
+def trading_status():
+    """获取实盘交易调度器状态"""
+    try:
+        from .task.scheduler import task_scheduler
+        return jsonify({'code': 200, 'message': 'success', 'data': task_scheduler.get_trading_status()})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/trading/runtime', methods=['GET'])
+def trading_runtime():
+    """获取实盘「期望运行状态 + 重启自动拉起开关」（低频接口，会读库）"""
+    try:
+        from .task.scheduler import task_scheduler
+        return jsonify({'code': 200, 'message': 'success',
+                        'data': task_scheduler.get_runtime_status()})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/trading/runtime/auto-resume', methods=['POST'])
+def trading_auto_resume_switch():
+    """打开/关闭「进程重启后自动拉起实盘」开关
+
+    自动拉起会在地位无人看管时重新开始下单，所以默认关闭，必须人工在页面
+    打开一次；打开后只在「上一次确实是运行状态」时才拉起，手动停止会同时
+    清除期望运行标记。
+    """
+    try:
+        from .task.scheduler import task_scheduler
+        data = request.get_json(silent=True) or {}
+        enabled = bool(data.get('enabled'))
+        rt = task_scheduler.set_auto_resume(enabled)
+        return jsonify({
+            'code': 200,
+            'message': ('已打开重启自动拉起：下次进程重启后会自动恢复实盘调度（会发邮件告知）'
+                        if enabled else '已关闭重启自动拉起：进程重启后实盘保持停止，需手动启动'),
+            'data': rt,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 强制平仓 API
+# =====================================================================
+
+@app.route('/api/task/trading/force-close', methods=['POST'])
+def trading_force_close():
+    """强制平仓（全平/平多/平空）"""
+    try:
+        from .task.scheduler import task_scheduler
+        data = request.get_json() or {}
+        close_type = data.get('type', 'all')  # all / long / short
+        if close_type not in ('all', 'long', 'short'):
+            return jsonify({'code': 400, 'message': 'type 必须是 all/long/short', 'data': None})
+
+        ok, msg = task_scheduler.force_close_positions(close_type)
+        return jsonify({'code': 200 if ok else 400, 'message': msg, 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 日志查看 API
+# =====================================================================
+
+_LOG_DIR = _os.path.join(_os.path.dirname(__file__), 'logs')
+_VALID_LOG_FILES = {
+    'task_scheduler': 'task_scheduler.log',
+    'trade_operations': 'trade_operations.log',
+}
+
+
+@app.route('/api/task/logs', methods=['GET'])
+def task_logs():
+    """读取日志文件内容，支持关键字搜索和时间范围过滤
+    参数:
+        file: task_scheduler | trade_operations
+        keyword: 搜索关键字
+        start_time: 开始时间 (YYYY-MM-DD HH:MM:SS)
+        end_time: 结束时间 (YYYY-MM-DD HH:MM:SS)
+        limit: 最大返回行数，默认 500
+        order: asc | desc，默认 desc（最新在前）
+    """
+    try:
+        file_key = request.args.get('file', 'task_scheduler')
+        if file_key not in _VALID_LOG_FILES:
+            return jsonify({'code': 400, 'message': f'无效的日志文件: {file_key}', 'data': None})
+
+        log_path = _os.path.join(_LOG_DIR, _VALID_LOG_FILES[file_key])
+        if not _os.path.exists(log_path):
+            return jsonify({'code': 200, 'message': '日志文件不存在（尚未产生日志）', 'data': {'lines': [], 'total': 0}})
+
+        keyword = request.args.get('keyword', '').strip()
+        start_time = request.args.get('start_time', '').strip()
+        end_time = request.args.get('end_time', '').strip()
+        limit = int(request.args.get('limit', 500))
+        order = request.args.get('order', 'desc')
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            raw_lines = f.readlines()
+
+        # 解析并过滤
+        filtered = []
+        for line in raw_lines:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+
+            # 提取时间戳 [YYYY-MM-DD HH:MM:SS]
+            line_time = ''
+            if len(line) > 21 and line[0] == '[':
+                line_time = line[1:20]
+
+            # 时间范围过滤
+            if start_time and line_time and line_time < start_time:
+                continue
+            if end_time and line_time and line_time > end_time:
+                continue
+
+            # 关键字过滤
+            if keyword and keyword.lower() not in line.lower():
+                continue
+
+            filtered.append(line)
+
+        # 排序
+        if order == 'desc':
+            filtered.reverse()
+
+        # 截断
+        total = len(filtered)
+        if limit > 0:
+            filtered = filtered[:limit]
+
+        return jsonify({
+            'code': 200,
+            'message': 'success',
+            'data': {
+                'lines': filtered,
+                'total': total,
+                'returned': len(filtered),
+                'file': file_key,
+            }
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/logs/download', methods=['GET'])
+def task_logs_download():
+    """下载日志文件
+    参数: file: task_scheduler | trade_operations
+    """
+    try:
+        file_key = request.args.get('file', 'task_scheduler')
+        if file_key not in _VALID_LOG_FILES:
+            return jsonify({'code': 400, 'message': f'无效的日志文件: {file_key}', 'data': None})
+
+        log_path = _os.path.join(_LOG_DIR, _VALID_LOG_FILES[file_key])
+        if not _os.path.exists(log_path):
+            return jsonify({'code': 404, 'message': '日志文件不存在', 'data': None})
+
+        return send_file(
+            log_path,
+            mimetype='text/plain',
+            as_attachment=True,
+            download_name=_VALID_LOG_FILES[file_key]
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/task/logs/clear', methods=['POST'])
+def task_logs_clear():
+    """清除日志文件内容
+    参数(JSON): file: task_scheduler | trade_operations
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        file_key = data.get('file', '')
+        if file_key not in _VALID_LOG_FILES:
+            return jsonify({'code': 400, 'message': f'无效的日志文件: {file_key}', 'data': None})
+
+        log_path = _os.path.join(_LOG_DIR, _VALID_LOG_FILES[file_key])
+        if not _os.path.exists(log_path):
+            return jsonify({'code': 200, 'message': '日志文件不存在，无需清除', 'data': None})
+
+        # 清空文件内容
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.truncate(0)
+
+        name_map = {'task_scheduler': '定时任务日志', 'trade_operations': '交易操作日志'}
+        return jsonify({'code': 200, 'message': f'{name_map.get(file_key, file_key)} 已清除', 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 测试邮件 API
+# =====================================================================
+
+@app.route('/api/task/email/test', methods=['POST'])
+def email_test():
+    """发送测试邮件"""
+    try:
+        from .task.scheduler import task_scheduler
+        data = request.get_json() or {}
+        to_email = data.get('to_email', '').strip() or None
+        ok, msg = task_scheduler.send_test_email(to_email)
+        return jsonify({'code': 200 if ok else 400, 'message': msg, 'data': None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+# =====================================================================
+# 系统监控 API（内存自监控 + 系统级健康检查，/system-status 页面使用）
+# =====================================================================
+
+@app.route('/api/system/status', methods=['GET'])
+def system_status():
+    """系统概况：内存监控线程状态 + 最近一轮系统检查结果"""
+    try:
+        from .memory_watchdog import get_memory_status
+        from .system_monitor import get_last_result
+        return jsonify({'code': 200, 'data': {
+            'watchdog': get_memory_status(),
+            'last_check': get_last_result(),
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/system/check', methods=['POST'])
+def system_check_now():
+    """手动触发一轮系统级检查（同步执行，返回本轮结果）"""
+    try:
+        from .system_monitor import run_check
+        return jsonify({'code': 200, 'message': '检测完成', 'data': run_check(source='embedded')})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
+@app.route('/api/system/memory/history', methods=['GET'])
+def system_memory_history():
+    """内存历史趋势：读本地 logs/memory_history.jsonl
+    参数:
+        limit: 采样点数上限，默认 1000，最大 10000（按采样频率约含 4~35 天数据）
+        source: 可选 app（进程内自监控）| guard（系统监控外部采样）
+    """
+    try:
+        from .memory_watchdog import read_history, get_memory_status
+        limit = min(max(int(request.args.get('limit', 1000)), 10), 10000)
+        source = request.args.get('source', '').strip()
+        if source not in ('', 'app', 'guard'):
+            return jsonify({'code': 400, 'message': 'source 必须是 app|guard', 'data': None})
+        st = get_memory_status()
+        return jsonify({'code': 200, 'data': {
+            'records': read_history(limit=limit, source=source or None),
+            'warn_mb': st['warn_mb'],
+            'kill_mb': st['kill_mb'],
+            'history_file': st['history_file'],
+        }})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})

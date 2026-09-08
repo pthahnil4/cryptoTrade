@@ -1,0 +1,52 @@
+{
+    "all_coins": [
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "XRP-USDT-SWAP",
+        "BNB-USDT-SWAP",
+        "USDC-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "TRX-USDT-SWAP",
+        "DOGE-USDT-SWAP",
+        "ADA-USDT-SWAP",
+        "AVAX-USDT-SWAP",
+        "LTC-USDT-SWAP",
+        "SHIB-USDT-SWAP",
+        "POL-USDT-SWAP",
+        "XLM-USDT-SWAP",
+        "DASH-USDT-SWAP",
+        "DOT-USDT-SWAP",
+        "ATOM-USDT-SWAP",
+        "ETC-USDT-SWAP",
+        "BCH-USDT-SWAP",
+        "TON-USDT-SWAP",
+        "CRO-USDT-SWAP",
+        "XAUT-USDT-SWAP",
+        "INJ-USDT-SWAP",
+        "LINK-USDT-SWAP",
+        "NEAR-USDT-SWAP",
+        "UNI-USDT-SWAP",
+        "TRUMP-USDT-SWAP"
+    ],
+    "default_selected": [
+        "BTC-USDT-SWAP"
+    ],
+    "starred_coins": [
+        "BTC-USDT-SWAP",
+        "ETC-USDT-SWAP"
+    ],
+    "floating_coins": [
+        "ALLO-USDT-SWAP",
+        "TSLA-USDT-SWAP",
+        "UB-USDT-SWAP",
+        "CL-USDT-SWAP",
+        "ZAMA-USDT-SWAP",
+        "BILL-USDT-SWAP",
+        "LA-USDT-SWAP",
+        "KAITO-USDT-SWAP",
+        "BEAT-USDT-SWAP",
+        "RE-USDT-SWAP",
+        "O-USDT-SWAP",
+        "INTC-USDT-SWAP"
+    ]
+}

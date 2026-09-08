@@ -1,0 +1,25 @@
+# Web 框架
+flask>=2.0.0
+
+# 数据分析
+pandas>=1.3.0
+numpy>=1.21.0
+
+# 量化回测
+backtrader>=1.9.76
+
+# OKX 交易所 API
+python-okx>=0.3.0
+
+# HTTP 客户端（OKX SDK 底层；项目直接用于显式超时配置与网络异常处理）
+httpx>=0.24.0
+
+# 定时任务调度
+APScheduler>=3.10.0
+
+# Excel(.xlsx) 导出（星标币种行情导出功能依赖）
+openpyxl>=3.0.0
+
+# MySQL 数据库（JSON 存储迁移批次1起启用）
+SQLAlchemy>=2.0.0
+PyMySQL>=1.1.0
