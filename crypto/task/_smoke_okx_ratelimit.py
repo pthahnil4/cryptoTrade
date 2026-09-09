@@ -230,9 +230,27 @@ _TARGETS = {
     'crypto/star_market.py': '_rl(',
     'crypto/batch_trend_updater.py': '_rl(',
     'crypto/api_routes.py': '_rl_call(',
+    # 以下是 2026-09-10 补的清单盲区：当时只扫了 7 个文件就报了 41/41 全绿，
+    # 而 alert_monitor / app.py 完全没接限频——“扫描清单不全”会让静态核对
+    # 给出假的完备感，新增调用 OKX 的模块时必须往里加。
+    'crypto/task/monitor/alert_monitor.py': '_rl(',
+    'crypto/app.py': '_rl_read(',
+    'crypto/plan_routes.py': '_rl_call(',
+}
+# 已登记的例外：(文件, 方法名) —— 不算“裸调用”，但必须在注释里写清理由。
+_RAW_READ_ALLOW = {
+    # plan_routes 走 api_routes._rl_call（传对象+方法名，不是直调），
+    # 这里只剩“限频模块导入失败才走”的 else 直连兜底分支。
+    # 代价：同文件同方法的真正裸调用也会被放过，新增其他接口仍会被卡。
+    ('crypto/plan_routes.py', 'get_account_balance'): '已包好的 fallback 分支',
 }
 _CLIENT = (r'\b(?:self\.)?(?:market_api|trade_api|account_api|public_api|'
-           r'funding_api|marketDataAPI|local_api|_get_api\(\))')
+           r'funding_api|marketDataAPI|local_api|_mkt_api|_acct_api|'
+           # 链式直调也要抓到：旧版只认变量名，正因如此没发现
+           # `MarketData.MarketAPI(flag=flag).get_ticker(...)` 与
+           # `get_account_api(account).get_positions(...)` 这两种裸调用。
+           r'get_\w*api\([^()]*\)|'
+           r'(?:\w+\.)?(?:MarketAPI|AccountAPI|TradeAPI|PublicAPI|FundingAPI)\([^()]*\))')
 _RAW_READ = re.compile(_CLIENT + r'\.(get_\w+)\(')
 _RAW_WRITE = re.compile(_CLIENT +
                         r'\.(place_order|place_algo_order|cancel_order|cancel_algo_order|'
@@ -248,6 +266,8 @@ for rel, wrap in _TARGETS.items():
     path = os.path.join(_ROOT, rel.replace('/', os.sep))
     src = open(path, encoding='utf-8').read()
     for m in _RAW_READ.finditer(src):
+        if (rel, m.group(1)) in _RAW_READ_ALLOW:
+            continue
         unwired.append(f"{rel}:{m.group(1)}")
     for m in _RAW_WRITE.finditer(src):
         written_ok += 1

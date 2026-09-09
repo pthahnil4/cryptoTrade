@@ -31,6 +31,22 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
+# 只读接口限频/退避（问题#8）：页面刷新与同进程的实盘调度、行情扫描、告警监控抢
+# 的是同一个 API key 配额，不限频时一旦打爆就集体回 50011（表现为“页面暂时拿不到
+# 数据”）。导入失败时置 None，_rl_read 退化为直连，绝不因限频模块不可用而弄挂页面。
+try:
+    from .task.utils.okx_ratelimit import limited as _rl_limited
+except ImportError:
+    _rl_limited = None
+
+
+def _rl_read(group, func, *args, **kwargs):
+    """只读 OKX 接口的统一出口：节流 + 50011 退避；限频模块缺失时直通。
+
+    只给查询类调用用。下单/撤单/改单严禁塞进来（结果未知时自动重发会重复下单）。
+    """
+    return _rl_limited(group, func, *args, **kwargs) if _rl_limited else func(*args, **kwargs)
+
 # =====================================================================
 # 注册 API 路由蓝图（将 demo 封装为 HTTP 接口）
 # =====================================================================
@@ -60,6 +76,16 @@ app.register_blueprint(alert_bp)
 # 注册分析纪律蓝图（小时槽合格判定/打卡闸门/反懈怠看板）
 # =====================================================================
 app.register_blueprint(discipline_bp)
+
+# =====================================================================
+# Web 访问闸门（审计问题#1：原先 0.0.0.0 监听 + 零鉴权，实盘下单/强平接口全暴露）
+# ---------------------------------------------------------------------
+# 必须放在所有蓝图注册之后：before_request 对蓝图路由同样生效，而 /auth/gate
+# 这个端点由本模块自带。fail-safe 口径：没配口令时只放行本机，配了口令时
+# 所有来源（含回环）都要过口令。判定逻辑与理由见 web_auth.py 文档。
+# =====================================================================
+from .web_auth import init_app as _init_web_auth
+_init_web_auth(app)
 
 # =====================================================================
 # 启动加速：DB 后台预热 + 调度器后台启动
@@ -1185,7 +1211,8 @@ def get_contract_spec():
         # 现价（公共行情接口，失败不阻断，仅换算结果为 0）
         price = 0.0
         try:
-            t = _MarketData.MarketAPI(flag=flag).get_ticker(instId=inst_id)
+            _mkt_api = _MarketData.MarketAPI(flag=flag)
+            t = _rl_read('market_ticker', _mkt_api.get_ticker, instId=inst_id)
             if t and t.get('code') == '0' and t.get('data'):
                 price = float(t['data'][0].get('last', 0) or 0)
         except Exception:
@@ -1622,7 +1649,8 @@ def task_residual_positions():
             pass
         ex_map = {}
         try:
-            r = get_account_api(account).get_positions(instType='SWAP')
+            _acct_api = get_account_api(account)
+            r = _rl_read('positions', _acct_api.get_positions, instType='SWAP')
             for p in (r.get('data') or []):
                 if abs(float(p.get('pos') or 0)) <= 0.001:
                     continue
@@ -1810,7 +1838,8 @@ def task_positions_current():
 
         # 1. 交易所实时持仓（按 instId 索引，过滤零持仓）
         try:
-            r = get_account_api(account).get_positions(instType='SWAP')
+            _acct_api = get_account_api(account)
+            r = _rl_read('positions', _acct_api.get_positions, instType='SWAP')
         except Exception as e:
             return jsonify({'code': 502,
                             'message': f'OKX 持仓查询失败: {e}', 'data': None})
@@ -1926,7 +1955,8 @@ def task_positions_history():
         params = {'instType': 'SWAP', 'instId': inst_id, 'limit': str(limit)}
         if after:
             params['after'] = after
-        r = get_account_api(account).get_positions_history(**params)
+        _acct_api = get_account_api(account)
+        r = _rl_read('positions', _acct_api.get_positions_history, **params)
         if r.get('code') != '0':
             return jsonify({'code': 502,
                             'message': f"OKX 查询失败: {r.get('msg') or '未知错误'}",

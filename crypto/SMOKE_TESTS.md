@@ -16,7 +16,7 @@
 | ⚠️ 写库 + 租约 | 写 DB/KV，需取维护租约暂停生产巡检 | ⚠️ 生产环境跑要避开巡检高峰 |
 | 🌐 连真实 API | 调 OKX 接口 | ❌ 实盘时段慎跑 |
 
-## 🔒 纯离线（17 个）
+## 🔒 纯离线（18 个）
 
 | 脚本 | 覆盖模块 | 何时重跑 |
 |---|---|---|
@@ -24,6 +24,7 @@
 | `crypto/_smoke_config_save_flag.py` | 配置写库失败如实上报（问题#7）—— `save_config` 返回 DB 主存结果、`last_save_db_ok()` 一次性消费、失败时文件仍落盘 | 改 `real_strategy_adapter.save_config` 或 `app._coin_cfg_warn()` |
 | `crypto/_smoke_longtermism.py` | 长期主义 v1.1（`plan_routes._calc_presence_days`）—— 在场天数去重、最佳连续 | 改 `plan_routes.py` 在场/连续天数逻辑 |
 | `crypto/_smoke_sysmon.py` | 内存自监控 + 系统监控（`memory_watchdog` / `system_monitor`）—— RSS 读取、JSONL 写入、状态字段 | 改 `memory_watchdog.py` 或 `system_monitor.py` |
+| `crypto/_smoke_web_auth.py` | Web 访问闸门（问题#1）—— 41 场景覆盖判定矩阵（未配口令=只放行回环、配口令=回环也要过口令）、cookie 存 HMAC 而非口令原文、口令来源优先级与文件回退、`safe_next` 挡开放重定向，并用自建极小 Flask app 验真接线（403/401 JSON与登录页、不发/发 cookie、HttpOnly+SameSite=Lax、`?token=` 引导后抹掉地址栏口令、Bearer、登出、静态资源免鉴权） | 改 `crypto/web_auth.py` 任何判定分支或 `init_app` 里的钩子；**注意它不导入 `crypto.app`**，闸门在真 app 上的接线要手工在线验（启服务后跑一轮 HTTP，见《闸门改动的在线验证步骤》） |
 | `crypto/task/_smoke_cl_ord_id.py` | 下单幂等打标与「结果未知」反查（问题#4）—— 29 场景覆盖 clOrdId 格式/打标全覆盖/异常后 found 不重发、absent 可重发、unknown 停手需人工核实 | 改 `trade_executor.py` 的 `gen_cl_ord_id` / `probe_*_by_*_id` / `execute_trade` / `execute_reduce_only_order` / `execute_chase_limit_order`，或新增下单出口时 |
 | `crypto/task/_smoke_dir_lock.py` | 人工方向锁定语义（2026-09-01 事故修复）—— 8 个场景覆盖 dual/single/页面锁定 | 改 `trend_range_trader.py` 方向锁定分支 |
 | `crypto/task/_smoke_dual_position.py` | 双仓位架构离线（**常驻**）—— 趋势/区间/减仓/对账/配置校验 | 改 `position_order_manager.py` 或 `trend_range_trader.py` 挂单/账本链路 |
@@ -31,7 +32,7 @@
 | `crypto/task/_smoke_leverage_guard.py` | 杠杆交易所回核（2026-09-01）—— 8 个场景覆盖缓存/回核/重设/cross-isolated 分键 | 改 `_set_leverage_if_needed` |
 | `crypto/task/_smoke_manual_close_detect.py` | 手动平仓检测 `_detect_external_close`（临时） | 改 `trend_range_trader._detect_external_close` |
 | `crypto/task/_smoke_manual_override_regression.py` | 人工干预三问题回归 —— 幽灵挂单/强制方向持续期/加仓吸收/对账缩减 | 改挂单管理器 `reconcile` 或 `_reconcile_slot` |
-| `crypto/task/_smoke_okx_ratelimit.py` | 只读接口限频/退避（问题#8）—— 41 场景覆盖开关直通、令牌桶、50011 退避、网络抖动重试、本地 bug 不重试、等不到令牌抛 RateLimited、环境变量覆盖，并静态核对 6 个文件「只读已接线 / 下单未被包」 | 改 `task/utils/okx_ratelimit.py`，或改 `trade_executor` / `api_routes` / `market_scanner` / `star_market` / `batch_trend_updater` / `instrument_spec` 里 OKX 接口调用方式（尤其新增只读接口、或给下单加包层时） |
+| `crypto/task/_smoke_okx_ratelimit.py` | 只读接口限频/退避（问题#8）—— 41 场景覆盖开关直通、令牌桶、50011 退避、网络抖动重试、本地 bug 不重试、等不到令牌抛 RateLimited、环境变量覆盖，并静态核对 10 个文件（1 个自身除外）“只读已接线 / 下单未被包” | 改 `task/utils/okx_ratelimit.py`，或改 `trade_executor` / `api_routes` / `market_scanner` / `star_market` / `batch_trend_updater` / `instrument_spec` / `alert_monitor` / `app.py` / `plan_routes` 里 OKX 接口调用方式（尤其新增只读接口、或给下单加包层时）；**新增调用 OKX 的模块必须加进 `_TARGETS`** |
 | `crypto/task/_smoke_order_step.py` | 合约下单步长三档（2026-09-01 实盘故障）—— XRP/NEAR/POL 三档规格 | 改 `InstrumentSpecCache.steps()`/`quantize()` 或挂单 `_q()` |
 | `crypto/task/_smoke_order_ttl.py` | 挂单 TTL 到期撤销（临时）—— 超龄撤单/未超龄保留/部分成交入账 | 改 `poll_fills` 或 TTL 分支 |
 | `crypto/task/_smoke_rg2.py` | 反向持仓风控强平（临时）—— 成功/失败分支、通知计数 | 改反向持仓风控分支 |
@@ -90,12 +91,36 @@
 > 通则：这些脚本都用了「首次失败即 `sys.exit(1)`」的 `ok()`，一旦前面卡住，后面的
 > 用例**从未跑到**——修好第一个坏点后必须复跑全量，才会暴露被掩盖的第二个。
 
+### 还有一类更危险：假完备（绿灯不等于验全了）
+
+`_smoke_okx_ratelimit.py` 的静态核对报 41/41 全绿，事后发现 `alert_monitor.py` 与
+`crypto/app.py` 共四处只读接口**完全没接线**：因为 `_TARGETS` 只列了 7 个文件，而且
+`_CLIENT` 只认变量名（`account_api.get_positions(`），认不出链式直调
+（`MarketData.MarketAPI(flag=flag).get_ticker(`、`get_account_api(a).get_positions(`）。
+2026-09-10 补了清单与正则，并用一个临时脚本做**反向验证**（把六种裸调用形状喂给
+正则，确认逐个能咬、四种已包形式不误报）才收工——静态扫到 0 命中与根本没扫到，
+在输出上长得一模一样。
+
+## 闸门改动的在线验证步骤（改 `web_auth.py` 后补做一遍）
+
+`_smoke_web_auth.py` 故意不导入 `crypto.app`（那会拉起调度器与 DB 预热），它只能证明
+闸门自身逻辑对，证明不了“挂在真 app 上确实生效”。两边都验才算改完：
+
+```powershell
+$env:CRYPTO_NO_BACKGROUND='1'; $env:CRYPTO_WEB_PORT='5111'; python app.py   # 后台起临时实例
+```
+
+然后至少打四个点：未登录 `GET /` → 401 登录页；`POST /auth/gate` 带错口令 → 401 且不发
+cookie；带对口令 → 302 到 `next` 且 `Set-Cookie` 含 HttpOnly；登录后 `GET /` 与
+`/plan`、`/api-console`、`/api/task/status` 都不再是 401/403（验蓝图路由与模板/静态资源
+没被误伤）。2026-09-10 就是这么跑过一轮 11 项全绿的。
+
 ## 已知缺口（待办）
 
 - [ ] 公共断言 helper `ck()` / `_title()` / `FAILS` 在至少 4 个文件里各自复制
   （`_smoke_discipline_mail.py`、`_smoke_discipline_http.py`、`_smoke_strategy_gate.py`、
   `_smoke_discipline.py`），可考虑抽到 `crypto/_smoke_util.py`
-- [ ] 没有统一 runner；想跑全部 🔒 脚本得手敲 17 条命令
+- [ ] 没有统一 runner；想跑全部 🔒 脚本得手敲 18 条命令
 - [ ] `_smoke_pos_history.py` 不是严格意义的冒烟测试，是查询工具，可考虑挪到 `demo/` 或重命名
 
 ## 维护约定

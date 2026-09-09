@@ -35,6 +35,9 @@ data/mail_preview/
 # 远端 MySQL 完整连接串（含账号密码）。本地/服务器保留，不进版本库。
 # 若确实需要入库，删除下面这一行即可。
 data/db_url.txt
+# Web 访问口令（crypto/web_auth.py 读，控制谁能访问实盘面板）。留本机不入库；
+# 也可改用环境变量 CRYPTO_WEB_TOKEN，两选一。
+data/web_token.txt
 # OKX 实盘 API 密钥（api_key/secret_key/passphrase 全明文）。这两份是运行必需
 # 文件，只不入库、不删除、不改名，程序照旧 import api_config。
 # 新环境搭配置请看脱敏模板：crypto/api_config.example.py 与

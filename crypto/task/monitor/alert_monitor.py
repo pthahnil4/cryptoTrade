@@ -53,6 +53,26 @@ except ImportError:
 import okx.MarketData as MarketData
 import okx.Account as Account
 
+# 只读接口限频/退避（问题#8）：本监控线程与实盘调度、页面轮询共用同一个 API key，
+# 不限频时互相打爆就集体回 50011，表现为“该发告警的那轮拿不到数据”静默漏报。
+# 导入失败时置 None，_rl() 直通原始调用，绝不因为限频模块不可用而断掉告警链路。
+# 两个调用点都在 except Exception 里，所以抛 RateLimited 也只是“本轮跳过”。
+try:
+    try:
+        from ..utils.okx_ratelimit import limited as _rl_limited
+    except ImportError:
+        from utils.okx_ratelimit import limited as _rl_limited
+except ImportError:
+    _rl_limited = None
+
+
+def _rl(group, func, *args, **kwargs):
+    """只读 OKX 接口的统一出口：节流 + 50011 退避；限频模块缺失时直通。
+
+    严禁把下单/撤单类请求塞进来（自动重发会重复下单）。
+    """
+    return _rl_limited(group, func, *args, **kwargs) if _rl_limited else func(*args, **kwargs)
+
 logger = logging.getLogger(__name__)
 
 _MARKET_API = None
@@ -186,7 +206,8 @@ def _resolve_price_symbols(cfg: dict) -> list:
 def _fetch_window_change_pct(market_api, inst_id: str, window_minutes: int):
     """取 1m K 线计算窗口内涨跌幅 %；数据不足返回 None"""
     limit = min(int(window_minutes) + 2, 100)
-    res = market_api.get_candlesticks(instId=inst_id, bar='1m', limit=str(limit))
+    res = _rl('market_candles', market_api.get_candlesticks,
+              instId=inst_id, bar='1m', limit=str(limit))
     data = (res or {}).get('data') or []
     if len(data) < 2:
         return None
@@ -204,7 +225,7 @@ def _fetch_positions(account: str):
     account_api = Account.AccountAPI(
         api_cfg['api_key'], api_cfg['secret_key'], api_cfg['passphrase'],
         False, api_cfg['flag'])
-    res = account_api.get_positions(instType='SWAP')
+    res = _rl('positions', account_api.get_positions, instType='SWAP')
     if not res or res.get('code') != '0':
         raise RuntimeError(f"持仓查询失败: {(res or {}).get('msg', res)}")
     positions = []

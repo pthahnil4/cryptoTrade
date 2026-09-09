@@ -29,7 +29,10 @@ OKX 对每个接口都有「N 次/2 秒」的限频，超限回 code=50011，客
 - 令牌桶是**进程内**共享。OKX 的限频按 API key 计，当前实盘只有一个账号，
   所以进程级分桶够用；若将来同进程并发跑多账号，需要把 bucket key 细分到账号。
 - 已接线范围：trade_executor 的只读调用点、api_routes 全部只读路由、
-  market_scanner / star_market / batch_trend_updater / instrument_spec。
+  market_scanner / star_market / batch_trend_updater / instrument_spec /
+  plan_routes 余额代理，以及 2026-09-10 补上的两个盲区：alert_monitor（K线与
+  持仓查询）与 crypto/app.py 里四处直调的只读接口。接线清单以
+  `_smoke_okx_ratelimit.py` 的 `_TARGETS` 为准，新增调用 OKX 的模块要跟着加。
   **实盘 K 线抓取路径 pro3_singletimeframe._request_candles 有意未接线**：
   那是交易核心的数据源，按用户决定保持原样直连，不给调度主链路新增
   任何可能卡住取数的环节。后来者若看到「K 线没限频」，那是明确决定，

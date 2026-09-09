@@ -29,12 +29,28 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from crypto.app import app
+from crypto.web_auth import configured_token as _web_token
 
 if __name__ == '__main__':
+    # 监听地址/端口可用环境变量覆盖（默认仍 0.0.0.0 + 5000，兼容现有部署）。
+    # 安全不靠改这里：真正兜底的是 crypto/web_auth.py 的访问闸门——
+    # 没配口令时远程一律 403（等价于只绑本机），配了口令时远程输口令进入，
+    # 因此绑 0.0.0.0 也不再是“实盘接口裸奔”。
+    _host = (os.environ.get('CRYPTO_WEB_HOST') or '0.0.0.0').strip()
+    _port = int(os.environ.get('CRYPTO_WEB_PORT') or 5000)
+
     print("[启动] 前后端分离服务已启动！")
-    print("[启动] 请在浏览器访问: http://127.0.0.1:5000")
-    print("[启动] 加密货币监控台: http://127.0.0.1:5000/")
-    print("[启动] API控制台: http://127.0.0.1:5000/api-console")
+    print(f"[启动] 请在浏览器访问: http://127.0.0.1:{_port}")
+    print(f"[启动] 加密货币监控台: http://127.0.0.1:{_port}/")
+    print(f"[启动] API控制台: http://127.0.0.1:{_port}/api-console")
+    if _web_token():
+        print("[安全] 访问口令已启用（CRYPTO_WEB_TOKEN 或 data/web_token.txt）："
+              "所有设备都要先在登录页输一次口令")
+    else:
+        print(f"[安全] 未配置访问口令 → 只允许本机访问，从其它设备打开 "
+              f"http://{_host}:{_port} 会被 403 拦下")
+        print("[安全] 想让手机/电脑远程用：设 CRYPTO_WEB_TOKEN 环境变量，"
+              "或把口令写进 data/web_token.txt（已在 .gitignore），重启生效")
     # threaded=True：Flask 开发服务器默认单线程，并发请求（页面加载+多个fetch）
     # 会互相阻塞甚至导致进程异常退出，开启多线程保证接口可用性
-    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+    app.run(debug=False, host=_host, port=_port, threaded=True)
