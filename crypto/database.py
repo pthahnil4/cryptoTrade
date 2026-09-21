@@ -20,9 +20,12 @@ import os
 import logging
 import datetime
 import threading
+import time
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, make_url
 from sqlalchemy.orm import sessionmaker, declarative_base
+
+from .db_performance import TimedQueuePool, instrument_engine, measure_commit
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,77 @@ def resolve_db_url() -> str:
 
 _engine = None
 _SessionFactory = None
+_engine_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------
+# DB 连接健康度（供"持久化降级"旁路告警读取，见 trend_range_trader P2-c）
+# 只在 session_scope 出入口被动更新，零额外开销；跨线程共享故加锁。
+# consecutive_failures 统计"连续"连接类失败次数，任一次成功 commit 即清零，
+# 因此偶发抖动不会累积、只有持续故障（DB 真挂了）才会爬升。
+# ---------------------------------------------------------------------
+_db_health_lock = threading.Lock()
+_DB_HEALTH = {
+    'consecutive_failures': 0,   # 连续连接类失败次数（健康度主指标）
+    'total_failures': 0,         # 进程累计连接类失败次数
+    'last_ok_ts': 0.0,           # 最近一次成功 commit 的时间戳
+    'last_error': '',            # 最近一次连接类失败摘要
+}
+
+
+def _is_conn_error(exc: BaseException) -> bool:
+    """是否"连接/可用性"类数据库故障（区别于约束冲突等业务数据错误）。
+
+    业务错误说明 DB 其实可达（只是这条写失败），不应记为链路降级；只有连接层
+    异常（OperationalError/InterfaceError/DisconnectionError/TimeoutError）才
+    意味着持久化真的用不了。延迟导入 sqlalchemy.exc，导入失败时保守判 False。
+    """
+    try:
+        from sqlalchemy.exc import (
+            OperationalError, InterfaceError, DisconnectionError, TimeoutError as SATimeout)
+        conn_types = (OperationalError, InterfaceError, DisconnectionError, SATimeout)
+    except Exception:
+        return False
+    if isinstance(exc, conn_types):
+        return True
+    # DBAPI 层原始异常（pymysql 未包装的连接错误）按类名兜底识别
+    name = type(exc).__name__.lower()
+    return any(k in name for k in ('operationalerror', 'interfaceerror',
+                                   'disconnection', 'connectionerror', 'timeout'))
+
+
+def _db_note_success():
+    with _db_health_lock:
+        _DB_HEALTH['consecutive_failures'] = 0
+        _DB_HEALTH['last_ok_ts'] = time.time()
+
+
+def _db_note_failure(exc: BaseException):
+    with _db_health_lock:
+        _DB_HEALTH['consecutive_failures'] += 1
+        _DB_HEALTH['total_failures'] += 1
+        _DB_HEALTH['last_error'] = (str(exc).splitlines() or [''])[0][:200]
+
+
+def db_health() -> dict:
+    """返回 DB 连接健康度快照（只读副本）：连续失败数 / 累计失败数 / 最近成功时间 / 最近错误。"""
+    with _db_health_lock:
+        return dict(_DB_HEALTH)
+
+
+def _connect_args(url: str) -> dict:
+    """按方言给出建连参数。
+
+    connect_timeout 是 MySQL 驱动专有入参：非 MySQL 目标（本地 SQLite 隔离冒烟）
+    一并传过去会直接 TypeError 建不出引擎，所以只对 MySQL/MariaDB 下发。
+    MySQL 侧含义不变：DB 故障时 5 秒内快速失败，不阻塞启动与请求。
+    """
+    try:
+        if make_url(url).get_dialect().name not in ('mysql', 'mariadb'):
+            return {}
+    except Exception:
+        return {}
+    return {'connect_timeout': 5}
 
 
 def _make_engine():
@@ -68,24 +142,30 @@ def _make_engine():
             '数据库未配置：请设置环境变量 CRYPTO_DB_URL，'
             '或在外置数据目录创建 db_url.txt（单行连接串，'
             '格式 mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）')
-    return create_engine(
+    engine = create_engine(
         url,
+        poolclass=TimedQueuePool,
         pool_pre_ping=True,     # 取连接前先探活，规避 MySQL 超时断开
         pool_recycle=1800,      # 连接最长存活 30 分钟后强制换新
         pool_size=10,           # 常驻连接扩容，减少 overflow 连接的反复销毁/重建握手
         max_overflow=5,         # overflow 仅作突发缓冲（其连接用完即销毁，代价高）
         pool_timeout=30,
-        pool_use_lifo=True,     # 后进先出：热连接持续复用，pre_ping 探活频率大幅下降
-        connect_args={'connect_timeout': 5},  # DB 故障时快速失败，不阻塞启动/请求
+        pool_use_lifo=True,     # 后进先出复用热连接；checkout 仍会执行 pre_ping
+        connect_args=_connect_args(url),
         future=True)
+    instrument_engine(engine)
+    return engine
 
 
 def get_engine():
-    """获取全局引擎（懒初始化，线程安全由 GIL + 幂等创建兜底）"""
+    """获取全局引擎；初始化期间不发布尚未就绪的会话工厂。"""
     global _engine, _SessionFactory
     if _engine is None:
-        _engine = _make_engine()
-        _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
+        with _engine_lock:
+            if _engine is None:
+                engine = _make_engine()
+                _SessionFactory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+                _engine = engine
     return _engine
 
 
@@ -106,13 +186,27 @@ class session_scope:
         self.session = None
 
     def __enter__(self):
-        self.session = get_session()
+        try:
+            self.session = get_session()
+        except Exception as e:
+            # 连会话都建不出来：几乎必是连接/引擎层故障，记一次 DB 失败后原样抛出
+            _db_note_failure(e)
+            raise
         return self.session
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if exc_type is None:
-                self.session.commit()
+                try:
+                    with measure_commit():
+                        self.session.commit()
+                except Exception as e:
+                    # commit 失败：区分"连接类故障"（计入 DB 健康度）与"业务/数据错误"
+                    # （如约束冲突，说明 DB 其实可达，只是这次写失败，不算链路降级）
+                    if _is_conn_error(e):
+                        _db_note_failure(e)
+                    raise
+                _db_note_success()
             else:
                 self.session.rollback()
         finally:
@@ -135,6 +229,7 @@ _REQUIRED_INDEXES = (
 # 存量表增量列补丁（后续迭代新增的列，存量库首次 init_db 时自动补齐，
 # 新建库由 db_schema.sql / create_all 直接含列；每进程仅检查一次）
 # - crypto_coins.m15_*：批量多周期趋势分析新增 15 分钟周期（与 models.CryptoCoin 对齐）
+# - crypto_coins.*_er：批量多周期趋势分析新增 Kaufman 效率系数 ER 列
 # - 批次11 分析纪律：task_analysis_records 增 hour_slot/source；
 #   plan_slots 增打卡与分析记录的关联列
 _REQUIRED_COLUMNS = (
@@ -149,17 +244,34 @@ _REQUIRED_COLUMNS = (
     ('crypto_coins', 'm15_atr', "VARCHAR(24) NOT NULL DEFAULT ''"),
     ('crypto_coins', 'm15_sar', "VARCHAR(24) NOT NULL DEFAULT ''"),
     ('crypto_coins', 'm15_sar_color', "VARCHAR(8) NOT NULL DEFAULT ''"),
+    ('crypto_coins', 'h1_er', "VARCHAR(24) NOT NULL DEFAULT ''"),
+    ('crypto_coins', 'h4_er', "VARCHAR(24) NOT NULL DEFAULT ''"),
+    ('crypto_coins', 'd1_er', "VARCHAR(24) NOT NULL DEFAULT ''"),
+    ('crypto_coins', 'm15_er', "VARCHAR(24) NOT NULL DEFAULT ''"),
     ('task_analysis_records', 'hour_slot', "VARCHAR(13) NOT NULL DEFAULT ''"),
     ('task_analysis_records', 'source', "VARCHAR(16) NOT NULL DEFAULT 'live'"),
     ('plan_slots', 'analysis_ids', "VARCHAR(255) NOT NULL DEFAULT ''"),
     ('plan_slots', 'analysis_hour', "VARCHAR(13) NOT NULL DEFAULT ''"),
     ('plan_slots', 'bypass_analysis', "TINYINT(1) NOT NULL DEFAULT 0"),
+    # 任务管理 v2（任务树）：plan_cards.tasks 整树 JSON；plan_slots.task_links
+    # 打卡关联 [{task_id,state}]。TEXT 可空（NULL/'' 视同未迁移/待关联）
+    ('plan_cards', 'tasks', "TEXT NULL"),
+    ('plan_slots', 'task_links', "TEXT NULL"),
+    # 热量模块明细结构扩展：食物支持「数量 × 单位热量 = 总热量」，
+    # 存量行 quantity 缺省 1（原 calories 字段即该行总摄入，语义兼容）
+    ('calorie_meal_items', 'quantity', "FLOAT NOT NULL DEFAULT 1"),
+    ('calorie_meal_items', 'unit', "VARCHAR(32) NOT NULL DEFAULT ''"),
 )
 
 # 新增表自动补建（init_db 默认模式不再逐表 create_all，这里只对
 # 后续迭代新增的表做 checkfirst 建表，存量库升级时无需手工跑 SQL）
 _NEW_TABLE_NAMES = (
     'analysis_reminder_log',   # 批次11 分析纪律小时槽台账
+    # 批次12 盘感模拟模块（RAG + LLM Wiki，见 doc/RAG_LLM_Wiki模拟盘感落地方案.md）
+    'instinct_corpus',
+    'instinct_wiki_rules',
+    'instinct_predictions',
+    'instinct_embeddings',
 )
 
 # 存量表废弃列退役补丁（架构调整后不再使用的列：先把存量数据迁移到
@@ -381,15 +493,37 @@ def init_db(force_create=False):
         logger.info('[DB] 初始化完成（schema %s）', SCHEMA_VERSION)
 
 
-def warmup_async():
-    """后台预热：应用启动时调用，在守护线程内完成 init_db。
+def warmup_async(attempts=4, first_wait=10.0):
+    """后台预热：应用启动时在守护线程里完成 init_db，失败则退避重试。
 
-    不阻塞 app.run()；失败只记日志，首个 DB 请求到达时会再次尝试。
+    为什么要重试，而不是"等首个请求再试"：库在公网（远端 MySQL），启动瞬间一次
+    几十秒的链路抖动就会让进程长时间带着未初始化状态跑 —— 期间"每进程一次"的
+    增量列/索引补齐、种子补全全都没做，第一个撞上它的请求要么报错要么走慢路径。
+    重试只发生在后台线程的 sleep 里，绝不阻塞 app.run()。
+
+    失败默认只打一行不打栈：预热失败绝大多数是网络抖动，几十行 pymysql 调用栈
+    会把同屏的真故障淹没（2026-09-11 终端里那一坨 2013/10060 就是这种噪声）。
+    需要看栈时设 CRYPTO_DB_WARM_TRACE=1。
     """
     def _warm():
-        try:
-            init_db()
-        except Exception as e:
-            logger.error(f'[DB] 后台预热失败（首个 DB 请求时将重试）: {e}', exc_info=True)
+        wait = float(first_wait)
+        for i in range(1, int(attempts) + 1):
+            try:
+                init_db()
+                if i > 1:
+                    logger.info(f'[DB] 后台预热第 {i} 次尝试成功')
+                return
+            except Exception as e:
+                brief = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                if i < attempts:
+                    logger.warning(f'[DB] 后台预热第 {i}/{attempts} 次失败：{brief}'
+                                   f'，{wait:g}s 后重试')
+                    time.sleep(wait)
+                    wait = min(wait * 2, 120.0)
+                else:
+                    logger.error(
+                        f'[DB] 后台预热 {attempts} 次均未成功：{brief}'
+                        f'（首个 DB 请求时仍会重试）',
+                        exc_info=bool(os.environ.get('CRYPTO_DB_WARM_TRACE')))
 
     threading.Thread(target=_warm, daemon=True, name='db-warmup').start()

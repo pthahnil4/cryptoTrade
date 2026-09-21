@@ -78,7 +78,12 @@ class EmailTool:
         # 创建SSL上下文
         self.context = ssl.create_default_context()
         
-        logger.info(f"邮箱工具初始化完成: {from_email} ({smtp_host}:{smtp_port}, SSL:{use_ssl})")
+        # 打印"生效值"而不是入参：入参为 None 时其实回落到 config.email_config，
+        # 原先这行天天显示 "None (None:None, SSL:None)"，看日志的人会当成邮件没配好
+        logger.info(
+            f"邮箱工具初始化完成: {self.from_email} "
+            f"({self.smtp_host}:{self.smtp_port}, SSL:{self.use_ssl})"
+            + ("  [来源: 调用入参]" if from_email or smtp_host else "  [来源: config.email_config]"))
     
     def test_connection(self) -> bool:
         """

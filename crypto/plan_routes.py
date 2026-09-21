@@ -20,6 +20,8 @@
 """
 
 import datetime
+import hashlib
+import json
 import uuid
 import logging
 import os
@@ -44,6 +46,27 @@ logger = logging.getLogger(__name__)
 plan_bp = Blueprint('plan_bp', __name__)
 
 # =============================================================================
+# 【旧版三档罚款开关】Longtermism v1.1 默认全面取消罚款。此处按用户要求重新
+# 启用 v1 三档机制（达标线 target_hours / 严重线 severe_hours / 缺口×时薪×倍数）。
+#   - 达标档：当日在场 ≥ target_hours(10h)      → 不罚
+#   - 一般档：severe_hours(6h) ≤ 当日 < 10h     → (10-当日) × 时薪 × normal_multiplier(2)
+#   - 严重档：当日 < severe_hours(6h)（含 0 打卡日）→ (10-当日) × 时薪 × severe_multiplier(4)
+# 罚款逐日累计，仅在【结算时】从"基础+提前奖励"中扣减（不为负：兜底 0）。
+# 规则【向前生效】：已结算的历史卡片不回溯重算，只影响尚未结算的卡。
+# 关掉罚款：环境变量 CRYPTO_PLAN_PENALTY=0，或把下方默认值改为 False。
+# =============================================================================
+LEGACY_PENALTY_ENABLED = os.environ.get('CRYPTO_PLAN_PENALTY', '1').strip() != '0'
+
+# =============================================================================
+# 「10 天倒计时」——任务卡的第三个结束条件（与 ①满 100 格 ②任务树全部完成 并列）：
+# 每张未结算的 in_progress 卡，自 start_time 起满 N 个日历日即触发结算/终止；
+# 任一条件命中即视为本轮结束。completed/已结算卡不受影响。
+# 天数可被 plan.daily_rule.countdown_days 覆盖；环境变量 CRYPTO_PLAN_COUNTDOWN_DAYS
+# 改默认值；结果 <=0 视为关闭倒计时。
+# =============================================================================
+PLAN_COUNTDOWN_DEFAULT = int(os.environ.get('CRYPTO_PLAN_COUNTDOWN_DAYS', '10') or 10)
+
+# =============================================================================
 # 数据库初始化已收敛到 database.init_db() 进程内单例，由应用启动时后台
 # 预热（warmup_async）完成，蓝图导入期不再同步建表，避免阻塞启动。
 # =============================================================================
@@ -54,20 +77,63 @@ plan_bp = Blueprint('plan_bp', __name__)
 # =============================================================================
 
 def _load_plans(session):
-    """读取整树数据；未初始化（空库）时自动预置默认计划"""
+    """读取整树数据；未初始化（空库）时自动预置默认计划
+
+    【读路径不写库】除首次初始化外，本函数内的各类惰性迁移一律只在内存里
+    归一化，不回写数据库。原因：/plan/api/list、card-detail、today-status 都是
+    GET，前端页面加载与轮询会并发触发（Flask threaded=True）；一旦读路径带全树
+    写事务，远端 MySQL 上多个大事务互相争 plan_cards/plan_slots 行锁，实测会撞
+    1205 Lock wait timeout（等满 50s）并把整个任务卡页面打成 500 空白。
+    迁移结果由后续任意一次真实写操作自然落库。
+    """
     data = repo.load_plans_data(session)
     if not data.get('initialized', False):
         return _create_default_plans(session)
     # 数据迁移：每日达标线 12→10，严重线 8→6
-    _migrate_daily_rule(session, data)
+    _migrate_daily_rule(data)
     # 数据迁移：交易打卡记录字段重构（operation_notes/reflection → market_analysis/action_advice）
-    _migrate_record_fields(session, data)
+    _migrate_record_fields(data)
+    # 数据迁移：任务树（任务管理 v2）——旧卡 milestones+todos → card['tasks']
+    _migrate_tasks(data)
     return data
 
 
-def _migrate_daily_rule(session, data):
-    """迁移为长期主义模式：在场优先，取消强制每日时长与罚款机制"""
-    changed = False
+def _load_plans_for_write(session, plan_id: str = ''):
+    """写入口统一读法：先锁计划行，再读整树。
+
+    写路径不能沿用普通读法：两个并发请求各自读同一份旧树、各自改一点再整树
+    写回，后提交那笔会把前一笔的改动抹掉（打卡丢失就是这么来的）。锁住计划行
+    之后同计划请求排队，等价于合法的串行执行；不同计划互不阻塞。
+
+    传空 plan_id 表示整树结构性改写（新建/删除计划要重排所有 sort_order），
+    此时锁定 plan_plans 全表。加锁只在 MySQL 上生效，离线 SQLite 回归自动跳过。
+    """
+    repo.lock_plan_rows(session, [plan_id] if plan_id else None)
+    return _load_plans(session)
+
+
+def _load_summary_plans(session):
+    """/plan/api/list 与 /plan/api/today-status 的窄投影读法。
+
+    返回结构与 _load_plans 完全一致（同样只读不写、同样做内存归一化），
+    差别只在读取列：见 plan_repo.load_summary_tree。整树读法会把每个格子的
+    打卡正文、行情分析、操作建议、任务关联都拉进内存，而这两个接口只输出
+    聚合数字 —— 200 卡 × 100 格的库上，这部分传输与反序列化是纯浪费。
+
+    这里刻意不跑 _migrate_record_fields：该迁移只补齐 market_analysis /
+    action_advice / account_balance 三个长文本键，聚合链路一个都不读它们；
+    daily_rule 与 tasks 两项迁移则确实是 stats 的输入，必须保留。
+    """
+    data = repo.load_summary_tree(session)
+    if not data.get('initialized', False):
+        return _create_default_plans(session)
+    _migrate_daily_rule(data)
+    _migrate_tasks(data)
+    return data
+
+
+def _migrate_daily_rule(data):
+    """迁移为长期主义模式：在场优先，取消强制每日时长与罚款机制（仅内存归一化）"""
     for plan in data.get('plans', []):
         rule = plan.get('daily_rule', {})
         if rule.get('mode') != 'longtermism':
@@ -75,29 +141,25 @@ def _migrate_daily_rule(session, data):
             rule['mode'] = 'longtermism'
             rule.pop('window', None)
             rule['min_record_minutes'] = 1   # 最低记录 1 分钟：几分钟也算在场
-            changed = True
         # v1.1：提前通关奖励不再翻倍（×1）——提前通关本身就是奖励（时间自由）
         if rule.get('early_bonus_multiplier', 1) != 1:
             rule['early_bonus_multiplier'] = 1
-            changed = True
-    if changed:
-        _save_plans(session, data)
 
 
 # 交易打卡记录规范字段（v2）：行情分析 / 操作建议 / 账户金额
 _TRADE_RECORD_FIELDS = ('market_analysis', 'action_advice', 'account_balance')
 
 
-def _migrate_record_fields(session, data):
-    """迁移交易打卡记录字段（v2 重构）
+def _migrate_record_fields(data):
+    """迁移交易打卡记录字段（v2 重构）——仅内存归一化，不写库
 
     - 旧「深度思考/复盘」(reflection) 内容映射为「行情分析」(market_analysis)
     - 旧「具体操作内容」(operation_notes) 字段废弃移除
     - 新增「操作建议」(action_advice)，缺失时补空字符串
     - 「账户金额」(account_balance) 缺失时补空字符串
-    确保旧数据在加载时自动完成重命名与补齐，与前端提交格式完全一致。
+    旧数据在加载时自动完成重命名与补齐，与前端提交格式完全一致；
+    归一化结果由后续任意一次真实写操作自然落库。
     """
-    changed = False
     for plan in data.get('plans', []):
         if plan.get('type') != 'trade':
             continue
@@ -109,19 +171,55 @@ def _migrate_record_fields(session, data):
                 # reflection → market_analysis（行情分析取代深度思考/复盘）
                 if 'market_analysis' not in record:
                     record['market_analysis'] = record.get('reflection', '') or ''
-                    changed = True
                 # 补齐操作建议 / 账户金额默认空值
                 for field in ('action_advice', 'account_balance'):
                     if field not in record:
                         record[field] = ''
-                        changed = True
                 # 移除废弃旧字段
                 for legacy in ('operation_notes', 'reflection'):
                     if legacy in record:
                         record.pop(legacy)
-                        changed = True
-    if changed:
-        _save_plans(session, data)
+
+
+def _migrated_task_id(card_id, kind, idx, title):
+    """迁移节点的确定性 ID：同一卡片的同一条旧条目永远推导出同一 id
+
+    读路径不回写数据库，因此每次加载都要重新推导任务树。若用随机 uuid，
+    历史 task_links 里存的 id 会在下一次加载后失配（关联标签全部变"已删除任务"、
+    完成状态无法汇总）。用「卡片ID + 来源类型 + 序号 + 标题」做哈希，保证幂等。
+    """
+    raw = f'{card_id}|{kind}|{idx}|{title}'.encode('utf-8')
+    return 'task_m' + hashlib.md5(raw).hexdigest()[:10]
+
+
+def _migrate_tasks(data):
+    """任务树迁移（任务管理 v2）——只推导不写库，重复推导结果完全一致
+
+    卡片无 tasks 键（None，旧数据）→ 将 milestones + todos 平铺清单转为
+    任务树顶层节点（content → title；done → status；预估留空=待补，
+    不计入进度、不可被打卡关联，补全后自动恢复）。旧列保留只读归档。
+    """
+    for plan in data.get('plans', []):
+        for card in plan.get('cards', []):
+            if card.get('tasks') is not None:
+                continue
+            tasks = []
+            sources = (('ms', card.get('milestones') or []),
+                       ('td', card.get('todos') or []))
+            for kind, items in sources:
+                for idx, item in enumerate(items):
+                    title = str(item.get('content') or '').strip()
+                    if not title:
+                        continue
+                    tasks.append({
+                        'id': _migrated_task_id(card.get('id'), kind, idx, title),
+                        'title': title,
+                        'estimated_minutes': 0,
+                        'status': 'done' if item.get('done') else 'todo',
+                        'children': [],
+                        'created_at': card.get('created_at') or '',
+                    })
+            card['tasks'] = tasks
 
 
 def _normalize_trade_record(record, analysis=None):
@@ -129,7 +227,7 @@ def _normalize_trade_record(record, analysis=None):
 
     仅保留规范字段：prediction / duration_minutes / actual /
     market_analysis / action_advice / account_balance /
-    analysis_ids / analysis_hour / bypass_analysis，
+    analysis_ids / analysis_hour / bypass_analysis / task_links，
     丢弃旧字段（operation_notes / reflection 等），缺失字段补空字符串。
 
     analysis：服务端闸门判定结果（{analysis_ids, analysis_hour, bypass_analysis}）。
@@ -154,6 +252,9 @@ def _normalize_trade_record(record, analysis=None):
     normalized['analysis_ids'] = ids[:40]
     normalized['analysis_hour'] = str(src.get('analysis_hour') or '')[:13]
     normalized['bypass_analysis'] = bool(src.get('bypass_analysis'))
+    # 任务树关联（任务管理 v2）：表单显式携带则采用，否则空数组
+    # （update-slot 的部分更新保护由调用方处理——缺键时回填库内旧值）
+    normalized['task_links'] = _normalize_task_links(record.get('task_links'))
     return normalized
 
 
@@ -241,6 +342,71 @@ def _save_plans(session, data):
     repo.save_plans_data(session, data)
 
 
+def _normalize_view_plan(plan, card):
+    """局部视图的内存归一化：与 _load_plans 用同一批迁移函数、同一顺序。
+
+    只把「目标计划 + 目标卡」组成一棵最小树喂给迁移函数：迁移函数就地修改
+    daily_rule / slots / tasks 对象，改动自然反映到 plan 与 card 本身，
+    而同计划其他卡的摘要（仅供 _calc_locked_ids 使用）不会被污染。
+    """
+    projection = {'plans': [dict(plan, cards=[card])]}
+    _migrate_daily_rule(projection)
+    _migrate_record_fields(projection)
+    _migrate_tasks(projection)
+
+
+# =============================================================================
+# 单卡写入口的局部读写（打卡 / 改格子 / 撤销 / 补录）
+# =============================================================================
+
+def _load_card_for_write(session, plan_id: str, card_id: str):
+    """打卡族统一读法：先锁计划行，再只读「本计划投影 + 目标卡完整数据」。
+
+    与 _load_plans_for_write 的差别只在读多少：写入口的并发保护完全相同
+    （同计划串行、跨计划并发）。少读的部分是其他计划的全部数据，以及本计划
+    其他卡的打卡正文/行情分析 —— 这些在整树读法里每格都要拉，而打卡只改
+    一个格子。返回值交给 repo.save_card_slots / save_card / save_sibling_changes
+    这组局部写入口，绝不进整树差量保存。
+
+    返回 None 表示计划行不存在（含空库未初始化），调用方按原语义报 404；
+    空库自动预置默认计划仍由 list / create-plan 等整树入口负责。
+    """
+    repo.lock_plan_rows(session, [plan_id] if plan_id else None)
+    return repo.load_plan_write_view(session, plan_id, card_id)
+
+
+def _normalize_write_plan(view):
+    """局部写视图的内存归一化：与 _load_plans 同批迁移、同结果。
+
+    目标卡按整树读法的完整口径迁移（含交易记录字段补齐，直接决定回传给
+    前端的 slots 内容）；兄弟卡只做统计必需的迁移：daily_rule 影响计划级
+    奖励与欢迎语，tasks 推导影响每张卡的任务进度。长文本字段补齐不喂给
+    兄弟卡 —— 它们的投影里本来就没有这些键，聚合统计也读不到。
+    """
+    plan, card = view['plan'], view['card']
+    tree = {'plans': [plan]}
+    _migrate_daily_rule(tree)
+    _migrate_tasks(tree)
+    if card is not None:
+        _migrate_record_fields({'plans': [dict(plan, cards=[card])]})
+
+
+def _save_view_writes(session, view):
+    """局部写收尾：目标格 → 目标卡 → 被牵连改写的兄弟卡。
+
+    三步都只写自己读过的行与列。整树差量保存在这条路径上不参与：兄弟卡是
+    窄投影，缺 goal/notes/review/milestones 等列，喂进整树保存会被当成
+    "用户把这些清空了"，不报错、不崩，只是数据没了。
+    """
+    plan, card = view['plan'], view['card']
+    rows = view['rows']
+    repo.save_card_slots(session, view['card_id'], card.get('slots'),
+                         rows.get('slots'))
+    repo.save_card(session, rows['card'], card)
+    repo.save_sibling_changes(session, view['plan_id'], plan.get('cards'),
+                              rows.get('siblings'))
+
+
 def _new_id(prefix='card'):
     """生成唯一 ID"""
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -317,6 +483,7 @@ def _create_learn_cards(count=10, base_reward=2000):
             "end_time": "",
             "status": "pending" if i > 1 else "in_progress",
             "milestones": [],
+            "tasks": [],
             "slots": _create_empty_slots(100),
             "notes": [],
             "review": "",
@@ -346,6 +513,7 @@ def _create_trade_cards(count=10):
             "end_time": "",
             "status": "pending" if i > 1 else "in_progress",
             "milestones": [],
+            "tasks": [],
             "slots": _create_empty_slots(100),
             "notes": [],
             "review": "",
@@ -407,6 +575,283 @@ def _create_default_plans(session):
     }
     _save_plans(session, data)
     return data
+
+
+# =============================================================================
+# 任务树（任务管理 v2）
+# -----------------------------------------------------------------------------
+# 结构：card['tasks'] = [TaskNode, ...]
+#   TaskNode = {id, title, estimated_minutes, status: todo|doing|done,
+#               children: [TaskNode...], completed_at, completed_by_slot, created_at}
+# 铁律：
+#   - 一切进度/汇总只计算叶子节点（父节点不重复计入）；
+#   - 父节点预估 = Σ叶子（自动重算、只读）；父任务只是任务名；
+#   - 完成只能由打卡标记（含子任务全完成后的逐级上卷），树上无勾选；
+#   - 已完成的任务不能再被打卡关联。
+# =============================================================================
+
+def _iter_tasks(tasks):
+    """深度优先遍历任务树，yield (node, siblings, parent_node)"""
+    stack = [(t, tasks, None) for t in reversed(tasks or [])]
+    while stack:
+        node, siblings, parent = stack.pop()
+        yield node, siblings, parent
+        children = node.get('children') or []
+        for ch in reversed(children):
+            stack.append((ch, children, node))
+
+
+def _find_task(tasks, task_id):
+    """按 id 查找节点，返回 (node, siblings, parent_node)；未找到返回 None"""
+    if not task_id:
+        return None
+    for node, siblings, parent in _iter_tasks(tasks):
+        if node.get('id') == task_id:
+            return node, siblings, parent
+    return None
+
+
+def _leaf_tasks(tasks):
+    """全部叶子节点（无 children）"""
+    return [n for n, _, _ in _iter_tasks(tasks) if not (n.get('children') or [])]
+
+
+def _task_is_container(node):
+    return bool(node and (node.get('children') or []))
+
+
+def _recompute_task_estimates(tasks):
+    """容器预估 = Σ叶子（后序就地写回）；叶子预估值保持不变"""
+    def _rec(node):
+        children = node.get('children') or []
+        if not children:
+            node['estimated_minutes'] = int(node.get('estimated_minutes') or 0)
+            return node['estimated_minutes']
+        total = 0
+        for ch in children:
+            total += _rec(ch)
+        node['estimated_minutes'] = total
+        return total
+    for t in tasks or []:
+        _rec(t)
+
+
+def _rollup_task(node):
+    """自底向上重算父节点状态：子全 done → 父自动 done；否则父从 done 回退"""
+    children = node.get('children') or []
+    if not children:
+        return node.get('status') or 'todo'
+    for ch in children:
+        _rollup_task(ch)
+    if all((ch.get('status') or 'todo') == 'done' for ch in children):
+        if node.get('status') != 'done':
+            node['status'] = 'done'
+            node['completed_at'] = _now_str()
+            node.pop('completed_by_slot', None)  # 上卷完成不属于任何一条打卡
+    else:
+        if node.get('status') == 'done':
+            node['status'] = 'doing'
+            node.pop('completed_at', None)
+            node.pop('completed_by_slot', None)
+        elif node.get('status') == 'todo' and any(
+                (ch.get('status') or 'todo') != 'todo' for ch in children):
+            node['status'] = 'doing'
+    return node.get('status')
+
+
+def _rollup_tasks(tasks):
+    for t in tasks or []:
+        _rollup_task(t)
+
+
+def _calc_tasks_all_done(card):
+    """任务树是否全部完成（存在叶子且所有叶子 done）——学习卡提前通关资格判定"""
+    leaves = _leaf_tasks(card.get('tasks') or [])
+    return len(leaves) > 0 and all(n.get('status') == 'done' for n in leaves)
+
+
+def _calc_task_progress(card):
+    """任务进度（叶子加权口径）
+
+    任务进度 = Σ(done 叶子预估分钟) ÷ Σ(叶子预估分钟)
+    - 只统计叶子；待补预估（estimated_minutes<=0）的叶子不计入分子/分母；
+    - done_count/total_count 按叶子计数，并额外返回待补预估数量。
+    """
+    leaves = _leaf_tasks(card.get('tasks') or [])
+    total_minutes = 0
+    done_minutes = 0
+    done_count = 0
+    pending_estimate = 0
+    for n in leaves:
+        est = int(n.get('estimated_minutes') or 0)
+        if est <= 0:
+            pending_estimate += 1
+        else:
+            total_minutes += est
+            if n.get('status') == 'done':
+                done_minutes += est
+        if n.get('status') == 'done':
+            done_count += 1
+    pct = round(done_minutes * 100 / total_minutes) if total_minutes > 0 else 0
+    return {
+        'done_minutes': done_minutes,
+        'total_minutes': total_minutes,
+        'pct': pct,
+        'done_count': done_count,
+        'total_count': len(leaves),
+        'pending_estimate': pending_estimate,
+    }
+
+
+def _normalize_task_links(raw):
+    """打卡 task_links 规范化：仅保留 {task_id, state∈(doing,done)}，去重保序"""
+    links = []
+    seen = set()
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        tid = str(item.get('task_id') or '').strip()
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        links.append({
+            'task_id': tid,
+            'state': 'done' if item.get('state') == 'done' else 'doing',
+        })
+    return links
+
+
+def _validate_task_links(tasks, links, slot_index):
+    """校验打卡关联（task_links 非空时严格执行）
+
+    - 任务必须存在、是叶子、预估已填（待补预估不可关联）；
+    - 已完成的任务不能再被关联（除非它正是由当前这条打卡标记完成的——
+      修改本条打卡的关联状态时允许）。
+    返回错误消息字符串；通过时返回 None。
+    """
+    for link in links:
+        found = _find_task(tasks, link['task_id'])
+        if not found:
+            return f"任务不存在或已被删除：{link['task_id']}"
+        node = found[0]
+        title = node.get('title') or ''
+        if _task_is_container(node):
+            return f"「{title}」是父任务（纯容器），只能关联叶子任务"
+        if int(node.get('estimated_minutes') or 0) <= 0:
+            return f"「{title}」尚未填写预估时长，补全后才能关联打卡"
+        if (node.get('status') == 'done'
+                and node.get('completed_by_slot') != slot_index):
+            return f"「{title}」已完成，不能继续打卡"
+    return None
+
+
+def _apply_task_links(tasks, links, slot_index, filled_at, prev_links=None):
+    """把一条打卡的 task_links 应用到任务树（差量回退 + 状态联动 + 上卷）
+
+    调用前须已通过 _validate_task_links。prev_links 为该打卡的旧关联
+    （修改打卡场景），用于回退"本次不再标记完成"的任务。
+    """
+    prev_map = {l.get('task_id'): l.get('state') for l in (prev_links or [])}
+    new_map = {l['task_id']: l['state'] for l in links}
+    # 1) 回退：旧版本标记 done，本次不再是 done → 完成依据消失，回退进行中
+    for tid, state in prev_map.items():
+        if state != 'done' or new_map.get(tid) == 'done':
+            continue
+        found = _find_task(tasks, tid)
+        if found and found[0].get('completed_by_slot') == slot_index:
+            node = found[0]
+            node['status'] = 'doing'
+            node.pop('completed_at', None)
+            node.pop('completed_by_slot', None)
+    # 2) 应用本次关联：done 写完成依据；doing 首次推进置进行中（不打断已完成）
+    for link in links:
+        found = _find_task(tasks, link['task_id'])
+        if not found:
+            continue
+        node = found[0]
+        if link['state'] == 'done':
+            node['status'] = 'done'
+            node['completed_at'] = filled_at or _now_str()
+            node['completed_by_slot'] = slot_index
+        elif node.get('status') != 'done':
+            node['status'] = 'doing'
+    # 3) 全树上卷（子全完成 → 父自动完成；回退同步传导）
+    _rollup_tasks(tasks)
+
+
+def _revert_slot_task_links(tasks, links, slot_index):
+    """删除（或清空）一条打卡时回退其完成依据：done → doing（含上卷父任务）"""
+    for link in links or []:
+        if link.get('state') != 'done':
+            continue
+        found = _find_task(tasks, link.get('task_id'))
+        if not found:
+            continue
+        node = found[0]
+        if node.get('completed_by_slot') == slot_index:
+            node['status'] = 'doing'
+            node.pop('completed_at', None)
+            node.pop('completed_by_slot', None)
+    _rollup_tasks(tasks)
+
+
+def _touch_task_links_doing(tasks, links):
+    """批量补录统一关联：任务置进行中（todo→doing），不涉及完成标记"""
+    for link in links or []:
+        found = _find_task(tasks, link['task_id'])
+        if found and found[0].get('status') == 'todo':
+            found[0]['status'] = 'doing'
+    _rollup_tasks(tasks)
+
+
+def _annotate_tasks(card):
+    """深拷贝任务树并附加计算属性（不入库，仅供 card-detail 响应）
+
+    - actual_minutes：该任务实际投入（Σ关联打卡时长，全额口径，多任务不摊)
+    - link_count：关联打卡次数
+    - sub_done_minutes/sub_total_minutes/sub_done_count/sub_total_count：子树聚合
+    """
+    tasks = json.loads(json.dumps(card.get('tasks') or [], ensure_ascii=False))
+    actual = {}
+    counts = {}
+    for slot in card.get('slots') or []:
+        rec = slot.get('record') or {}
+        minutes = int(rec.get('duration_minutes') or 0)
+        for link in rec.get('task_links') or []:
+            tid = link.get('task_id')
+            if not tid:
+                continue
+            actual[tid] = actual.get(tid, 0) + minutes
+            counts[tid] = counts.get(tid, 0) + 1
+
+    def _agg(node):
+        children = node.get('children') or []
+        node['actual_minutes'] = actual.get(node.get('id'), 0)
+        node['link_count'] = counts.get(node.get('id'), 0)
+        if children:
+            dm = tm = dc = tc = 0
+            for ch in children:
+                _agg(ch)
+                dm += ch.get('sub_done_minutes', 0)
+                tm += ch.get('sub_total_minutes', 0)
+                dc += ch.get('sub_done_count', 0)
+                tc += ch.get('sub_total_count', 0)
+            node['sub_done_minutes'] = dm
+            node['sub_total_minutes'] = tm
+            node['sub_done_count'] = dc
+            node['sub_total_count'] = tc
+        else:
+            est = int(node.get('estimated_minutes') or 0)
+            done = node.get('status') == 'done'
+            node['sub_done_minutes'] = est if done else 0
+            node['sub_total_minutes'] = est
+            node['sub_done_count'] = 1 if done else 0
+            node['sub_total_count'] = 1
+        return node
+
+    for t in tasks:
+        _agg(t)
+    return tasks
 
 
 # =============================================================================
@@ -536,20 +981,14 @@ def _build_presence_calendar(all_slots, weeks=_CALENDAR_WEEKS):
     return {'start_date': start.isoformat(), 'weeks': weeks, 'days': days}
 
 
-def _calc_milestones_all_done(card):
-    """子目标是否全部完成（学习卡提前通关的资格判定）"""
-    milestones = card.get('milestones', [])
-    return len(milestones) > 0 and all(m.get('done') for m in milestones)
-
-
 def _calc_early_eligible(card):
     """是否具备提前通关资格：
     - 交易卡：始终具备（由资金倍数判定通关）
-    - 学习卡：子目标全部完成（任务完成即通关，无需硬耗 100 小时）
+    - 学习卡：任务树全部完成（任务完成即通关，无需硬耗 100 小时）
     """
     if card['type'] == 'trade':
         return True
-    return _calc_milestones_all_done(card)
+    return _calc_tasks_all_done(card)
 
 
 def _calc_slot_hours_by_date(slots, date_str):
@@ -610,12 +1049,137 @@ def _calc_total_hours(slots):
     return sum(1 for s in slots if s.get('filled'))
 
 
+def _penalty_rule(plan):
+    """返回旧版三档罚款参数字典；未启用（开关关 / 缺 target_hours）时返回 None。
+    读取顺序：plan.daily_rule 的 target_hours/severe_hours/normal_multiplier/severe_multiplier。
+    """
+    if not LEGACY_PENALTY_ENABLED or not plan:
+        return None
+    rule = plan.get('daily_rule', {}) or {}
+    target = rule.get('target_hours')
+    if not target or target <= 0:
+        return None
+    return {
+        'target_hours': float(target),
+        'severe_hours': float(rule.get('severe_hours', 6)),
+        'normal_multiplier': float(rule.get('normal_multiplier', 2)),
+        'severe_multiplier': float(rule.get('severe_multiplier', 4)),
+    }
+
+
+def _day_penalty_hours(day_hours, rule, hourly_rate):
+    """单日罚款额：≥达标线不罚；否则按缺口×时薪×（一般/严重）倍数。"""
+    if day_hours >= rule['target_hours']:
+        return 0.0
+    gap = rule['target_hours'] - day_hours
+    mult = rule['severe_multiplier'] if day_hours < rule['severe_hours'] else rule['normal_multiplier']
+    return gap * hourly_rate * mult
+
+
+def _calc_card_penalty(plan, card, hourly_rate, end_date=None):
+    """累计一张【未结算】卡从开始日到 end_date（含）的每日罚款。
+
+    - 只罚已过去的一天：end_date 缺省为"昨天"，避免对进行中的今天误判为缺勤；
+    - 0 打卡日落严重档（这正是"保证状态在线/不中断"的诉求所在）；
+    - 卡未设 start_time（未开始）不计罚款。
+    返回 {'total_penalty','judged_days','idle_days','normal_days','severe_days'}。
+    """
+    empty = {'total_penalty': 0.0, 'judged_days': 0, 'idle_days': 0,
+             'normal_days': 0, 'severe_days': 0}
+    rule = _penalty_rule(plan)
+    if not rule:
+        return empty
+    start_str = (card.get('start_time') or '')[:10]
+    if not start_str:
+        return empty
+    try:
+        start_d = datetime.date.fromisoformat(start_str)
+    except ValueError:
+        return empty
+    if end_date:
+        try:
+            end_d = datetime.date.fromisoformat(end_date[:10])
+        except ValueError:
+            end_d = datetime.date.today() - datetime.timedelta(days=1)
+    else:
+        end_d = datetime.date.today() - datetime.timedelta(days=1)  # 不含今天
+    if end_d < start_d:
+        return empty
+
+    slots = card.get('slots', [])
+    total = judged = idle = normal = severe = 0
+    cur = start_d
+    while cur <= end_d:
+        ds = cur.isoformat()
+        day_hours = _calc_slot_hours_by_date(slots, ds)
+        judged += 1
+        if day_hours <= 0:
+            idle += 1
+        elif day_hours < rule['severe_hours']:
+            severe += 1
+        elif day_hours < rule['target_hours']:
+            normal += 1
+        total += _day_penalty_hours(day_hours, rule, hourly_rate)
+        cur += datetime.timedelta(days=1)
+    return {'total_penalty': round(total, 2), 'judged_days': judged, 'idle_days': idle,
+            'normal_days': normal, 'severe_days': severe}
+
+
+def _countdown_days(plan):
+    """本计划每张卡的倒计时天数上限：daily_rule.countdown_days 优先，否则默认常量。
+    返回 <=0 表示该计划关闭倒计时。
+    """
+    rule = (plan or {}).get('daily_rule', {}) or {}
+    raw = rule.get('countdown_days')
+    if raw is None:
+        return PLAN_COUNTDOWN_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return PLAN_COUNTDOWN_DEFAULT
+
+
+def _calc_days_elapsed(card):
+    """自 start_time 起已过的整日历天数（最小 0）；无 start_time / 非法日期返回 None。"""
+    start_str = (card.get('start_time') or '')[:10]
+    if not start_str:
+        return None
+    try:
+        start_d = datetime.date.fromisoformat(start_str)
+    except ValueError:
+        return None
+    return max(0, (datetime.date.today() - start_d).days)
+
+
+def _countdown_view(plan, card):
+    """倒计时三态。返回 dict：
+      limit / elapsed / remaining / expired / active
+    active=True 仅当该卡「未结算 且 in_progress 且计划开启倒计时(>0) 且设有 start_time」。
+    completed / 已结算 / 锁定(pending) 卡一律 active=False，不参与倒计时（不受影响）。
+    """
+    limit = _countdown_days(plan)
+    elapsed = _calc_days_elapsed(card)
+    active = (card.get('status') == 'in_progress' and not card.get('settlement')
+              and limit > 0 and elapsed is not None)
+    if not active:
+        return {'limit': limit, 'elapsed': elapsed if elapsed is not None else 0,
+                'remaining': 0, 'expired': False, 'active': False}
+    return {'limit': limit, 'elapsed': elapsed,
+            'remaining': max(0, limit - elapsed), 'expired': elapsed >= limit, 'active': True}
+
+
+def _is_countdown_expired(plan, card):
+    """第三个结束条件是否已触发：未结算 in_progress 卡自 start_time 起满倒计时天数。"""
+    v = _countdown_view(plan, card)
+    return bool(v['active'] and v['expired'])
+
+
 def _calc_card_reward(plan, card):
     """计算任务卡的奖励预估（长期主义版：无罚款扣减）
 
     奖励构成 = 基础奖励 + 提前完成奖励
     - 交易卡：始终预估提前奖励（通关时按资金倍数正式结算）
-    - 学习卡：子目标全部完成后具备提前通关资格，此时才计入提前奖励
+    - 学习卡：任务树全部完成后具备提前通关资格，此时才计入提前奖励
     """
     filled_count = _calc_total_hours(card.get('slots', []))
     presence_days = _calc_presence_days(card.get('slots', []))
@@ -633,7 +1197,7 @@ def _calc_card_reward(plan, card):
     early_bonus = early_hours * hourly_rate * _early_multiplier(plan) if early_eligible else 0
     final_reward = base_reward + early_bonus
 
-    return {
+    info = {
         'filled_count': filled_count,
         'total_hours': round(filled_count, 1),
         'presence_days': presence_days,
@@ -644,43 +1208,101 @@ def _calc_card_reward(plan, card):
         'final_reward': round(final_reward, 1)
     }
 
+    # 旧版三档罚款：仅当计划配置了罚款（daily_rule.target_hours）时才注入字段并扣减；
+    # 长期主义计划下返回结构与旧版逐字节一致（不含任何 penalty_* 键）。
+    # 规则向前生效：已结算历史卡不回溯（penalty_enabled=False），未结算卡按"罚到昨天"累计。
+    if _penalty_rule(plan) is not None:
+        active = not card.get('settlement')
+        penalty = _calc_card_penalty(plan, card, hourly_rate) if active else \
+            {'total_penalty': 0.0, 'judged_days': 0, 'idle_days': 0,
+             'normal_days': 0, 'severe_days': 0}
+        penalty_total = penalty['total_penalty']
+        info['penalty_enabled'] = active
+        info['total_penalty'] = round(penalty_total, 1)
+        info['penalty_judged_days'] = penalty['judged_days']
+        info['penalty_idle_days'] = penalty['idle_days']
+        info['penalty_normal_days'] = penalty['normal_days']
+        info['penalty_severe_days'] = penalty['severe_days']
+        # 罚款只增不减：final 兜底 0，但如实回报原始罚款额
+        info['final_reward'] = round(max(0, base_reward + early_bonus - penalty_total), 1)
+
+    # 「10 天倒计时」第三个结束条件：始终返回，供前端展示"剩余 X 天"与判定到期。
+    # 仅未结算 in_progress 卡 active/expired 有意义；completed/已结算卡 remaining=0。
+    cd = _countdown_view(plan, card)
+    info['countdown_days'] = cd['limit']
+    info['days_elapsed'] = cd['elapsed']
+    info['days_remaining'] = cd['remaining']
+    info['countdown_expired'] = cd['expired']
+    info['countdown_active'] = cd['active']
+    return info
+
 
 def _settle_card(plan, card, profit_multiplier=None):
     """正式结算一张任务卡（生成 settlement）
 
-    长期主义版：
-    - 学习卡：满 100 小时自动通关；子目标全部完成可提前通关（含提前奖励）
-    - 交易卡：资金倍数 ≥ 2 判定翻倍通关；无任何罚款扣减
+    长期主义 + 旧版三档罚款（LEGACY_PENALTY_ENABLED 时）：
+    - 学习卡：满 100 小时自动通关；任务树全部完成可提前通关（含提前奖励）
+    - 交易卡：资金倍数 ≥ 2 判定翻倍通关
+    - 罚款：结算日（含今天）回溯累计每日三档罚款，从"基础+提前"扣减，兜底 0；
+            交易卡未翻倍通关本就 0 奖金，不再叠加罚款。
     """
     reward_info = _calc_card_reward(plan, card)
     filled_count = reward_info['filled_count']
 
     if card['type'] == 'trade':
+        base_reward = card.get('base_reward', 2000)
+        hourly_rate = card.get('hourly_rate', 20)
+    else:
+        base_reward = card.get('reward', 2000)
+        hourly_rate = base_reward // 100
+
+    # 结算含"今天"：按结算日重算罚款（预估只到昨天）。长期主义计划无罚款。
+    penalty_on = _penalty_rule(plan) is not None
+    settle_day = _now_str()[:10]
+    penalty = _calc_card_penalty(plan, card, hourly_rate, end_date=settle_day) \
+        if penalty_on else {'total_penalty': 0.0, 'judged_days': 0, 'idle_days': 0,
+                            'normal_days': 0, 'severe_days': 0}
+    penalty_total = penalty['total_penalty']
+
+    if card['type'] == 'trade':
         # 交易卡：需用户确认资金倍数
         multiplier = profit_multiplier if profit_multiplier is not None else 0
         is_pass = multiplier >= 2
+        early_bonus = reward_info['early_bonus'] if is_pass else 0
+        final = max(0, base_reward + early_bonus - penalty_total) if is_pass else 0
         settlement = {
-            "base_reward": card.get('base_reward', 2000),
+            "base_reward": base_reward,
             "total_hours_used": filled_count,
             "early_hours": max(0, 100 - filled_count),
-            "early_bonus": reward_info['early_bonus'] if is_pass else 0,
-            "final_reward": reward_info['final_reward'] if is_pass else 0,
+            "early_bonus": early_bonus,
+            "final_reward": round(final, 1),
             "profit_multiplier": multiplier,
             "settled_at": _now_str()
         }
+        if penalty_on and is_pass:
+            settlement['penalty_total'] = round(penalty_total, 1)
+            settlement['penalty_idle_days'] = penalty['idle_days']
+            settlement['penalty_normal_days'] = penalty['normal_days']
+            settlement['penalty_severe_days'] = penalty['severe_days']
         card['settlement'] = settlement
         card['status'] = 'completed' if is_pass else 'failed'
     else:
-        # 学习卡：满 100 小时 或 子目标全部完成 → 通关（长期主义：任务完成即通关）
-        is_pass = filled_count >= 100 or _calc_milestones_all_done(card)
+        # 学习卡：满 100 小时 或 任务树全部完成 → 通关（长期主义：任务完成即通关）
+        is_pass = filled_count >= 100 or _calc_tasks_all_done(card)
+        final = max(0, base_reward + reward_info['early_bonus'] - penalty_total)
         settlement = {
-            "base_reward": card.get('reward', 2000),
+            "base_reward": base_reward,
             "total_hours_used": filled_count,
             "early_hours": reward_info['early_hours'],
             "early_bonus": reward_info['early_bonus'],
-            "final_reward": reward_info['final_reward'],
+            "final_reward": round(final, 1),
             "settled_at": _now_str()
         }
+        if penalty_on:
+            settlement['penalty_total'] = round(penalty_total, 1)
+            settlement['penalty_idle_days'] = penalty['idle_days']
+            settlement['penalty_normal_days'] = penalty['normal_days']
+            settlement['penalty_severe_days'] = penalty['severe_days']
         card['settlement'] = settlement
         card['status'] = 'completed' if is_pass else 'failed'
 
@@ -690,16 +1312,28 @@ def _settle_card(plan, card, profit_multiplier=None):
     return card
 
 
-def _unlock_next_card(plan, current_card):
-    """解锁下一张卡"""
-    cards = plan.get('cards', [])
+def _next_pending_card(plan, current_card):
+    """找出结算后应当被解锁的下一张卡（round+1 且 pending）；纯查询不改数据。
+
+    单卡局部写路径需要在结算前先知道会牵连到哪张兄弟卡，才能把它那一行的
+    变更写回去，因此把「找谁」和「改谁」拆成两步。
+    """
     current_round = current_card.get('round', 0)
-    for c in cards:
+    for c in plan.get('cards', []):
         if c.get('round') == current_round + 1 and c.get('status') == 'pending':
-            c['status'] = 'in_progress'
-            c['start_time'] = _now_str()
-            c['updated_at'] = _now_str()
-            break
+            return c
+    return None
+
+
+def _unlock_next_card(plan, current_card):
+    """解锁下一张卡；返回被解锁的卡（没有则 None）"""
+    nxt = _next_pending_card(plan, current_card)
+    if nxt is None:
+        return None
+    nxt['status'] = 'in_progress'
+    nxt['start_time'] = _now_str()
+    nxt['updated_at'] = _now_str()
+    return nxt
 
 
 def _recompute_serial_chain(plan):
@@ -717,6 +1351,21 @@ def _recompute_serial_chain(plan):
                     c['start_time'] = _now_str()
         elif c.get('status') != 'pending':
             c['status'] = 'pending'
+
+
+def _apply_countdown_settlements(plan):
+    """第三个结束条件落库：对某计划内所有"未结算 in_progress 且已满倒计时天数"的卡
+    执行结算/终止，随后重算串行链。返回被结算的卡 id 列表（无则空）。
+    纯内存整树操作，加锁读写与落库由调用方（POST 写路径）负责。
+    """
+    settled = []
+    for c in sorted(plan.get('cards', []), key=lambda x: x.get('round', 0)):
+        if _is_countdown_expired(plan, c):
+            _settle_card(plan, c)   # 学习卡按 filled/树判通关，倒计时到期未满即 failed 终止
+            settled.append(c['id'])
+    if settled:
+        _recompute_serial_chain(plan)
+    return settled
 
 
 # =============================================================================
@@ -806,7 +1455,7 @@ def _build_plan_stats(plan):
             }
             break
 
-    # 列表页只需摘要字段；完整 slots/notes/milestones 走 /plan/api/card-detail 按需加载
+    # 列表页只需摘要字段；完整 slots/notes/tasks 走 /plan/api/card-detail 按需加载
     result = []
     for c in sorted(cards, key=lambda x: x.get('round', 0)):
         c_info = {
@@ -825,6 +1474,7 @@ def _build_plan_stats(plan):
             'end_time': c.get('end_time', ''),
             'created_at': c.get('created_at', ''),
             'reward_info': _calc_card_reward(plan, c),
+            'task_progress': _calc_task_progress(c),
         }
         result.append(c_info)
 
@@ -931,6 +1581,10 @@ def _build_card_detail(plan, card):
         'hit_rate': _calc_card_hit_rate(card),
         'milestones': card.get('milestones', []),
         'todos': card.get('todos', []),
+        # 任务树（任务管理 v2）：深拷贝 + 计算属性（实际投入/子聚合），不入库
+        'tasks': _annotate_tasks(card),
+        'task_progress': _calc_task_progress(card),
+        'tasks_all_done': _calc_tasks_all_done(card),
         'slots': card.get('slots', []),
         'notes': card.get('notes', []),
         'review': card.get('review', ''),
@@ -969,10 +1623,10 @@ def _build_refresh_payload(plan, card):
 
 @plan_bp.route('/plan/api/list', methods=['GET'])
 def api_list():
-    """获取所有计划 + 统计数据 + 当日状态"""
+    """获取所有计划 + 统计数据 + 当日状态（窄投影读法，不拉长文本）"""
     try:
         with session_scope() as session:
-            data = _load_plans(session)
+            data = _load_summary_plans(session)
             plans = data.get('plans', [])
             result = []
             for plan in plans:
@@ -989,6 +1643,10 @@ def api_card_detail():
 
     列表接口只返回摘要，点击卡片打开详情弹窗时调本接口取完整数据，
     避免列表页一次性传输所有卡的 100 格明细。
+
+    读取范围同样收敛到「本卡」：只取目标计划行、目标卡行、本卡格子，
+    外加同计划卡片的 id/type/round/status 摘要（算串行锁定用）。
+    整树读法在 200 张卡 × 100 格时会把别人的打卡正文一起拖进内存。
     """
     try:
         plan_id = request.args.get('plan_id', '')
@@ -996,13 +1654,22 @@ def api_card_detail():
         if not plan_id or not card_id:
             return jsonify({"code": 400, "message": "plan_id 和 card_id 不能为空", "data": None})
         with session_scope() as session:
-            data = _load_plans(session)
-            plan = next((p for p in data.get('plans', []) if p['id'] == plan_id), None)
-            if not plan:
-                return jsonify({"code": 404, "message": "计划不存在", "data": None})
-            card = next((c for c in plan.get('cards', []) if c['id'] == card_id), None)
-            if not card:
+            view = repo.load_card_view(session, plan_id, card_id)
+            if view is not None and view.get('card') is None:
                 return jsonify({"code": 404, "message": "任务卡不存在", "data": None})
+            if view is None:
+                # 计划行不存在：走整树确认一次，覆盖「库尚未初始化需预置默认计划」
+                # 的历史语义（冷路径，正常查询不会到这里）
+                data = _load_plans(session)
+                plan = next((p for p in data.get('plans', []) if p['id'] == plan_id), None)
+                if not plan:
+                    return jsonify({"code": 404, "message": "计划不存在", "data": None})
+                card = next((c for c in plan.get('cards', []) if c['id'] == card_id), None)
+                if not card:
+                    return jsonify({"code": 404, "message": "任务卡不存在", "data": None})
+            else:
+                plan, card = view['plan'], view['card']
+                _normalize_view_plan(plan, card)
             detail = _build_card_detail(plan, card)
         return jsonify({"code": 200, "message": "success", "data": detail})
     except Exception as e:
@@ -1050,7 +1717,7 @@ def api_create_plan():
             new_plan['cards'] = _create_trade_cards(new_plan['round_count'])
 
         with session_scope() as session:
-            data = _load_plans(session)
+            data = _load_plans_for_write(session)
             data['plans'].append(new_plan)
             _save_plans(session, data)
         return jsonify({"code": 200, "message": "创建成功", "data": new_plan})
@@ -1066,7 +1733,9 @@ def api_delete_plan():
         body = request.get_json() or {}
         plan_id = body.get('plan_id', '')
         with session_scope() as session:
-            data = _load_plans(session)
+            # 删除会重排其余所有计划的 sort_order，属于整树结构性改写，
+            # 与 create-plan 一致锁 plan_plans 全表，不能只锁被删的那一行。
+            data = _load_plans_for_write(session)
             data['plans'] = [p for p in data['plans'] if p['id'] != plan_id]
             _save_plans(session, data)
         return jsonify({"code": 200, "message": "删除成功", "data": None})
@@ -1083,7 +1752,7 @@ def api_create_card():
         card_type = body.get('type', 'learn')
 
         with session_scope() as session:
-            data = _load_plans(session)
+            data = _load_plans_for_write(session, plan_id)
             plan = None
             for p in data['plans']:
                 if p['id'] == plan_id:
@@ -1111,6 +1780,7 @@ def api_create_card():
                     "end_time": _normalize_datetime_str(body.get('end_time', '')) or '',
                     "status": "pending",
                     "milestones": [],
+                    "tasks": [],
                     "slots": _create_empty_slots(100),
                     "notes": [],
                     "review": "",
@@ -1141,6 +1811,7 @@ def api_create_card():
                     "end_time": _normalize_datetime_str(body.get('end_time', '')) or '',
                     "status": "pending",
                     "milestones": [],
+                    "tasks": [],
                     "slots": _create_empty_slots(100),
                     "notes": [],
                     "review": "",
@@ -1173,38 +1844,39 @@ def api_update_card():
         fields = body.get('fields', {})
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    for key, value in fields.items():
-                        if key in ('milestones', 'todos', 'start_time', 'end_time', 'status', 'goal', 'reward', 'review', 'notes'):
-                            # TodoList 只接受列表结构，防止脏数据写入
-                            if key == 'todos' and not isinstance(value, list):
-                                return jsonify({"code": 400, "message": "todos 字段必须为数组", "data": None})
-                            # 开始/结束时间：校验并统一存储为 YYYY-MM-DD HH:MM:SS
-                            if key in ('start_time', 'end_time'):
-                                normalized = _normalize_datetime_str(value)
-                                if normalized is None:
-                                    return jsonify({"code": 400, "message": "时间格式不正确，应为 YYYY-MM-DD HH:MM", "data": None})
-                                value = normalized
-                            card[key] = value
+            # 局部读写：改卡字段只动本卡；放弃任务时解锁的下一张卡按列补写
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
 
-                    # 交易卡修改奖励时同步基础奖金与时薪
-                    if card['type'] == 'trade' and 'reward' in fields:
-                        card['base_reward'] = fields['reward']
-                        card['hourly_rate'] = fields['reward'] // 100
+            for key, value in fields.items():
+                if key in ('milestones', 'todos', 'start_time', 'end_time', 'status', 'goal', 'reward', 'review', 'notes'):
+                    # TodoList 只接受列表结构，防止脏数据写入
+                    if key == 'todos' and not isinstance(value, list):
+                        return jsonify({"code": 400, "message": "todos 字段必须为数组", "data": None})
+                    # 开始/结束时间：校验并统一存储为 YYYY-MM-DD HH:MM:SS
+                    if key in ('start_time', 'end_time'):
+                        normalized = _normalize_datetime_str(value)
+                        if normalized is None:
+                            return jsonify({"code": 400, "message": "时间格式不正确，应为 YYYY-MM-DD HH:MM", "data": None})
+                        value = normalized
+                    card[key] = value
 
-                    # 放弃任务时解锁下一张卡
-                    if fields.get('status') == 'abandoned' and card.get('status') == 'abandoned':
-                        _unlock_next_card(plan, card)
+            # 交易卡修改奖励时同步基础奖金与时薪
+            if card['type'] == 'trade' and 'reward' in fields:
+                card['base_reward'] = fields['reward']
+                card['hourly_rate'] = fields['reward'] // 100
 
-                    card['updated_at'] = _now_str()
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "更新成功", "data": card})
+            # 放弃任务时解锁下一张卡
+            if fields.get('status') == 'abandoned' and card.get('status') == 'abandoned':
+                _unlock_next_card(plan, card)
+
+            card['updated_at'] = _now_str()
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "更新成功", "data": card})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1220,7 +1892,7 @@ def api_delete_card():
         card_id = body.get('card_id', '')
 
         with session_scope() as session:
-            data = _load_plans(session)
+            data = _load_plans_for_write(session, plan_id)
             for plan in data['plans']:
                 if plan['id'] != plan_id:
                     continue
@@ -1233,15 +1905,309 @@ def api_delete_card():
         return jsonify({"code": 500, "message": str(e), "data": None})
 
 
+# =============================================================================
+# 任务树节点操作（任务管理 v2）
+# -----------------------------------------------------------------------------
+# 卡片进入结算（completed/failed/abandoned）后任务树只读；编辑仅限
+# pending/in_progress。全部接口遵循"局部读→校验→变更→局部保存→返回 refresh
+# 载荷"，一切错误返回都发生在任何内存变更之前（session_scope 正常退出即
+# commit）。
+# =============================================================================
+
+_TASK_EDITABLE_STATUS = ('pending', 'in_progress')
+
+
+def _find_plan_card(data, plan_id, card_id):
+    """从整树数据中定位 (plan, card)；未找到返回 (None, None)"""
+    for plan in data.get('plans', []):
+        if plan.get('id') != plan_id:
+            continue
+        for card in plan.get('cards', []):
+            if card.get('id') == card_id:
+                return plan, card
+    return None, None
+
+
+def _view_tree(view):
+    """把单卡局部写视图包成整树定位函数认识的结构；计划不存在时等价于空树。
+
+    只用于任务树写入口复用 _find_plan_card / _load_editable_card 的定位与
+    校验文案，不产生新的数据面：view['plan']['cards'] 里目标卡是完整数据，
+    其余卡是窄投影（定位与状态校验只用 id/status）。
+    """
+    return {'plans': [view['plan']]} if view and view.get('plan') else {'plans': []}
+
+
+def _load_editable_card(data, plan_id, card_id):
+    """定位可编辑卡片；成功返回 ((plan, card), None)，失败返回 (None, 错误响应)"""
+    plan, card = _find_plan_card(data, plan_id, card_id)
+    if not card:
+        return None, jsonify({"code": 404, "message": "卡片不存在", "data": None})
+    if card.get('status') not in _TASK_EDITABLE_STATUS:
+        return None, jsonify({"code": 403, "message": "卡片已结束，任务树只读", "data": None})
+    return (plan, card), None
+
+
+def _task_save_response(session, view, plan, card):
+    """任务树变更统一收尾：局部保存 + 返回任务树与局部刷新载荷
+
+    任务树只长在本卡（card.tasks）与关联打卡的 task_links 上，改动范围天然是
+    单卡；兄弟卡仅在同一次调用里被结算/解锁逻辑顺带碰到（本路径不会）。
+    """
+    card['updated_at'] = _now_str()
+    _save_view_writes(session, view)
+    return jsonify({"code": 200, "message": "success", "data": {
+        "tasks": _annotate_tasks(card),
+        "task_progress": _calc_task_progress(card),
+        "tasks_all_done": _calc_tasks_all_done(card),
+        "refresh": _build_refresh_payload(plan, card)
+    }})
+
+
+@plan_bp.route('/plan/api/task-add', methods=['POST'])
+def api_task_add():
+    """新增任务节点
+
+    参数: plan_id, card_id, title, estimated_minutes(>0), parent_id(可选)
+    挂到 parent_id 下（该父任务变为容器，预估自动=Σ叶子）；parent_id 为空则
+    追加到顶层末尾。新增节点一律为"待开始"。
+    """
+    try:
+        body = request.get_json() or {}
+        plan_id = body.get('plan_id', '')
+        card_id = body.get('card_id', '')
+        title = str(body.get('title') or '').strip()
+        parent_id = str(body.get('parent_id') or '').strip()
+        try:
+            estimated = int(body.get('estimated_minutes') or 0)
+        except (TypeError, ValueError):
+            estimated = 0
+
+        if not title:
+            return jsonify({"code": 400, "message": "任务名称不能为空", "data": None})
+        if estimated <= 0:
+            return jsonify({"code": 400, "message": "请填写预估时长（分钟，需大于 0）", "data": None})
+
+        with session_scope() as session:
+            view = _load_card_for_write(session, plan_id, card_id)
+            if view is not None:
+                _normalize_write_plan(view)
+            found_card, err_resp = _load_editable_card(_view_tree(view), plan_id, card_id)
+            if err_resp:
+                return err_resp
+            plan, card = found_card
+
+            tasks = card.get('tasks') or []
+            if parent_id:
+                parent_found = _find_task(tasks, parent_id)
+                if not parent_found:
+                    return jsonify({"code": 400, "message": "父任务不存在", "data": None})
+                siblings = parent_found[0].setdefault('children', [])
+            else:
+                siblings = tasks
+            siblings.append({
+                'id': _new_id('task'),
+                'title': title,
+                'estimated_minutes': estimated,
+                'status': 'todo',
+                'children': [],
+                'created_at': _now_str(),
+            })
+            card['tasks'] = tasks
+            _recompute_task_estimates(tasks)
+            _rollup_tasks(tasks)
+            return _task_save_response(session, view, plan, card)
+    except Exception as e:
+        logger.error(f"[Plan] api_task_add 错误: {e}", exc_info=True)
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@plan_bp.route('/plan/api/task-update', methods=['POST'])
+def api_task_update():
+    """更新任务节点：重命名 / 改预估（仅叶子）/ 移动父级 / 同级上移下移
+
+    参数: plan_id, card_id, task_id,
+          title(可选), estimated_minutes(可选，仅叶子),
+          parent_id(可选；键存在即视为移动请求，空值=移到顶层),
+          move(可选, 'up'|'down')
+    """
+    try:
+        body = request.get_json() or {}
+        plan_id = body.get('plan_id', '')
+        card_id = body.get('card_id', '')
+        task_id = body.get('task_id', '')
+        move = body.get('move') or ''
+
+        # 先完成全部参数校验，再统一变更（session_scope 正常退出即 commit，
+        # 必须避免"校验失败但已发生部分变更"）
+        title = None
+        if 'title' in body:
+            title = str(body.get('title') or '').strip()
+            if not title:
+                return jsonify({"code": 400, "message": "任务名称不能为空", "data": None})
+        estimated = None
+        if 'estimated_minutes' in body:
+            try:
+                estimated = int(body.get('estimated_minutes') or 0)
+            except (TypeError, ValueError):
+                estimated = 0
+            if estimated <= 0:
+                return jsonify({"code": 400, "message": "请填写预估时长（分钟，需大于 0）", "data": None})
+
+        with session_scope() as session:
+            view = _load_card_for_write(session, plan_id, card_id)
+            if view is not None:
+                _normalize_write_plan(view)
+            found_card, err_resp = _load_editable_card(_view_tree(view), plan_id, card_id)
+            if err_resp:
+                return err_resp
+            plan, card = found_card
+
+            tasks = card.get('tasks') or []
+            task_found = _find_task(tasks, task_id)
+            if not task_found:
+                return jsonify({"code": 400, "message": "任务不存在", "data": None})
+            node, siblings, parent = task_found
+
+            if estimated is not None and _task_is_container(node):
+                return jsonify({"code": 400, "message": "父任务预估由子任务自动累加，不能直接修改", "data": None})
+
+            # 移动目标解析（防成环：目标不能是自身或其子孙）
+            target_children = None
+            if 'parent_id' in body:
+                target_id = str(body.get('parent_id') or '').strip()
+                if target_id == task_id:
+                    return jsonify({"code": 400, "message": "不能移动到自身", "data": None})
+                if target_id and _find_task(node.get('children') or [], target_id):
+                    return jsonify({"code": 400, "message": "不能移动到自己的子任务下", "data": None})
+                if target_id:
+                    target_found = _find_task(tasks, target_id)
+                    if not target_found:
+                        return jsonify({"code": 400, "message": "目标父任务不存在", "data": None})
+                    target_children = target_found[0].setdefault('children', [])
+                else:
+                    target_children = tasks
+
+            # ---- 校验通过，开始变更 ----
+            if title is not None:
+                node['title'] = title
+            if estimated is not None:
+                node['estimated_minutes'] = estimated
+            if move in ('up', 'down'):
+                idx = siblings.index(node)
+                swap = idx - 1 if move == 'up' else idx + 1
+                if 0 <= swap < len(siblings):
+                    siblings[idx], siblings[swap] = siblings[swap], siblings[idx]
+            # parent_id 指向当前父级自身时视为无移动（保持原顺序）
+            if target_children is not None and target_children is not siblings:
+                siblings.remove(node)
+                target_children.append(node)
+
+            _recompute_task_estimates(tasks)
+            _rollup_tasks(tasks)
+            return _task_save_response(session, view, plan, card)
+    except Exception as e:
+        logger.error(f"[Plan] api_task_update 错误: {e}", exc_info=True)
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@plan_bp.route('/plan/api/task-delete', methods=['POST'])
+def api_task_delete():
+    """删除任务节点（连同其全部子任务）；已关联的打卡保留作为历史痕迹
+
+    参数: plan_id, card_id, task_id
+    """
+    try:
+        body = request.get_json() or {}
+        plan_id = body.get('plan_id', '')
+        card_id = body.get('card_id', '')
+        task_id = body.get('task_id', '')
+
+        with session_scope() as session:
+            view = _load_card_for_write(session, plan_id, card_id)
+            if view is not None:
+                _normalize_write_plan(view)
+            found_card, err_resp = _load_editable_card(_view_tree(view), plan_id, card_id)
+            if err_resp:
+                return err_resp
+            plan, card = found_card
+
+            tasks = card.get('tasks') or []
+            task_found = _find_task(tasks, task_id)
+            if not task_found:
+                return jsonify({"code": 400, "message": "任务不存在", "data": None})
+            node, siblings, parent = task_found
+            siblings.remove(node)
+            _recompute_task_estimates(tasks)
+            _rollup_tasks(tasks)
+            return _task_save_response(session, view, plan, card)
+    except Exception as e:
+        logger.error(f"[Plan] api_task_delete 错误: {e}", exc_info=True)
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@plan_bp.route('/plan/api/task-cancel-done', methods=['POST'])
+def api_task_cancel_done():
+    """取消任务完成：把完成依据打卡中的该任务改回"进行中"，任务状态回退
+
+    容器任务（父任务）是子任务完成的上卷结果，不能单独取消——返回 400，
+    随子任务的取消自动传导。参数: plan_id, card_id, task_id
+    """
+    try:
+        body = request.get_json() or {}
+        plan_id = body.get('plan_id', '')
+        card_id = body.get('card_id', '')
+        task_id = body.get('task_id', '')
+
+        with session_scope() as session:
+            view = _load_card_for_write(session, plan_id, card_id)
+            if view is not None:
+                _normalize_write_plan(view)
+            found_card, err_resp = _load_editable_card(_view_tree(view), plan_id, card_id)
+            if err_resp:
+                return err_resp
+            plan, card = found_card
+
+            tasks = card.get('tasks') or []
+            task_found = _find_task(tasks, task_id)
+            if not task_found:
+                return jsonify({"code": 400, "message": "任务不存在", "data": None})
+            node = task_found[0]
+            if _task_is_container(node):
+                return jsonify({"code": 400, "message": "父任务状态由子任务自动汇总，请对子任务操作", "data": None})
+            if node.get('status') != 'done':
+                return jsonify({"code": 400, "message": "该任务当前未完成，无需取消", "data": None})
+
+            # 完成依据（唯一）：关联打卡中该任务 state 从 done 改回 doing
+            for slot in card.get('slots', []):
+                rec = slot.get('record')
+                if not isinstance(rec, dict):
+                    continue
+                for link in rec.get('task_links') or []:
+                    if link.get('task_id') == task_id and link.get('state') == 'done':
+                        link['state'] = 'doing'
+            # 任务本体回退（防御性兜底：done 必有完成依据，但不依赖它成立）
+            node['status'] = 'doing'
+            node.pop('completed_at', None)
+            node.pop('completed_by_slot', None)
+            _rollup_tasks(tasks)
+            return _task_save_response(session, view, plan, card)
+    except Exception as e:
+        logger.error(f"[Plan] api_task_cancel_done 错误: {e}", exc_info=True)
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
 @plan_bp.route('/plan/api/fill-slot', methods=['POST'])
 def api_fill_slot():
     """勾选格子（填写小时记录）
 
     参数:
         plan_id, card_id, slot_index,
-        record: 学习卡 {content, duration_minutes}；
+        record: 学习卡 {content, duration_minutes, task_links}；
                 交易卡 {prediction, duration_minutes, actual,
-                        market_analysis, action_advice, account_balance}
+                        market_analysis, action_advice, account_balance, task_links}
+        task_links: [{task_id, state: doing|done}] 任务树关联；空数组=待关联
+                    （开始时允许不选，结束时由前端引导补选；填了则严格校验）
         filled_at: 可选，自定义打卡时间（补录历史记录），格式 YYYY-MM-DD HH:MM 或 YYYY-MM-DD HH:MM:SS
     """
     try:
@@ -1249,7 +2215,7 @@ def api_fill_slot():
         plan_id = body.get('plan_id', '')
         card_id = body.get('card_id', '')
         slot_index = body.get('slot_index')
-        record = body.get('record', {})
+        record = body.get('record') or {}
         custom_filled_at = body.get('filled_at', '').strip()
 
         if slot_index is None or slot_index < 0 or slot_index >= 100:
@@ -1263,58 +2229,76 @@ def api_fill_slot():
             custom_filled_at = normalized
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
+            # 局部读写：只锁本计划、只读本计划投影 + 目标卡完整数据，
+            # 写回也只碰目标格子、目标卡与被解锁的那张兄弟卡
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                # 计划不存在 / 卡不属于该计划：与整树定位路径同样的 404 文案
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
 
-                    # 检查串行锁定：只有 in_progress 的卡才能勾选
-                    if card['status'] != 'in_progress':
-                        return jsonify({"code": 403, "message": "当前卡不可勾选（状态: " + card['status'] + "）", "data": None})
+            # 检查串行锁定：只有 in_progress 的卡才能勾选
+            if card['status'] != 'in_progress':
+                return jsonify({"code": 403, "message": "当前卡不可勾选（状态: " + card['status'] + "）", "data": None})
 
-                    slots = card.get('slots', [])
-                    if slot_index >= len(slots):
-                        return jsonify({"code": 400, "message": "格子索引超出范围", "data": None})
+            slots = card.get('slots', [])
+            if slot_index >= len(slots):
+                return jsonify({"code": 400, "message": "格子索引超出范围", "data": None})
 
-                    slot = slots[slot_index]
-                    if slot.get('filled'):
-                        return jsonify({"code": 400, "message": "该格子已勾选", "data": None})
+            slot = slots[slot_index]
+            if slot.get('filled'):
+                return jsonify({"code": 400, "message": "该格子已勾选", "data": None})
 
-                    # 交易卡：先过分析纪律闸门（先分析记录，然后才允许打卡），
-                    # 再按新规范字段结构化，与前端提交格式保持一致
-                    analysis = None
-                    if card['type'] == 'trade':
-                        allowed, analysis, block = _discipline_gate(session, custom_filled_at)
-                        if not allowed:
-                            return _gate_block_response(block, _gate_message(block))
-                        record = _normalize_trade_record(record, analysis)
+            # 交易卡：先过分析纪律闸门（先分析记录，然后才允许打卡），
+            # 再按新规范字段结构化，与前端提交格式保持一致；
+            # 学习卡记录同样按规范字段重建（content/duration_minutes/task_links）
+            analysis = None
+            if card['type'] == 'trade':
+                allowed, analysis, block = _discipline_gate(session, custom_filled_at)
+                if not allowed:
+                    return _gate_block_response(block, _gate_message(block))
+                record = _normalize_trade_record(record, analysis)
+            else:
+                record = {
+                    'content': str(record.get('content', '') or ''),
+                    'duration_minutes': record.get('duration_minutes', 0) or 0,
+                    'task_links': _normalize_task_links(record.get('task_links')),
+                }
 
-                    # 填写记录（支持自定义时间补录，默认当前时间）
-                    slot['filled'] = True
-                    slot['filled_at'] = custom_filled_at if custom_filled_at else _now_str()
-                    slot['record'] = record
+            # 任务树关联校验（任务管理 v2）：不通过则不写入任何数据
+            links = record.get('task_links') or []
+            err = _validate_task_links(card.get('tasks') or [], links, slot_index)
+            if err:
+                return jsonify({"code": 400, "message": err, "data": None})
 
-                    # 交易回填后的自动计算
-                    if card['type'] == 'trade' and record.get('prediction') and record.get('actual'):
-                        record['hit'] = (record['prediction'] == record['actual'])
+            # 填写记录（支持自定义时间补录，默认当前时间）
+            slot['filled'] = True
+            slot['filled_at'] = custom_filled_at if custom_filled_at else _now_str()
+            slot['record'] = record
 
-                    card['updated_at'] = _now_str()
+            # 任务树联动：标记完成/进行中 + 逐级上卷
+            _apply_task_links(card.get('tasks') or [], links, slot_index, slot['filled_at'])
 
-                    # 检查是否满 100 格（学习卡自动完成；交易卡由用户确认翻倍后手动结算）
-                    filled_count = _calc_total_hours(slots)
-                    if card['type'] == 'learn' and filled_count >= 100:
-                        _settle_card(plan, card)
+            # 交易回填后的自动计算
+            if card['type'] == 'trade' and record.get('prediction') and record.get('actual'):
+                record['hit'] = (record['prediction'] == record['actual'])
 
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "✅ 勾选成功 · 欢迎回来，长期主义者 🌱", "data": {
-                        "slot": slot,
-                        "card_status": card['status'],
-                        "filled_count": filled_count,
-                        "refresh": _build_refresh_payload(plan, card)
-                    }})
+            card['updated_at'] = _now_str()
+
+            # 检查是否满 100 格（学习卡自动完成；交易卡由用户确认翻倍后手动结算）
+            filled_count = _calc_total_hours(slots)
+            if card['type'] == 'learn' and (filled_count >= 100 or _is_countdown_expired(plan, card)):
+                _settle_card(plan, card)
+
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "✅ 勾选成功 · 欢迎回来，长期主义者 🌱", "data": {
+                "slot": slot,
+                "card_status": card['status'],
+                "filled_count": filled_count,
+                "refresh": _build_refresh_payload(plan, card)
+            }})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1324,57 +2308,74 @@ def api_fill_slot():
 
 @plan_bp.route('/plan/api/update-slot', methods=['POST'])
 def api_update_slot():
-    """更新格子记录（如回填实际涨跌）"""
+    """更新格子记录（如回填实际涨跌；也可修改任务关联 task_links）"""
     try:
         body = request.get_json() or {}
         plan_id = body.get('plan_id', '')
         card_id = body.get('card_id', '')
         slot_index = body.get('slot_index')
-        record = body.get('record', {})
+        record = body.get('record') or {}
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    slots = card.get('slots', [])
-                    if slot_index < 0 or slot_index >= len(slots):
-                        return jsonify({"code": 400, "message": "格子索引无效", "data": None})
-                    slot = slots[slot_index]
-                    if not slot.get('filled'):
-                        return jsonify({"code": 400, "message": "该格子未勾选，无法更新", "data": None})
+            # 局部读写：见 fill-slot 同款注释（回填实际涨跌只改一个格子）
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
 
-                    # 交易卡记录按新规范字段结构化，与前端提交格式保持一致
-                    if card['type'] == 'trade':
-                        # 分析关联字段以库内既有值为准（表单不回传这些字段，
-                        # 避免“回填实际涨跌”时把打卡与分析记录的关联抹除）
-                        prev = slot.get('record') or {}
-                        keep_analysis = {
-                            'analysis_ids': prev.get('analysis_ids') or record.get('analysis_ids') or [],
-                            'analysis_hour': prev.get('analysis_hour') or record.get('analysis_hour') or '',
-                            'bypass_analysis': bool(prev.get('bypass_analysis')
-                                                    or record.get('bypass_analysis')),
-                        }
-                        slot['record'] = _normalize_trade_record(record, keep_analysis)
-                    elif slot['record'] is None:
-                        slot['record'] = record
-                    else:
-                        slot['record'].update(record)
+            slots = card.get('slots', [])
+            if slot_index < 0 or slot_index >= len(slots):
+                return jsonify({"code": 400, "message": "格子索引无效", "data": None})
+            slot = slots[slot_index]
+            if not slot.get('filled'):
+                return jsonify({"code": 400, "message": "该格子未勾选，无法更新", "data": None})
 
-                    # 重新计算命中
-                    r = slot['record']
-                    if card['type'] == 'trade' and r.get('prediction') and r.get('actual'):
-                        r['hit'] = (r['prediction'] == r['actual'])
+            prev = slot.get('record') or {}
+            prev_links = _normalize_task_links(prev.get('task_links'))
+            # 任务树关联（任务管理 v2）：表单未携带 task_links 键时沿用库内
+            # 旧值（局部更新保护）；携带时严格校验（含差量回退）后应用
+            raw_links = record.get('task_links') if 'task_links' in record else prev_links
+            new_links = _normalize_task_links(raw_links)
+            err = _validate_task_links(card.get('tasks') or [], new_links, slot_index)
+            if err:
+                return jsonify({"code": 400, "message": err, "data": None})
+            record = dict(record)
+            record['task_links'] = new_links
 
-                    card['updated_at'] = _now_str()
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "更新成功", "data": {
-                        "slot": slot,
-                        "refresh": _build_refresh_payload(plan, card)
-                    }})
+            # 交易卡记录按新规范字段结构化，与前端提交格式保持一致
+            if card['type'] == 'trade':
+                # 分析关联字段以库内既有值为准（表单不回传这些字段，
+                # 避免“回填实际涨跌”时把打卡与分析记录的关联抹除）
+                keep_analysis = {
+                    'analysis_ids': prev.get('analysis_ids') or record.get('analysis_ids') or [],
+                    'analysis_hour': prev.get('analysis_hour') or record.get('analysis_hour') or '',
+                    'bypass_analysis': bool(prev.get('bypass_analysis')
+                                            or record.get('bypass_analysis')),
+                }
+                slot['record'] = _normalize_trade_record(record, keep_analysis)
+            elif slot['record'] is None:
+                slot['record'] = record
+            else:
+                slot['record'].update(record)
+
+            # 任务树联动：差量回退（旧 done 且本次非 done 的关联）
+            # + 应用新关联（done 写完成依据）+ 逐级上卷
+            _apply_task_links(card.get('tasks') or [], new_links, slot_index,
+                              slot.get('filled_at') or _now_str(), prev_links)
+
+            # 重新计算命中
+            r = slot['record']
+            if card['type'] == 'trade' and r.get('prediction') and r.get('actual'):
+                r['hit'] = (r['prediction'] == r['actual'])
+
+            card['updated_at'] = _now_str()
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "更新成功", "data": {
+                "slot": slot,
+                "refresh": _build_refresh_payload(plan, card)
+            }})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1397,37 +2398,44 @@ def api_unfill_slot():
             return jsonify({"code": 400, "message": "格子索引无效(0~99)", "data": None})
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    slots = card.get('slots', [])
-                    if slot_index >= len(slots):
-                        return jsonify({"code": 400, "message": "格子索引超出范围", "data": None})
-                    slot = slots[slot_index]
-                    if not slot.get('filled'):
-                        return jsonify({"code": 400, "message": "该格子未勾选，无需删除", "data": None})
+            # 局部读写：撤销一个格子只改这一格 + 本卡；若因此撤销结算，
+            # 串行链重算牵连到的兄弟卡也只补写 status/start_time 等被改的列
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
 
-                    slot['filled'] = False
-                    slot['filled_at'] = ''
-                    slot['record'] = None
+            slots = card.get('slots', [])
+            if slot_index >= len(slots):
+                return jsonify({"code": 400, "message": "格子索引超出范围", "data": None})
+            slot = slots[slot_index]
+            if not slot.get('filled'):
+                return jsonify({"code": 400, "message": "该格子未勾选，无需删除", "data": None})
 
-                    # 若已结算且不满足通关条件（不足 100 小时且子目标未全部完成），撤销结算并重算串行链
-                    if card.get('settlement') and _calc_total_hours(slots) < 100 and not _calc_milestones_all_done(card):
-                        card['settlement'] = None
-                        card['status'] = 'pending'
-                        _recompute_serial_chain(plan)
+            # 任务树回退（任务管理 v2）：删除打卡 → 本打卡标记完成的任务
+            # 回退"进行中"（含上卷父任务传导）；旧关联需在清空 record 前取出
+            old_links = _normalize_task_links((slot.get('record') or {}).get('task_links'))
+            _revert_slot_task_links(card.get('tasks') or [], old_links, slot_index)
 
-                    card['updated_at'] = _now_str()
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "删除成功", "data": {
-                        "card_status": card['status'],
-                        "filled_count": _calc_total_hours(slots),
-                        "refresh": _build_refresh_payload(plan, card)
-                    }})
+            slot['filled'] = False
+            slot['filled_at'] = ''
+            slot['record'] = None
+
+            # 若已结算且不满足通关条件（不足 100 小时且任务树未全部完成），撤销结算并重算串行链
+            if card.get('settlement') and _calc_total_hours(slots) < 100 and not _calc_tasks_all_done(card):
+                card['settlement'] = None
+                card['status'] = 'pending'
+                _recompute_serial_chain(plan)
+
+            card['updated_at'] = _now_str()
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "删除成功", "data": {
+                "card_status": card['status'],
+                "filled_count": _calc_total_hours(slots),
+                "refresh": _build_refresh_payload(plan, card)
+            }})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1437,7 +2445,7 @@ def api_unfill_slot():
 
 @plan_bp.route('/plan/api/reset-card', methods=['POST'])
 def api_reset_card():
-    """重置任务卡：清空所有打卡记录、小记、目标拆解、结算，恢复到初始状态
+    """重置任务卡：清空所有打卡记录、小记、目标拆解/任务树、结算，恢复到初始状态
 
     参数: plan_id, card_id
     """
@@ -1447,28 +2455,31 @@ def api_reset_card():
         card_id = body.get('card_id', '')
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    # 保留配置（标题/目标/奖励），清空全部过程数据
-                    card['slots'] = _create_empty_slots(100)
-                    card['milestones'] = []
-                    card['todos'] = []
-                    card['notes'] = []
-                    card['review'] = ''
-                    card['settlement'] = None
-                    card['start_time'] = ''
-                    card['end_time'] = ''
-                    card['status'] = 'pending'
-                    # 重算串行链（若前面卡都已结束，本卡自动恢复为进行中）
-                    _recompute_serial_chain(plan)
-                    card['updated_at'] = _now_str()
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "重置成功", "data": card})
+            # 局部读写：重置只清空本卡的过程数据（格子值 + 卡字段），
+            # 串行链重算牵连的兄弟卡由 save_sibling_changes 按列差量补写
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
+
+            # 保留配置（标题/目标/奖励），清空全部过程数据
+            card['slots'] = _create_empty_slots(100)
+            card['milestones'] = []
+            card['todos'] = []
+            card['tasks'] = []
+            card['notes'] = []
+            card['review'] = ''
+            card['settlement'] = None
+            card['start_time'] = ''
+            card['end_time'] = ''
+            card['status'] = 'pending'
+            # 重算串行链（若前面卡都已结束，本卡自动恢复为进行中）
+            _recompute_serial_chain(plan)
+            card['updated_at'] = _now_str()
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "重置成功", "data": card})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1489,21 +2500,21 @@ def api_add_note():
             return jsonify({"code": 400, "message": "内容不能为空", "data": None})
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    note = {
-                        "time": _now_str(),
-                        "content": content
-                    }
-                    card['notes'].append(note)
-                    card['updated_at'] = _now_str()
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "添加成功", "data": note})
+            # 局部读写：加一条小记只改本卡 notes 一列，格子一个都不动
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+
+            note = {
+                "time": _now_str(),
+                "content": content
+            }
+            card['notes'].append(note)
+            card['updated_at'] = _now_str()
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "添加成功", "data": note})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1520,29 +2531,29 @@ def api_toggle_milestone():
         milestone_index = body.get('milestone_index')
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    milestones = card.get('milestones', [])
-                    if milestone_index < 0 or milestone_index >= len(milestones):
-                        return jsonify({"code": 400, "message": "子目标索引无效", "data": None})
-                    milestones[milestone_index]['done'] = not milestones[milestone_index]['done']
-                    card['updated_at'] = _now_str()
-                    _save_plans(session, data)
-                    # 返回子目标完成状态与提前通关资格，供前端引导结算
-                    all_done = _calc_milestones_all_done(card)
-                    early_eligible = _calc_early_eligible(card)
-                    return jsonify({"code": 200, "message": "切换成功", "data": {
-                        "milestones": card['milestones'],
-                        "all_done": all_done,
-                        "early_eligible": early_eligible,
-                        "card_status": card['status'],
-                        "filled_count": _calc_total_hours(card.get('slots', []))
-                    }})
+            # 局部读写：切一个子目标只改本卡 milestones 一列
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+
+            milestones = card.get('milestones', [])
+            if milestone_index < 0 or milestone_index >= len(milestones):
+                return jsonify({"code": 400, "message": "子目标索引无效", "data": None})
+            milestones[milestone_index]['done'] = not milestones[milestone_index]['done']
+            card['updated_at'] = _now_str()
+            _save_view_writes(session, view)
+            # 返回任务树完成状态与提前通关资格，供前端引导结算
+            all_done = _calc_tasks_all_done(card)
+            early_eligible = _calc_early_eligible(card)
+            return jsonify({"code": 200, "message": "切换成功", "data": {
+                "milestones": card['milestones'],
+                "all_done": all_done,
+                "early_eligible": early_eligible,
+                "card_status": card['status'],
+                "filled_count": _calc_total_hours(card.get('slots', []))
+            }})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1559,32 +2570,63 @@ def api_settle_round():
         profit_multiplier = body.get('profit_multiplier')
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
-                        continue
-                    if card['status'] == 'completed' or card['status'] == 'failed':
-                        return jsonify({"code": 400, "message": "已结算，无需重复结算", "data": card.get('settlement')})
+            # 局部读写：结算改本卡 status/settlement，并解锁下一张卡
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
 
-                    # 交易卡必须提供资金倍数；学习卡可自动/提前通关（满100小时或子目标全部完成）
-                    if card['type'] == 'trade':
-                        if profit_multiplier is None:
-                            return jsonify({"code": 400, "message": "请提供当前资金倍数（本金 × N）", "data": None})
-                        if profit_multiplier < 2 and _calc_total_hours(card.get('slots', [])) < 100:
-                            return jsonify({"code": 400, "message": "未翻倍且未满 100 小时，暂不能结算", "data": None})
-                    else:
-                        if _calc_total_hours(card.get('slots', [])) < 100 and not _calc_milestones_all_done(card):
-                            return jsonify({"code": 400, "message": "未满 100 小时且子目标未全部完成，暂不能结算", "data": None})
+            if card['status'] == 'completed' or card['status'] == 'failed':
+                return jsonify({"code": 400, "message": "已结算，无需重复结算", "data": card.get('settlement')})
 
-                    _settle_card(plan, card, profit_multiplier)
-                    _save_plans(session, data)
-                    return jsonify({"code": 200, "message": "结算成功", "data": card})
+            # 交易卡必须提供资金倍数；学习卡可自动/提前通关（满100小时或任务树全部完成）
+            if card['type'] == 'trade':
+                if profit_multiplier is None:
+                    return jsonify({"code": 400, "message": "请提供当前资金倍数（本金 × N）", "data": None})
+                if profit_multiplier < 2 and _calc_total_hours(card.get('slots', [])) < 100:
+                    return jsonify({"code": 400, "message": "未翻倍且未满 100 小时，暂不能结算", "data": None})
+            else:
+                if _calc_total_hours(card.get('slots', [])) < 100 and not _calc_tasks_all_done(card):
+                    return jsonify({"code": 400, "message": "未满 100 小时且任务树未全部完成，暂不能结算", "data": None})
+
+            _settle_card(plan, card, profit_multiplier)
+            _save_view_writes(session, view)
+            return jsonify({"code": 200, "message": "结算成功", "data": card})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@plan_bp.route('/plan/api/settle-expired', methods=['POST'])
+def api_settle_expired():
+    """惰性落库"10 天倒计时"到期结算（第三个结束条件）。
+
+    GET 读接口一律不写库（见 _load_plans 锁超时说明），故到期结算改由前端在拿到
+    列表后、发现某卡 reward_info.countdown_expired 为真时发起本 POST：走加锁的
+    _load_plans_for_write 全树写路径结算并解锁下一张，返回最新计划结构与被结算的卡。
+    可选 body.plan_id 限定单个计划；缺省扫描全部计划。幂等：已结算卡不再处理。
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        plan_id = (body.get('plan_id') or '').strip()
+        with session_scope() as session:
+            data = _load_plans_for_write(session, plan_id)
+            targets = [p for p in data.get('plans', []) if (not plan_id or p['id'] == plan_id)]
+            settled = []
+            for plan in targets:
+                for cid in _apply_countdown_settlements(plan):
+                    settled.append({'plan_id': plan['id'], 'card_id': cid})
+            if settled:
+                _save_plans(session, data)
+            refreshed = [_build_plan_info(p) for p in targets]
+        msg = (f"已结算 {len(settled)} 张到期卡" if settled else "无到期卡")
+        return jsonify({"code": 200, "message": msg,
+                        "data": {"settled": settled, "plans": refreshed}})
+    except Exception as e:
+        logger.error(f"[Plan] api_settle_expired 错误: {e}", exc_info=True)
         return jsonify({"code": 500, "message": str(e), "data": None})
 
 
@@ -1681,7 +2723,8 @@ def api_backfill_balances():
         end_ms = int((d_end + datetime.timedelta(days=1)).timestamp() * 1000)
 
         with session_scope() as session:
-            points = balance_repo.load_account_points(session, account_key)
+            points = balance_repo.load_account_points(session, account_key,
+                                                      start_ms=start_ms, end_ms=end_ms)
 
         # 按日聚合：每天取时间戳最晚的一个快照点
         daily = {}
@@ -1731,7 +2774,9 @@ def api_backfill_batch():
     """批量历史补录：将多条记录按时间先后依次填入空格子
 
     参数: plan_id, card_id,
-          entries: [{filled_at: 'YYYY-MM-DD HH:MM', record: {...}}]
+          entries: [{filled_at: 'YYYY-MM-DD HH:MM', record: {...}}],
+          task_links(可选): [{task_id, state}] 整批统一关联同一组任务，
+                            状态固定"进行中"（历史补录只推进，不标完成）
     依次占用空格子（0→99），空格子不足时多余条目跳过并在 skipped 中返回；
     交易卡记录走 _normalize_trade_record 规范化字段，prediction+actual 齐全时自动计算 hit。
 
@@ -1749,6 +2794,10 @@ def api_backfill_batch():
         if len(entries) > 100:
             return jsonify({"code": 400, "message": "单次补录不能超过 100 条", "data": None})
 
+        # 任务树关联（任务管理 v2）：整批统一关联同一组任务，状态固定"进行中"
+        batch_links = [{'task_id': x['task_id'], 'state': 'doing'}
+                       for x in _normalize_task_links(body.get('task_links'))]
+
         # 逐条校验并规范化时间，随后按时间升序填入
         norm_entries = []
         for e in entries:
@@ -1761,95 +2810,112 @@ def api_backfill_batch():
         norm_entries.sort(key=lambda x: x[0])
 
         with session_scope() as session:
-            data = _load_plans(session)
-            for plan in data['plans']:
-                if plan['id'] != plan_id:
-                    continue
-                for card in plan.get('cards', []):
-                    if card['id'] != card_id:
+            # 局部读写：整批补录只改本卡的空格子（差量写，未动的格子零 SQL）
+            view = _load_card_for_write(session, plan_id, card_id)
+            card = view['card'] if view else None
+            if card is None:
+                return jsonify({"code": 404, "message": "卡片不存在", "data": None})
+            _normalize_write_plan(view)
+            plan = view['plan']
+
+            # 与 fill-slot 保持一致的串行锁定校验
+            if card['status'] != 'in_progress':
+                return jsonify({"code": 403, "message": "当前卡不可补录（状态: " + card['status'] + "）", "data": None})
+
+            # 任务树关联校验：整批同一组关联，任一项不合法则整批拒绝
+            if batch_links:
+                err = _validate_task_links(card.get('tasks') or [], batch_links, -1)
+                if err:
+                    return jsonify({"code": 400, "message": err, "data": None})
+
+            slots = card.get('slots', [])
+            free_indexes = [i for i, s in enumerate(slots) if not s.get('filled')]
+            is_trade = card['type'] == 'trade'
+
+            # 闸门开启时才逐条判定；同一小时槽只判一次（范围补录常多日同一时刻）
+            gate_cfg = None
+            if is_trade:
+                try:
+                    from . import discipline_repo as _disc
+                    _cfg = _disc.load_config()
+                    if _cfg.get('enabled', True):
+                        gate_cfg = _cfg
+                except Exception as e:
+                    logger.warning(f'[Plan] 补录闸门不可用，按无闸门处理: {e}')
+            gate_cache = {}
+
+            filled = 0
+            blocked = []
+            for fa, record in norm_entries:
+                if filled >= len(free_indexes):
+                    break
+                analysis = None
+                if gate_cfg is not None:
+                    slot_key = fa[:13]
+                    if slot_key not in gate_cache:
+                        gate_cache[slot_key] = _discipline_gate(session, fa, gate_cfg)
+                    allowed, analysis, block = gate_cache[slot_key]
+                    if not allowed:
+                        blocked.append({
+                            'filled_at': fa,
+                            'hour_slot': slot_key,
+                            'required': block.get('required'),
+                            'actual': block.get('actual'),
+                            'missing_coins': block.get('missing_coins') or [],
+                        })
                         continue
+                slot = slots[free_indexes[filled]]
+                if is_trade:
+                    record['task_links'] = batch_links
+                    record = _normalize_trade_record(record, analysis)
+                    if record.get('prediction') and record.get('actual'):
+                        record['hit'] = (record['prediction'] == record['actual'])
+                else:
+                    record = {
+                        'content': str(record.get('content', '') or ''),
+                        'duration_minutes': record.get('duration_minutes', 0) or 0,
+                        'task_links': batch_links,
+                    }
+                slot['filled'] = True
+                slot['filled_at'] = fa
+                slot['record'] = record
+                filled += 1
 
-                    # 与 fill-slot 保持一致的串行锁定校验
-                    if card['status'] != 'in_progress':
-                        return jsonify({"code": 403, "message": "当前卡不可补录（状态: " + card['status'] + "）", "data": None})
-
-                    slots = card.get('slots', [])
-                    free_indexes = [i for i, s in enumerate(slots) if not s.get('filled')]
-                    is_trade = card['type'] == 'trade'
-
-                    # 闸门开启时才逐条判定；同一小时槽只判一次（范围补录常多日同一时刻）
-                    gate_cfg = None
-                    if is_trade:
-                        try:
-                            from . import discipline_repo as _disc
-                            _cfg = _disc.load_config()
-                            if _cfg.get('enabled', True):
-                                gate_cfg = _cfg
-                        except Exception as e:
-                            logger.warning(f'[Plan] 补录闸门不可用，按无闸门处理: {e}')
-                    gate_cache = {}
-
-                    filled = 0
-                    blocked = []
-                    for fa, record in norm_entries:
-                        if filled >= len(free_indexes):
-                            break
-                        analysis = None
-                        if gate_cfg is not None:
-                            slot_key = fa[:13]
-                            if slot_key not in gate_cache:
-                                gate_cache[slot_key] = _discipline_gate(session, fa, gate_cfg)
-                            allowed, analysis, block = gate_cache[slot_key]
-                            if not allowed:
-                                blocked.append({
-                                    'filled_at': fa,
-                                    'hour_slot': slot_key,
-                                    'required': block.get('required'),
-                                    'actual': block.get('actual'),
-                                    'missing_coins': block.get('missing_coins') or [],
-                                })
-                                continue
-                        slot = slots[free_indexes[filled]]
-                        if is_trade:
-                            record = _normalize_trade_record(record, analysis)
-                            if record.get('prediction') and record.get('actual'):
-                                record['hit'] = (record['prediction'] == record['actual'])
-                        slot['filled'] = True
-                        slot['filled_at'] = fa
-                        slot['record'] = record
-                        filled += 1
-
-                    # 全部条目都被闸门挡住：整批 403，直接引导去补回溯分析
-                    if blocked and filled == 0:
-                        blocked_slots = sorted({b['hour_slot'] for b in blocked})
-                        return jsonify({"code": 403, "message": (
-                            f"📝 先分析，再打卡：{len(blocked)} 条补录全部被拦（缺 {len(blocked_slots)} 个小时的分析记录）"),
-                            "data": {
-                                "need_analysis": True,
-                                "filled": 0,
-                                "blocked": blocked,
-                                "blocked_slots": blocked_slots,
-                            }})
-
-                    card['updated_at'] = _now_str()
-                    filled_count = _calc_total_hours(slots)
-                    # 学习卡满 100 格自动结算（与 fill-slot 逻辑一致）
-                    if card['type'] == 'learn' and filled_count >= 100:
-                        _settle_card(plan, card)
-                    _save_plans(session, data)
-                    blocked_slots = sorted({b['hour_slot'] for b in blocked})
-                    msg = f"补录成功，共 {filled} 条"
-                    if blocked:
-                        msg += f"；{len(blocked)} 条因缺分析记录被拦（涉 {len(blocked_slots)} 个小时）"
-                    return jsonify({"code": 200, "message": msg, "data": {
-                        "filled": filled,
-                        "skipped": len(norm_entries) - filled - len(blocked),
+            # 全部条目都被闸门挡住：整批 403，直接引导去补回溯分析
+            if blocked and filled == 0:
+                blocked_slots = sorted({b['hour_slot'] for b in blocked})
+                return jsonify({"code": 403, "message": (
+                    f"📝 先分析，再打卡：{len(blocked)} 条补录全部被拦（缺 {len(blocked_slots)} 个小时的分析记录）"),
+                    "data": {
+                        "need_analysis": True,
+                        "filled": 0,
                         "blocked": blocked,
                         "blocked_slots": blocked_slots,
-                        "filled_count": filled_count,
-                        "card_status": card['status'],
-                        "refresh": _build_refresh_payload(plan, card)
                     }})
+
+            # 任务树联动：整批关联统一推进为"进行中"
+            if batch_links:
+                _touch_task_links_doing(card.get('tasks') or [], batch_links)
+
+            card['updated_at'] = _now_str()
+            filled_count = _calc_total_hours(slots)
+            # 学习卡满 100 格自动结算（与 fill-slot 逻辑一致）
+            if card['type'] == 'learn' and (filled_count >= 100 or _is_countdown_expired(plan, card)):
+                _settle_card(plan, card)
+            _save_view_writes(session, view)
+            blocked_slots = sorted({b['hour_slot'] for b in blocked})
+            msg = f"补录成功，共 {filled} 条"
+            if blocked:
+                msg += f"；{len(blocked)} 条因缺分析记录被拦（涉 {len(blocked_slots)} 个小时）"
+            return jsonify({"code": 200, "message": msg, "data": {
+                "filled": filled,
+                "skipped": len(norm_entries) - filled - len(blocked),
+                "blocked": blocked,
+                "blocked_slots": blocked_slots,
+                "filled_count": filled_count,
+                "card_status": card['status'],
+                "refresh": _build_refresh_payload(plan, card)
+            }})
 
         return jsonify({"code": 404, "message": "卡片不存在", "data": None})
     except Exception as e:
@@ -1878,7 +2944,7 @@ def api_today_status():
         result = []
 
         with session_scope() as session:
-            data = _load_plans(session)
+            data = _load_summary_plans(session)
             for plan in data.get('plans', []):
                 result.append(_build_today_entry(plan))
 

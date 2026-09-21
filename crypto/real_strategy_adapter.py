@@ -146,17 +146,31 @@ def save_config(config):
         json.dump(config, f, ensure_ascii=False, indent=4)
     return db_ok
 
+def _sort_fixed_by_market_cap(coins, config):
+    """固定币种按市值排名降序（排名数字升序）稳定排序。
+
+    排名依据 config['market_ranks']（inst_id → CoinGecko 市值排名，
+    由「更新市值列表」刷新写入）；无排名数据的币（手动提升/未入榜）
+    保持原有相对顺序排在最后；从未刷新过时（无 market_ranks）列表原样返回。
+    """
+    ranks = config.get("market_ranks") or {}
+    if not ranks:
+        return coins
+    return sorted(coins, key=lambda c: ranks.get(c, 10 ** 9))
+
+
 def get_all_coins():
-    """获取所有可用币种（固定币种 + 浮动币种，浮动币种排在最后）"""
+    """获取所有可用币种（固定币种按市值降序 + 浮动币种排最后）"""
     config = load_config()
-    fixed = config.get("all_coins", [])
+    fixed = _sort_fixed_by_market_cap(config.get("all_coins", []), config)
     floating = [c for c in config.get("floating_coins", []) if c not in fixed]
     return fixed + floating
 
 
 def get_fixed_coins():
-    """获取固定币种（市值较大的稳定币种，不可随意删改）"""
-    return load_config().get("all_coins", [])
+    """获取固定币种（按 CoinGecko 实时市值降序，不可随意删改）"""
+    config = load_config()
+    return _sort_fixed_by_market_cap(config.get("all_coins", []), config)
 
 
 def get_floating_coins():
@@ -267,6 +281,262 @@ def sync_coin_list():
     config["all_coins"] = merged
     save_config(config)
     return merged
+
+
+# ================================================================
+#  crypto_coins「宇宙」维护（DB 表 + CSV 文件双写）
+# ================================================================
+# 宇宙 = 批量趋势分析(batch_trend_updater)的输入清单，也是 get_csv_coins()
+# /「CSV同步固定」的数据源。关键不变量：batch_trend_updater 只处理宇宙里
+# 「已有」的币（读宇宙→分析→原样写回），不会去交易所重新发现新币种。因此
+# 从宇宙删除的币不会自动复活 —— 「移除选中」必须同时删宇宙，否则一按
+# 「CSV同步固定」就被打回原形（这正是此前删了又冒出来的根因）。
+# DB 为主存、CSV 为兜底；两者列数可能不同（DB=48列含15m，旧CSV=37列），
+# 故 CSV 写回严格保留其自身表头，避免格式漂移。
+_UNIVERSE_CSV = os.path.join(BASE_DIR, 'crypto_coins.csv')
+
+
+def _read_universe_csv():
+    """读 CSV 宇宙，返回 (fieldnames, rows)；文件缺失/损坏返回 ([], [])。"""
+    import csv
+    try:
+        with open(_UNIVERSE_CSV, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = [dict(r) for r in reader]
+        return fieldnames, rows
+    except Exception as e:
+        log(f"【宇宙】读取 CSV 失败: {e!r}")
+        return [], []
+
+
+def _write_universe_csv(fieldnames, rows):
+    """按给定表头写回 CSV 宇宙（保留原列结构，避免格式漂移）。"""
+    import csv
+    if not fieldnames:
+        return
+    try:
+        with open(_UNIVERSE_CSV, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception as e:
+        log(f"【宇宙】写回 CSV 失败: {e!r}")
+
+
+def _universe_remove_coins(targets):
+    """从宇宙（DB 表 + CSV 文件）删除 inst_id ∈ targets 的行，返回实际删除的集合。
+
+    删除后 batch_trend_updater 不再处理它们，也不会复活。
+    安全护栏：若删除会导致宇宙被清空，则放弃该存储的删除（记日志），避免误清全表。
+    """
+    targets = {(c or '').strip() for c in targets if (c or '').strip()}
+    if not targets:
+        return set()
+    removed = set()
+
+    # --- DB 主存 ---
+    if _db_session_scope is not None and _market_repo is not None:
+        try:
+            with _db_session_scope() as _s:
+                rows = _market_repo.load_coin_rows(_s)
+            hit = {(r.get('inst_id') or '').strip() for r in rows} & targets
+            kept = [r for r in rows if (r.get('inst_id') or '').strip() not in targets]
+            if hit and kept:
+                with _db_session_scope() as _s:
+                    _market_repo.save_coin_rows(_s, kept)
+                removed |= hit
+            elif hit and not kept:
+                log(f"【宇宙删行】DB 删除会导致宇宙清空，已放弃: {sorted(hit)}")
+        except Exception as e:
+            log(f"【宇宙删行】DB 操作失败: {e!r}")
+
+    # --- CSV 兜底（保留原表头）---
+    fieldnames, crows = _read_universe_csv()
+    if fieldnames:
+        hit = {(r.get('inst_id') or '').strip() for r in crows} & targets
+        kept = [r for r in crows if (r.get('inst_id') or '').strip() not in targets]
+        if hit and kept:
+            _write_universe_csv(fieldnames, kept)
+            removed |= hit
+        elif hit and not kept:
+            log(f"【宇宙删行】CSV 删除会导致宇宙清空，已放弃: {sorted(hit)}")
+
+    return removed
+
+
+def _universe_add_coins(targets):
+    """把 inst_id ∈ targets 加入宇宙（DB 表 + CSV 文件），已存在则跳过。
+
+    新增行只填身份列（rank/symbol/inst_id），指标列留空，由 batch_trend_updater
+    下次运行时自动补全。返回实际新增的 inst_id 列表（保持传入顺序、去重）。
+    """
+    req = []
+    seen = set()
+    for c in targets:
+        c = (c or '').strip()
+        if c and c not in seen:
+            req.append(c)
+            seen.add(c)
+    if not req:
+        return []
+
+    def _minimal(inst_id, rank, keys):
+        row = {k: '' for k in keys} if keys else {}
+        row['rank'] = str(rank)
+        row['symbol'] = inst_id.split('-')[0]
+        row['inst_id'] = inst_id
+        row['name_cn'] = ''
+        return row
+
+    def _max_rank(rows):
+        m = 0
+        for r in rows:
+            rk = (r.get('rank') or '').strip()
+            if rk.isdigit():
+                m = max(m, int(rk))
+        return m
+
+    added = set()
+
+    # --- DB 主存 ---
+    if _db_session_scope is not None and _market_repo is not None:
+        try:
+            with _db_session_scope() as _s:
+                rows = _market_repo.load_coin_rows(_s)
+            existing = {(r.get('inst_id') or '').strip() for r in rows}
+            keys = list(rows[0].keys()) if rows else ['rank', 'symbol', 'inst_id', 'name_cn']
+            rank = _max_rank(rows)
+            new_rows = list(rows)
+            for c in req:
+                if c in existing:
+                    continue
+                rank += 1
+                new_rows.append(_minimal(c, rank, keys))
+                existing.add(c)
+                added.add(c)
+            if len(new_rows) != len(rows):
+                with _db_session_scope() as _s:
+                    _market_repo.save_coin_rows(_s, new_rows)
+        except Exception as e:
+            log(f"【宇宙加行】DB 操作失败: {e!r}")
+
+    # --- CSV 兜底（保留原表头）---
+    fieldnames, crows = _read_universe_csv()
+    if fieldnames:
+        existing = {(r.get('inst_id') or '').strip() for r in crows}
+        rank = _max_rank(crows)
+        new_rows = list(crows)
+        for c in req:
+            if c in existing:
+                continue
+            rank += 1
+            new_rows.append(_minimal(c, rank, fieldnames))
+            existing.add(c)
+            added.add(c)
+        if len(new_rows) != len(crows):
+            _write_universe_csv(fieldnames, new_rows)
+
+    return [c for c in req if c in added]
+
+
+def remove_fixed_coins(coins):
+    """从固定列表移除选中币种，并从 crypto_coins 宇宙彻底删除（下架币清理）。
+
+    - 至少保留一个固定币种：若移除后固定列表为空则抛 ValueError（HTTP 层转 400）。
+    - 同步从 default_selected / starred_coins / floating_coins 剔除，避免残留。
+    - 关键：同时删「宇宙」(DB表+CSV)，否则「CSV同步固定」会把下架币复活；
+      batch_trend_updater 只处理宇宙内已有币，删除后不会自动加回（永久生效）。
+    - 返回实际被移除的固定币种列表（保持原固定列表顺序）。
+    """
+    config = load_config()
+    fixed = config.get("all_coins", [])
+    remove_set = {(c or "").strip() for c in coins if (c or "").strip()}
+    new_fixed = [c for c in fixed if c not in remove_set]
+    if not new_fixed:
+        raise ValueError("至少保留一个固定币种")
+    removed = [c for c in fixed if c in remove_set]
+    removed_set = set(removed)
+    config["all_coins"] = new_fixed
+    # 被移除的币种不再监控：从选中/星标/浮动列表一并剔除，避免残留
+    config["default_selected"] = [c for c in config.get("default_selected", [])
+                                  if c not in removed_set]
+    config["starred_coins"] = [c for c in config.get("starred_coins", [])
+                               if c not in removed_set]
+    config["floating_coins"] = [c for c in config.get("floating_coins", [])
+                                if c not in removed_set]
+    # 从宇宙彻底删除，确保「CSV同步固定」不会把下架币复活
+    universe_removed = _universe_remove_coins(removed_set)
+    log(f"【移除固定】config 移除 {removed} | 宇宙删除 {sorted(universe_removed)}")
+    save_config(config)
+    return removed
+
+
+def promote_floating_to_fixed(coins):
+    """将浮动币种提升为固定：加入 all_coins、从 floating_coins 剔除，并写入宇宙。
+
+    - 关键：同步写入 crypto_coins 宇宙(DB表+CSV)，否则「CSV同步固定」会因该币
+      不在宇宙里而把它从固定列表丢弃（这正是此前"提升不成功"的根因）。
+    - 修正"既是固定又是浮动"的重复态：无论是否新加入固定，都从浮动列表剔除。
+    - 提升后币种保持原有选中/星标状态；宇宙新增行的指标由批量分析下次补全。
+    - 返回本次被提升为固定的币种列表（保持传入顺序、去重）。
+    """
+    config = load_config()
+    fixed = config.get("all_coins", [])
+    floating = config.get("floating_coins", [])
+    fixed_set = set(fixed)
+    req = []
+    seen = set()
+    for c in coins:
+        c = (c or "").strip()
+        if c and c not in seen:
+            req.append(c)
+            seen.add(c)
+    for c in req:
+        if c not in fixed_set:
+            fixed.append(c)
+            fixed_set.add(c)
+    config["all_coins"] = fixed
+    # 无论是否新加入固定，都从浮动列表剔除，消除"既固定又浮动"的重复态
+    config["floating_coins"] = [c for c in floating if c not in seen]
+    # 写入宇宙，避免「CSV同步固定」把刚提升的币丢弃
+    universe_added = _universe_add_coins(req)
+    log(f"【提升固定】提升 {req} | 宇宙新增 {universe_added}")
+    save_config(config)
+    return req
+
+
+def sync_fixed_from_csv():
+    """以 crypto_coins 宇宙为准，把固定列表(all_coins)对齐到宇宙（安全语义）。
+
+    自「移除选中/提升为固定」改为同步维护宇宙后，宇宙即固定列表的唯一真相：
+    - 已下架并被「移除选中」删掉的币不再在宇宙里 → 同步不会复活它们；
+    - 被「提升为固定」的币已写入宇宙 → 同步不会丢弃它们。
+    因此这里的"覆盖"是安全的：结果 == 当前宇宙 == 用户维护后的固定列表。
+    与 sync_coin_list（合并、保留手动添加项）不同，这里是整表对齐：
+    保持宇宙顺序、去重；浮动币种保持不变（剔除已进入固定列表者）；
+    已选中列表剔除对齐后不再存在的币种。返回对齐后的固定币种列表。
+    """
+    csv_coins = get_csv_coins()
+    new_fixed = []
+    seen = set()
+    for c in csv_coins:
+        c = (c or "").strip()
+        if c and c not in seen:
+            new_fixed.append(c)
+            seen.add(c)
+    if not new_fixed:
+        raise ValueError("CSV 中未读取到任何币种，已取消同步")
+    config = load_config()
+    config["all_coins"] = new_fixed
+    # 浮动币种保持不变，但剔除已进入固定列表的项，避免同一币种既是固定又是浮动
+    floating = [c for c in config.get("floating_coins", []) if c not in seen]
+    config["floating_coins"] = floating
+    # 已选中列表剔除同步后不再存在的币种
+    valid_all = seen | set(floating)
+    config["default_selected"] = [c for c in config.get("default_selected", []) if c in valid_all]
+    save_config(config)
+    return new_fixed
 
 
 def get_starred_coins():

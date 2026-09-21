@@ -162,9 +162,12 @@ document.addEventListener('DOMContentLoaded', () => {
             // 点击标签切换选中状态
             tag.addEventListener('click', function() {
                 tag.classList.toggle('active');
+                updateCoinActionButtons();  // 选中变化后同步「移除/提升」按钮可用态
             });
             coinSelectorEl.appendChild(tag);
         });
+        // 渲染完成后按当前选中刷新固定币种管理按钮的启用状态
+        updateCoinActionButtons();
     }
 
     // 移除浮动币种
@@ -296,6 +299,7 @@ document.addEventListener('DOMContentLoaded', () => {
         coinSelectorEl.querySelectorAll('.coin-tag').forEach(function(tag) {
             tag.classList.add('active');
         });
+        updateCoinActionButtons();
     });
 
     // ---- 重置选择 ----
@@ -305,6 +309,7 @@ document.addEventListener('DOMContentLoaded', () => {
             coinSelectorEl.querySelectorAll('.coin-tag').forEach(function(tag) {
                 tag.classList.remove('active');
             });
+            updateCoinActionButtons();
             // 同时清空后端选择
             fetch('/api/strategy/clear-selections', { method: 'POST' }).then(function() {
                 SELECTED_COINS = [];
@@ -326,6 +331,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 tag.classList.add('active');
             }
         });
+        updateCoinActionButtons();
     });
 
     // ---- 重置星标 ----
@@ -346,6 +352,171 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     });
+
+    // ================================================================
+    //  固定币种管理：移除选中 / 提升为固定 / CSV 同步固定
+    // ================================================================
+    var removeFixedBtn = document.getElementById('remove-fixed-btn');
+    var promoteFixedBtn = document.getElementById('promote-fixed-btn');
+    var syncCsvFixedBtn = document.getElementById('sync-csv-fixed-btn');
+
+    // 轻量 Toast（复用共享 .task-toast 样式；index.html 末尾提供 #toast 容器）
+    function showToast(msg, type) {
+        var t = document.getElementById('toast');
+        if (!t) return;
+        t.textContent = msg;
+        t.className = 'task-toast toast-' + (type || 'info') + ' show';
+        clearTimeout(t._timer);
+        t._timer = setTimeout(function() { t.classList.remove('show'); }, 3500);
+    }
+
+    // 币种显示名（去掉 -USDT-SWAP 后缀）
+    function coinLabel(coin) {
+        return (coin || '').replace('-USDT-SWAP', '');
+    }
+
+    // 当前「选中(active)」标签里属于固定币种的部分
+    function getSelectedFixedCoins() {
+        var fixedSet = {};
+        FIXED_COINS.forEach(function(c) { fixedSet[c] = true; });
+        var out = [];
+        coinSelectorEl.querySelectorAll('.coin-tag.active').forEach(function(tag) {
+            if (fixedSet[tag.dataset.coin]) out.push(tag.dataset.coin);
+        });
+        return out;
+    }
+
+    // 当前「选中(active)」标签里属于浮动币种的部分
+    function getSelectedFloatingCoins() {
+        var floatingSet = {};
+        FLOATING_COINS.forEach(function(c) { floatingSet[c] = true; });
+        var out = [];
+        coinSelectorEl.querySelectorAll('.coin-tag.active').forEach(function(tag) {
+            if (floatingSet[tag.dataset.coin]) out.push(tag.dataset.coin);
+        });
+        return out;
+    }
+
+    // 依据当前选中情况启用/禁用「移除选中」「提升为固定」按钮
+    function updateCoinActionButtons() {
+        var fixedSel = getSelectedFixedCoins();
+        var floatingSel = getSelectedFloatingCoins();
+        if (removeFixedBtn) {
+            removeFixedBtn.disabled = fixedSel.length === 0;
+            removeFixedBtn.title = fixedSel.length
+                ? '将选中的 ' + fixedSel.length + ' 个固定币种移出监控'
+                : '请先选中至少一个固定币种';
+        }
+        if (promoteFixedBtn) {
+            promoteFixedBtn.disabled = floatingSel.length === 0;
+            promoteFixedBtn.title = floatingSel.length
+                ? '将选中的 ' + floatingSel.length + ' 个浮动币种提升为固定'
+                : '请先选中至少一个浮动币种';
+        }
+    }
+
+    // 统一应用后端返回的币种配置并刷新界面（选择器/卡片/趋势数据）
+    function applyCoinConfig(data) {
+        if (!data) return;
+        ALL_COINS = data.all_coins || [];
+        FIXED_COINS = data.fixed_coins || [];
+        FLOATING_COINS = data.floating_coins || [];
+        SELECTED_COINS = data.selected_coins || [];
+        STARRED_COINS = data.starred_coins || [];
+        renderCoinSelector();   // 内部会调用 updateCoinActionButtons 同步按钮态
+        coinDataCache = {};     // 清空缓存，强制重新拉取最新数据
+        initCards();
+        startRefresh();         // 触发一次趋势数据刷新
+    }
+
+    // ---- 移除选中的固定币种（下架币种清理，危险操作）----
+    if (removeFixedBtn) {
+        removeFixedBtn.addEventListener('click', function() {
+            var targets = getSelectedFixedCoins();
+            if (!targets.length) { showToast('请先选中至少一个固定币种', 'info'); return; }
+            // 前端护栏：不能把固定币种全部移除（后端同样校验，双重保险）
+            if (targets.length >= FIXED_COINS.length) {
+                MDialog.alert({ message: '至少保留一个固定币种', type: 'warning' });
+                return;
+            }
+            var names = targets.map(coinLabel).join('、');
+            MDialog.confirm('确定要将 ' + names + ' 从固定列表中移除吗？<br>将同时从币种库(CSV)中彻底删除，之后不会再被「CSV同步固定」带回。', async function() {
+                removeFixedBtn.disabled = true;
+                try {
+                    var res = await fetch('/api/strategy/fixed-coins/remove', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ coins: targets })
+                    });
+                    var result = await res.json();
+                    if (result.code === 200) {
+                        applyCoinConfig(result.data);
+                        showToast('✅ ' + result.message, 'success');
+                    } else {
+                        updateCoinActionButtons();
+                        showToast('移除失败: ' + result.message, 'error');
+                    }
+                } catch (e) {
+                    updateCoinActionButtons();
+                    showToast('移除失败: 网络错误', 'error');
+                }
+            });
+        });
+    }
+
+    // ---- 将选中的浮动币种提升为固定（成功操作）----
+    if (promoteFixedBtn) {
+        promoteFixedBtn.addEventListener('click', function() {
+            var targets = getSelectedFloatingCoins();
+            if (!targets.length) { showToast('请先选中至少一个浮动币种', 'info'); return; }
+            promoteFixedBtn.disabled = true;
+            (async function() {
+                try {
+                    var res = await fetch('/api/strategy/fixed-coins/promote', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ coins: targets })
+                    });
+                    var result = await res.json();
+                    if (result.code === 200) {
+                        applyCoinConfig(result.data);
+                        showToast('⬆ ' + result.message, 'success');
+                    } else {
+                        updateCoinActionButtons();
+                        showToast('提升失败: ' + result.message, 'error');
+                    }
+                } catch (e) {
+                    updateCoinActionButtons();
+                    showToast('提升失败: 网络错误', 'error');
+                }
+            })();
+        });
+    }
+
+    // ---- 以 CSV 覆盖固定币种列表（信息操作，浮动币种保留）----
+    if (syncCsvFixedBtn) {
+        syncCsvFixedBtn.addEventListener('click', function() {
+            MDialog.confirm('确定要用币种库(CSV)对齐固定列表吗？<br>已移除的下架币不会复活，已提升的币会保留。', async function() {
+                syncCsvFixedBtn.textContent = '⏳ 同步中...';
+                syncCsvFixedBtn.disabled = true;
+                try {
+                    var res = await fetch('/api/strategy/fixed-coins/sync-csv', { method: 'POST' });
+                    var result = await res.json();
+                    if (result.code === 200) {
+                        applyCoinConfig(result.data);
+                        showToast('📥 ' + result.message, 'success');
+                    } else {
+                        showToast('同步失败: ' + result.message, 'error');
+                    }
+                } catch (e) {
+                    showToast('同步失败: 网络错误', 'error');
+                } finally {
+                    syncCsvFixedBtn.textContent = '📥 CSV同步固定';
+                    syncCsvFixedBtn.disabled = false;
+                }
+            });
+        });
+    }
 
     // ================================================================
     //  高级筛选面板（币种选择器内）
@@ -1026,7 +1197,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const badgeFiltered = document.getElementById('badge-filtered');
 
     let currentView = 'full';  // 'full' or 'filtered'
-    let pollingTimer = null;
+    
     let isRunning = false;
     let allRecords = [];            // 完整数据缓存
     let filteredRecords = [];       // 筛选后数据
@@ -1035,12 +1206,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let filterActive = false;       // 是否有激活的筛选
 
     // ================================================================
-    // 周期显示选择 + 简洁视图（统一列可见性控制）
+    // 周期显示选择 + 指标显示/隐藏（统一列可见性控制）
     // ================================================================
-    // 列可见性由两个维度共同决定：
+    // 列可见性由两个相互独立的维度共同决定：
     //   1) 周期选择：未选中的周期整列隐藏（data-period 标记）；
-    //   2) 简洁视图 / 未全选周期：隐藏次要指标列（.indicator-col，即 DIF/ADX/ATR/SAR/时间），
-    //      仅保留核心列（.core-col：趋势/交易价/盈亏%/MACD）。
+    //   2) 指标开关 showIndicators：默认开启 → 展示全部指标列
+    //      （.indicator-col，即 DIF/ADX/ATR/SAR/ER/时间）；关闭后仅保留核心列
+    //      （.core-col：趋势/交易价/盈亏%/MACD）。
+    //      该开关与周期选择解耦：无论选中几个周期，都可自由显隐指标列。
     var ALL_PERIODS = ['15m', '1H', '4H', '1D'];
     var DEFAULT_PERIODS = ['15m', '4H'];
     var PERIOD_LABELS = { '15m': '15分钟', '1H': '1小时', '4H': '4小时', '1D': '1天' };
@@ -1054,22 +1227,26 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (e) {}
         return DEFAULT_PERIODS.slice();
     })();
-    var simpleView = (function() {
-        var saved = localStorage.getItem('batchSimpleView');
-        return saved === null ? false : saved === '1';
+    // showIndicators：指标列是否显示（true=显示，false=隐藏，默认显示）。
+    // 偏好键升级为 batchShowIndicators.v2：旧键默认值为不显示且已被部分浏览器
+    // 持久化；换键后一次性重置为全部展开，后续手动切换仍会记住偏好。
+    var showIndicators = (function() {
+        var saved = localStorage.getItem('batchShowIndicators.v2');
+        if (saved !== null) return saved === '1';
+        return true;
     })();
 
     function savePeriodPrefs() {
         try {
             localStorage.setItem('batchSelectedPeriods', JSON.stringify(selectedPeriods));
-            localStorage.setItem('batchSimpleView', simpleView ? '1' : '0');
+            localStorage.setItem('batchShowIndicators.v2', showIndicators ? '1' : '0');
         } catch (e) {}
     }
 
     // 统一应用列可见性（表头 th + 数据 td），re-render 后需重新调用
     function applyColumnVisibility() {
-        var allSelected = selectedPeriods.length >= ALL_PERIODS.length;
-        var hideSecondary = simpleView || !allSelected;
+        // 指标列显隐仅由 showIndicators 决定，与周期选择相互独立
+        var hideSecondary = !showIndicators;
         var sel = {};
         selectedPeriods.forEach(function(p) { sel[p] = true; });
         document.querySelectorAll('#data-table th, #data-table td').forEach(function(cell) {
@@ -1135,6 +1312,16 @@ document.addEventListener('DOMContentLoaded', () => {
         return 'td-adx-weak';
     }
 
+    // ER 效率系数（0~1，越接近 1 越单边）：≥0.5 强趋势，≥0.3 温和，其余震荡
+    // 复用 ADX 的强弱配色，方便与 ADX/ATR 一起目视筛选“趋势强且波动大”的币种
+    function erClass(val) {
+        var n = parseFloat(val);
+        if (isNaN(n)) return '';
+        if (n >= 0.5) return 'td-adx-strong';
+        if (n >= 0.3) return 'td-adx-moderate';
+        return 'td-adx-weak';
+    }
+
     // SAR 颜色：优先用后端按“SAR vs 当前收盘价”算好的颜色（green/red），
     // 后端缺省时回退到前端按“SAR vs 交易价”估算
     function sarColorClass(sarVal, tradePrice, backendColor) {
@@ -1146,7 +1333,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return s < p ? 'td-sar-green' : 'td-sar-red';
     }
 
-    // ---- 单元格构造：单个周期的 8 列（趋势/交易价/盈亏%/MACD 为核心，DIF/ADX/ATR/SAR 为次要）----
+    // ---- 单元格构造：单个周期的 9 列（趋势/交易价/盈亏%/MACD 为核心，DIF/ADX/ATR/SAR/ER 为次要）----
     function buildPeriodCells(r, bar) {
         var trend = r[bar + '_趋势'];
         var price = r[bar + '_交易价格'];
@@ -1157,6 +1344,7 @@ document.addEventListener('DOMContentLoaded', () => {
         var atr = r['ATR_' + bar];
         var sar = r['SAR_' + bar];
         var sarColor = r['SAR颜色_' + bar];
+        var er = r['ER_' + bar];
         var dp = ' data-period="' + bar + '"';
         return '<td class="core-col ' + trendClass(trend) + '"' + dp + '>' + fmtCell(trend) + '</td>' +
             '<td class="core-col"' + dp + '>' + fmtCell(price) + '</td>' +
@@ -1165,7 +1353,8 @@ document.addEventListener('DOMContentLoaded', () => {
             '<td class="indicator-col ' + macdColor(dif) + '"' + dp + '>' + fmtCell(dif) + '</td>' +
             '<td class="indicator-col ' + adxClass(adx) + '"' + dp + '>' + fmtCell(adx) + '</td>' +
             '<td class="indicator-col"' + dp + '>' + fmtCell(atr) + '</td>' +
-            '<td class="indicator-col ' + sarColorClass(sar, price, sarColor) + '"' + dp + '>' + fmtCell(sar) + '</td>';
+            '<td class="indicator-col ' + sarColorClass(sar, price, sarColor) + '"' + dp + '>' + fmtCell(sar) + '</td>' +
+            '<td class="indicator-col ' + erClass(er) + '"' + dp + '>' + fmtCell(er) + '</td>';
     }
 
     // ---- 单元格构造：单个周期的交易时间列（次要，统一排在表尾）----
@@ -1200,7 +1389,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 '<td><strong>' + fmtCell(r['币种'], '') + '</strong></td>' +
                 '<td style="font-size:0.75rem;color:#888;">' + fmtCell(r['交易对'], '') + '</td>' +
                 '<td>' + fmtCell(r['名称'], '') + '</td>' +
-                // 各周期 8 列（趋势/交易价/盈亏%/MACD/DIF/ADX/ATR/SAR），顺序与 thead 一致
+                // 各周期 9 列（趋势/交易价/盈亏%/MACD/DIF/ADX/ATR/SAR/ER），顺序与 thead 一致
                 buildPeriodCells(r, '15m') +
                 buildPeriodCells(r, '1H') +
                 buildPeriodCells(r, '4H') +
@@ -1600,71 +1789,98 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // ---- 进度轮询 ----
-    let pollFailCount = 0;  // 连续轮询失败次数（网络抖动不中断，连续失败才停止）
+    // ---- SSE 实时推送（进度 + 日志）----
+    let sseSource = null;
+    const logPanel = document.getElementById('batch-log-panel');
+    const logBody = document.getElementById('batch-log-body');
+    const logCount = document.getElementById('batch-log-count');
+    const logToggle = document.getElementById('batch-log-toggle');
+    let logLineCount = 0;
+    let logCollapsed = false;
 
-    async function pollProgress() {
-        try {
-            var resp = await fetch('/api/batch/progress');
-            var result = await resp.json();
-            if (result.code === 200 && result.data) {
-                pollFailCount = 0;
-                var p = result.data;
-                updateProgressUI(p);
+    logToggle.addEventListener('click', function() {
+        logCollapsed = !logCollapsed;
+        logBody.style.display = logCollapsed ? 'none' : '';
+        logToggle.textContent = logCollapsed ? '展开' : '收起';
+    });
 
-                if (p.status === 'running') {
-                    pollingTimer = setTimeout(pollProgress, 1500);
-                } else {
-                    // 完成或出错 → 停止轮询
-                    stopPolling();
-                    batchStartBtn.disabled = false;
-                    batchStartBtn.textContent = '批量更新趋势数据';
-                    isRunning = false;
+    function appendLog(line) {
+        logLineCount++;
+        logCount.textContent = '(' + logLineCount + '行)';
+        var el = document.createElement('div');
+        var color = line.level === 'error' ? '#f48771' : line.level === 'warn' ? '#cca700' : '#d4d4d4';
+        el.style.color = color;
+        el.textContent = '[' + line.ts + '] ' + line.msg;
+        logBody.appendChild(el);
+        // 自动滚到底
+        if (!logCollapsed) logBody.scrollTop = logBody.scrollHeight;
+    }
 
-                    // 自动加载最新数据
-                    if (p.status === 'completed') {
+    function openBatchSSE() {
+        if (sseSource) { sseSource.close(); sseSource = null; }
+        sseSource = new EventSource('/api/batch/log/stream');
+        sseSource.addEventListener('progress', function(e) {
+            var p = JSON.parse(e.data);
+            updateProgressUI(p);
+        });
+        sseSource.addEventListener('log', function(e) {
+            appendLog(JSON.parse(e.data));
+        });
+        sseSource.addEventListener('done', function(e) {
+            sseSource.close();
+            sseSource = null;
+            // 完成时最终刷新一次进度 UI（含耗时）
+            fetch('/api/batch/progress').then(function(r) { return r.json(); }).then(function(j) {
+                if (j.code === 200 && j.data) {
+                    updateProgressUI(j.data);
+                    if (j.data.status === 'completed') {
                         loadTableData(currentView);
                         document.getElementById('stat-update-time').textContent =
                             '更新于: ' + new Date().toLocaleTimeString();
                     }
                 }
-            }
-        } catch (e) {
-            // 网络瞬时抖动不清除轮询（后台任务仍在运行），连续失败才停止，避免进度条假死
-            console.warn('轮询进度失败:', e);
-            pollFailCount++;
-            if (pollFailCount >= 5) {
-                stopPolling();
+            });
+            batchStartBtn.disabled = false;
+            batchStartBtn.textContent = '批量更新趋势数据';
+            isRunning = false;
+        });
+        sseSource.onerror = function() {
+            // 连接异常断开：回退到一次性进度查询判断是否真的结束了
+            if (sseSource) { sseSource.close(); sseSource = null; }
+            fetch('/api/batch/progress').then(function(r) { return r.json(); }).then(function(j) {
+                if (j.code === 200 && j.data && j.data.status === 'running') {
+                    // 仍在运行，2s 后重连
+                    setTimeout(openBatchSSE, 2000);
+                } else {
+                    updateProgressUI(j.data || {status:'error', message:'SSE 连接中断'});
+                    batchStartBtn.disabled = false;
+                    batchStartBtn.textContent = '批量更新趋势数据';
+                    isRunning = false;
+                }
+            }).catch(function() {
                 batchStartBtn.disabled = false;
                 batchStartBtn.textContent = '批量更新趋势数据';
                 isRunning = false;
-            } else {
-                pollingTimer = setTimeout(pollProgress, 1500);
-            }
-        }
-    }
-
-    function stopPolling() {
-        if (pollingTimer) {
-            clearTimeout(pollingTimer);
-            pollingTimer = null;
-        }
+            });
+        };
     }
 
     function updateProgressUI(p) {
         batchProgress.classList.add('active');
         var pct = p.progress_pct || 0;
         progressBar.style.width = pct + '%';
-        progressBar.textContent = pct >= 5 ? pct + '%' : '';
+        progressBar.textContent = pct >= 3 ? pct.toFixed(0) + '%' : '';
 
         if (p.status === 'running') {
-            // 显示已耗时，让用户确认任务仍在执行中
             var elapsed = p.elapsed_seconds
                 ? '（已耗时 ' + Math.floor(p.elapsed_seconds) + ' 秒）'
                 : '';
             progressMsg.textContent = (p.message || ('处理中: ' + p.current + '/' + p.total)) + elapsed;
         } else if (p.status === 'completed') {
-            progressMsg.textContent = p.message || '分析完成!';
+            var timeStr = p.elapsed_seconds ? '，耗时 ' + p.elapsed_seconds.toFixed(1) + ' 秒' : '';
+            progressMsg.textContent = (p.message || '分析完成') + timeStr;
+            progressBar.style.width = '100%';
+            progressBar.textContent = '100%';
             progressBar.style.background = 'linear-gradient(90deg, #5cb85c, #5cb85c)';
         } else if (p.status === 'error') {
             progressMsg.textContent = '错误: ' + (p.message || '未知错误');
@@ -1676,42 +1892,53 @@ document.addEventListener('DOMContentLoaded', () => {
     batchStartBtn.addEventListener('click', async function() {
         if (isRunning) return;
 
-        // 动态获取币种总数（CSV 行数），避免弹窗写死
-        var totalCoins = 27;
+        // 动态获取币种总数
+        var totalCoins = 55;
         try {
             var pr = await fetch('/api/batch/progress');
             var prj = await pr.json();
-            if (prj.code === 200 && prj.data && prj.data.total) totalCoins = prj.data.total;
+            if (prj.code === 200 && prj.data) {
+                if (prj.data.status === 'running') {
+                    MDialog.alert({ message: '已有批量任务正在运行中', type: 'info' });
+                    return;
+                }
+                if (prj.data.total) totalCoins = Math.round(prj.data.total / 5); // 5≈(220+55)/55，反推
+            }
         } catch (e) {}
 
-        // 确认
         MDialog.confirm({
             title: '批量分析确认',
-            message: '即将对全部 ' + totalCoins + ' 个加密货币进行 15m + 1H + 4H + 1D 多周期 Pro3 策略分析，预计需要较长时间。<br><br>确定继续？',
+            message: '即将对全部 ' + totalCoins + ' 个加密货币进行 15m + 1H + 4H + 1D 多周期 Pro3 策略分析。<br><br>确定继续？',
             type: 'info',
             onOk: async function() {
                 isRunning = true;
                 batchStartBtn.disabled = true;
-                batchStartBtn.textContent = '启动中...';
-                pollFailCount = 0;
+                batchStartBtn.textContent = '运行中...';
 
-                // 重置进度 UI
+                // 重置 UI
                 batchProgress.classList.add('active');
                 progressBar.style.width = '0%';
                 progressBar.style.background = 'linear-gradient(90deg, #4a90d9, #5cb85c)';
                 progressBar.textContent = '';
                 progressMsg.textContent = '正在启动批量分析...';
+                // 重置日志面板
+                logPanel.style.display = '';
+                logBody.innerHTML = '';
+                logLineCount = 0;
+                logCount.textContent = '';
+                logCollapsed = false;
+                logBody.style.display = '';
+                logToggle.textContent = '收起';
 
                 try {
                     var resp = await fetch('/api/batch/update', { method: 'POST' });
                     var result = await resp.json();
-
                     if (result.code === 200) {
-                        progressMsg.textContent = '批量分析已启动，正在获取数据...';
-                        // 开始轮询进度
-                        pollProgress();
+                        progressMsg.textContent = '批量分析已启动...';
+                        // 等后台线程 progress.start() 生效后再连 SSE（避免 idle→done 竞态）
+                        setTimeout(openBatchSSE, 600);
                     } else {
-                        MDialog.alert({ message: '启动失败: ' + (result.message || '未知错误'), type: 'danger' });
+                        MDialog.alert({ message: '启动失败: ' + (result.message || ''), type: 'danger' });
                         isRunning = false;
                         batchStartBtn.disabled = false;
                         batchStartBtn.textContent = '批量更新趋势数据';
@@ -1779,24 +2006,39 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // ---- 简洁视图 / 详细视图切换（与周期选择统一由 applyColumnVisibility 控制列显隐）----
+    // ---- 指标显示/隐藏切换 ----
+    // showIndicators 为唯一数据源；新增的「显示指标」按钮与旧的「简洁视图」按钮共用同一
+    // 状态，文案与高亮始终同步，彼此不会冲突。最终列显隐统一由 applyColumnVisibility 落地。
+    var indicatorsBtn = document.getElementById('toggle-indicators-btn');
     var collapseBtn = document.getElementById('collapse-indicators-btn');
 
-    function syncCollapseBtn() {
-        if (!collapseBtn) return;
-        // 按钮文案表示“点击后切换到的目标视图”：当前简洁→提示详细，当前详细→提示简洁
-        collapseBtn.textContent = simpleView ? '📊 详细视图' : '📋 简洁视图';
-        collapseBtn.classList.toggle('active', simpleView);
+    // 切换指标列显隐（供两个按钮共用）
+    function toggleIndicators() {
+        showIndicators = !showIndicators;
+        savePeriodPrefs();
+        syncIndicatorButtons();
+        applyColumnVisibility();
     }
 
-    if (collapseBtn) {
-        collapseBtn.addEventListener('click', function() {
-            simpleView = !simpleView;
-            savePeriodPrefs();
-            syncCollapseBtn();
-            applyColumnVisibility();
-        });
+    // 同步两个按钮的文案 / title / 高亮状态
+    function syncIndicatorButtons() {
+        if (indicatorsBtn) {
+            // 文案表示当前状态：已显示→提示可隐藏，已隐藏→提示可显示
+            indicatorsBtn.textContent = showIndicators ? '🙈 隐藏指标' : '🔍 显示指标';
+            indicatorsBtn.title = showIndicators
+                ? '隐藏 ADX / ATR / SAR / ER 等指标列'
+                : '显示 ADX / ATR / SAR / ER 等指标列';
+            indicatorsBtn.classList.toggle('active', showIndicators);
+        }
+        if (collapseBtn) {
+            // 旧「简洁视图」按钮：文案表示点击后切换到的目标视图，与新按钮保持同步
+            collapseBtn.textContent = showIndicators ? '📋 简洁视图' : '📊 详细视图';
+            collapseBtn.classList.toggle('active', !showIndicators);
+        }
     }
+
+    if (indicatorsBtn) indicatorsBtn.addEventListener('click', toggleIndicators);
+    if (collapseBtn) collapseBtn.addEventListener('click', toggleIndicators);
 
     // ---- 周期选择：单个周期切换 ----
     document.querySelectorAll('#period-toggles .period-toggle').forEach(function(btn) {
@@ -1831,7 +2073,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ---- 初始化：渲染周期选择器状态 + 同步按钮文案 + 应用列可见性（表头）----
     renderPeriodSelector();
-    syncCollapseBtn();
+    syncIndicatorButtons();
     applyColumnVisibility();
 });
 

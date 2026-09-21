@@ -144,6 +144,54 @@ def save_alert_config():
                                    pnl.get('critical_pct', -20.0), -99, -0.1)
         if pnl['critical_pct'] > pnl['warning_pct']:
             return jsonify({'code': 400, 'message': '盈亏严重阈值（更深亏损）不得大于预警阈值'})
+        # 盈利侧提醒（阈值全部由配置决定；正值，越大越"达标"）
+        pnl['profit_enabled'] = bool(pnl_in.get('profit_enabled',
+                                                 pnl.get('profit_enabled', True)))
+        pnl['profit_warning_pct'] = _num(pnl_in.get('profit_warning_pct'),
+                                          pnl.get('profit_warning_pct', 10.0), 0.1, 999)
+        pnl['profit_critical_pct'] = _num(pnl_in.get('profit_critical_pct'),
+                                           pnl.get('profit_critical_pct', 20.0), 0.1, 999)
+        if pnl['profit_critical_pct'] < pnl['profit_warning_pct']:
+            return jsonify({'code': 400, 'message': '盈利达标阈值不得小于盈利预警阈值'})
+
+        liq_in = payload.get('liq', {}) or {}
+        liq = cfg.setdefault('liq', {})
+        liq['enabled'] = bool(liq_in.get('enabled', liq.get('enabled')))
+        # 强平距离：越近越危险，严重阈值应 ≤ 预警阈值
+        liq['warning_pct'] = _num(liq_in.get('warning_pct'),
+                                    liq.get('warning_pct', 5.0), 0.1, 99)
+        liq['critical_pct'] = _num(liq_in.get('critical_pct'),
+                                     liq.get('critical_pct', 2.0), 0.1, 99)
+        if liq['critical_pct'] > liq['warning_pct']:
+            return jsonify({'code': 400, 'message': '强平距离严重阈值（更近）不得大于预警阈值'})
+
+        acct_in = payload.get('acct', {}) or {}
+        acct = cfg.setdefault('acct', {})
+        acct['enabled'] = bool(acct_in.get('enabled', acct.get('enabled')))
+        acct['margin_warning_pct'] = _num(acct_in.get('margin_warning_pct'),
+                                           acct.get('margin_warning_pct', 200.0), 100, 100000)
+        acct['margin_critical_pct'] = _num(acct_in.get('margin_critical_pct'),
+                                            acct.get('margin_critical_pct', 120.0), 100, 100000)
+        if acct['margin_critical_pct'] > acct['margin_warning_pct']:
+            return jsonify({'code': 400, 'message': '保证金率严重阈值（更临近强平）不得大于预警阈值'})
+        acct['min_avail_warning'] = _num(acct_in.get('min_avail_warning'),
+                                          acct.get('min_avail_warning', 100.0), 0, 1e9)
+        acct['min_avail_critical'] = _num(acct_in.get('min_avail_critical'),
+                                           acct.get('min_avail_critical', 20.0), 0, 1e9)
+        if acct['min_avail_critical'] > acct['min_avail_warning']:
+            return jsonify({'code': 400, 'message': '可用余额严重阈值不得大于预警阈值'})
+
+        lv_in = payload.get('liveness', {}) or {}
+        lv = cfg.setdefault('liveness', {})
+        lv['enabled'] = bool(lv_in.get('enabled', lv.get('enabled')))
+        lv['grace_multiplier'] = _num(lv_in.get('grace_multiplier'),
+                                        lv.get('grace_multiplier', 5), 1, 1000)
+        lv['min_stale_seconds'] = _num(lv_in.get('min_stale_seconds'),
+                                        lv.get('min_stale_seconds', 900), 60, 86400)
+        lv['critical_stale_seconds'] = _num(lv_in.get('critical_stale_seconds'),
+                                             lv.get('critical_stale_seconds', 2400), 60, 86400)
+        if lv['critical_stale_seconds'] < lv['min_stale_seconds']:
+            return jsonify({'code': 400, 'message': '调度轮停滞严重阈值不得小于预警下限'})
 
         mon.save_alert_config(cfg)
 
@@ -165,7 +213,7 @@ def save_alert_config():
 
 @alert_bp.route('/alert/api/history', methods=['GET'])
 def alert_history():
-    """告警历史查询：?limit=200&type=price|pnl&level=&inst=（默认最近200条）"""
+    """告警历史查询：?limit=200&type=price|pnl|profit|liq|acct|liveness&level=&inst=（默认最近200条）"""
     try:
         limit = min(int(request.args.get('limit', 200)), 1000)
         f_type = request.args.get('type', '').strip()
@@ -173,7 +221,7 @@ def alert_history():
         f_inst = request.args.get('inst', '').strip()
 
         stmt = select(AlertLog).order_by(AlertLog.created_at.desc(), AlertLog.id.desc())
-        if f_type in ('price', 'pnl'):
+        if f_type in ('price', 'pnl', 'profit', 'liq', 'acct', 'liveness'):
             stmt = stmt.where(AlertLog.alert_type == f_type)
         if f_level in ('warning', 'critical', 'recover'):
             stmt = stmt.where(AlertLog.level == f_level)

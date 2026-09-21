@@ -25,11 +25,11 @@
     "运作流程": "空仓且无挂单 → 入场边界挂限价开仓单（随边界改单追价）→ 成交后立即在对侧边界挂 reduce-only 限价平仓单（随边界改单追价）→ 平仓成交后篮子归零，下一轮重新挂开仓单，无限循环刷区间"
   },
   "_comment_reverse_position_guard": {
-    "enabled": "反向持仓风控总开关：检测到与长周期方向相反的“另一模式”净持仓时启用预警+超时强平。覆盖两类来源：①账本内程序自身旧方向残留仓（长周期反转后未及时清理的程序仓，2026-09-02 LIT 事故修正）②账本外人工反向开仓（如长多但手动开空）",
-    "grace_minutes": "预警到强平的宽限分钟数（默认10）：首次检测立即发预警邮件，超过此时长未处理则系统强制平仓（计时器持久化 MySQL，重启不重置）",
-    "生效条件": "仅当趋势跟踪为双周期单向模式(period_mode=dual)时启用；单周期双向模式下多空持仓均为合法策略仓，自动关闭本风控",
-    "强平方式": "账本内旧方向仓按篮子市价全平（同步扣账本）；账本外人工反向单按超出量定量 reduce-only；强平失败保留计时器下轮重试（自愈）"
+    "enabled": "人工反向持仓风控总开关：检测到与长周期方向相反的人工持仓（如长多但手动开空）时启用预警+超时强平",
+    "grace_minutes": "预警到强平的宽限分钟数（默认10）：首次检测立即发预警邮件，超过此时长未处理则系统强制平仓（计时器持久化，重启不重置）",
+    "生效条件": "仅当趋势跟踪为双周期单向模式(period_mode=dual)时启用；单周期双向模式下多空持仓均为合法策略仓，自动关闭本风控"
   },
+  "_comment_risk_alerts": "执行类静默失效告警（叫醒级，豁免30分钟冷却）：enabled=总开关 | place_fail_rounds=单币连续N轮下单被交易所拒/失败→发'下单持续被拒'邮件(补上'success=True但实际一单没挂'的盲区,0或1=每轮即发) | sl_tp_fail_rounds=止盈/止损触发但平仓连续N轮未成功→发'名义止损失效、持仓裸露'邮件。另：下单结果未知need_verify(孤儿单可能已落地)不受本段控制，首轮即发核实邮件。P2项：ledger_divergence_enabled/shrink_alert_frac/absorb_alert_frac=账本与真实持仓大幅背离(缩减后仅保留≤shrink_alert_frac疑似强平爆仓→critical,吸收超账本≥absorb_alert_frac倍人工加仓→warning,从零吸收不算避免重启误报) | algo_fail_rounds=趋势仓有持仓且要求静态触发价但交易所兜底委托连续N轮挂不上→critical(宕机时最后防线缺失) | persist_fail_rounds=DB连接连续失败≥N→持久化降级叫醒告警(期间重启会丢冷却/计时/方向状态) | link_alert_rounds=连续N轮全批币种OKX读接口失败→链路成片异常聚合系统邮件(仅多币判定,单币交回连续失败告警)",
   "_comment_risk_control": "max_position_per_currency：单币种上限（两篮子双向持仓+未成交开仓挂单合计），张数口径 | max_position_per_currency_usd：单币种上限USD口径，每轮按现价折算张数后与张数口径取更严者（0=不启用） | max_total_position：全账户总上限（跨全部币种同口径合计，仅张数口径，跨币种张数相加无实际意义，建议设0停用改用单币种USD上限），两者均在开仓挂单前强制拦截，超限拒单",
   "_comment_signal_and_price": {
     "entry_price_type": "趋势跟踪开仓挂单价：'close'(反转bar收盘价,默认) / 'open'(反转bar开盘价)。行情趋势强弱由人为切换判断",
@@ -60,80 +60,49 @@
     {
       "entry_price_type": "close",
       "exit_price_type": "open",
-      "instId": "BICO-USDT-SWAP",
+      "instId": "INJ-USDT-SWAP",
       "leverage": 10,
-      "long_period": "4H",
-      "manual_direction": "auto",
+      "long_period": "1H",
+      "manual_direction": "long",
       "range_position": {
         "boll_amend_min_pct": 0.001,
         "boll_dev": 2,
         "boll_period": 20,
-        "contracts": 6,
+        "contracts": 0.2,
         "enabled": true,
-        "notional_usd": 2,
-        "size_mode": "contracts"
+        "notional_usd": 0.6,
+        "size_mode": "usd"
       },
-      "short_period": "15m",
+      "short_period": "1m",
       "signal_algo": "diff",
-      "trade_enabled": false,
+      "trade_enabled": true,
       "trend_position": {
-        "contracts": 20,
+        "contracts": 0.2,
         "enabled": true,
         "exchange_algo_backup": true,
-        "notional_usd": 20,
+        "notional_usd": 1,
         "period_mode": "dual",
         "size_mode": "usd",
         "stop_loss": {
-          "atr_multiple": 1.5,
           "enabled": false,
+          "type": "fixed",
           "fixed_pct": 3,
-          "type": "fixed"
+          "atr_multiple": 1.5
         },
         "take_profit": {
-          "category": "none",
-          "channel": {
-            "min_profit_pct": 0,
-            "mode": "outer"
-          },
           "enabled": false,
+          "category": "none",
           "fixed_target": {
-            "atr_multiple": 3,
             "mode": "pct",
             "pct": 5,
-            "r_multiple": 2
-          },
-          "ladder": {
-            "levels": [
-              {
-                "close_ratio": 0.33,
-                "pct": 2
-              },
-              {
-                "close_ratio": 0.5,
-                "pct": 4
-              },
-              {
-                "close_ratio": 1,
-                "pct": 6
-              }
-            ]
-          },
-          "momentum": {
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5,
-            "mode": "hist_decay"
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
+            "r_multiple": 2,
+            "atr_multiple": 3
           },
           "trailing": {
-            "activate_pct": 1,
-            "chandelier_atr": 3,
             "mode": "pullback_pct",
+            "activate_pct": 1,
             "pullback_pct": 2,
+            "chandelier_atr": 3,
             "r_levels": [
               [
                 1,
@@ -148,6 +117,37 @@
                 2
               ]
             ]
+          },
+          "momentum": {
+            "mode": "hist_decay",
+            "decay_bars": 3,
+            "lookback": 30,
+            "min_profit_pct": 0.5
+          },
+          "channel": {
+            "mode": "outer",
+            "min_profit_pct": 0
+          },
+          "ladder": {
+            "levels": [
+              {
+                "pct": 2,
+                "close_ratio": 0.33
+              },
+              {
+                "pct": 4,
+                "close_ratio": 0.5
+              },
+              {
+                "pct": 6,
+                "close_ratio": 1
+              }
+            ]
+          },
+          "time_stop": {
+            "enabled": false,
+            "max_bars": 24,
+            "min_profit_pct": 1
           }
         }
       },
@@ -156,80 +156,49 @@
     {
       "entry_price_type": "close",
       "exit_price_type": "open",
-      "instId": "LIT-USDT-SWAP",
+      "instId": "DASH-USDT-SWAP",
       "leverage": 10,
-      "long_period": "4H",
-      "manual_direction": "auto",
+      "long_period": "1H",
+      "manual_direction": "long",
       "range_position": {
         "boll_amend_min_pct": 0.001,
         "boll_dev": 2,
         "boll_period": 20,
-        "contracts": 6,
-        "enabled": false,
-        "notional_usd": 2,
-        "size_mode": "contracts"
+        "contracts": 0.2,
+        "enabled": true,
+        "notional_usd": 0.6,
+        "size_mode": "usd"
       },
-      "short_period": "5m",
+      "short_period": "1m",
       "signal_algo": "diff",
-      "trade_enabled": false,
+      "trade_enabled": true,
       "trend_position": {
-        "contracts": 20,
+        "contracts": 0.2,
         "enabled": true,
         "exchange_algo_backup": true,
-        "notional_usd": 20,
+        "notional_usd": 1,
         "period_mode": "dual",
         "size_mode": "usd",
         "stop_loss": {
-          "atr_multiple": 1.5,
           "enabled": false,
+          "type": "fixed",
           "fixed_pct": 3,
-          "type": "fixed"
+          "atr_multiple": 1.5
         },
         "take_profit": {
-          "category": "none",
-          "channel": {
-            "min_profit_pct": 0,
-            "mode": "outer"
-          },
           "enabled": false,
+          "category": "none",
           "fixed_target": {
-            "atr_multiple": 3,
             "mode": "pct",
             "pct": 5,
-            "r_multiple": 2
-          },
-          "ladder": {
-            "levels": [
-              {
-                "close_ratio": 0.33,
-                "pct": 2
-              },
-              {
-                "close_ratio": 0.5,
-                "pct": 4
-              },
-              {
-                "close_ratio": 1,
-                "pct": 6
-              }
-            ]
-          },
-          "momentum": {
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5,
-            "mode": "hist_decay"
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
+            "r_multiple": 2,
+            "atr_multiple": 3
           },
           "trailing": {
-            "activate_pct": 1,
-            "chandelier_atr": 3,
             "mode": "pullback_pct",
+            "activate_pct": 1,
             "pullback_pct": 2,
+            "chandelier_atr": 3,
             "r_levels": [
               [
                 1,
@@ -244,6 +213,229 @@
                 2
               ]
             ]
+          },
+          "momentum": {
+            "mode": "hist_decay",
+            "decay_bars": 3,
+            "lookback": 30,
+            "min_profit_pct": 0.5
+          },
+          "channel": {
+            "mode": "outer",
+            "min_profit_pct": 0
+          },
+          "ladder": {
+            "levels": [
+              {
+                "pct": 2,
+                "close_ratio": 0.33
+              },
+              {
+                "pct": 4,
+                "close_ratio": 0.5
+              },
+              {
+                "pct": 6,
+                "close_ratio": 1
+              }
+            ]
+          },
+          "time_stop": {
+            "enabled": false,
+            "max_bars": 24,
+            "min_profit_pct": 1
+          }
+        }
+      },
+      "verbose_lifecycle": true
+    },
+    {
+      "entry_price_type": "close",
+      "exit_price_type": "open",
+      "instId": "BICO-USDT-SWAP",
+      "leverage": 10,
+      "long_period": "1H",
+      "manual_direction": "long",
+      "range_position": {
+        "boll_amend_min_pct": 0.001,
+        "boll_dev": 2,
+        "boll_period": 20,
+        "contracts": 0.2,
+        "enabled": true,
+        "notional_usd": 0.6,
+        "size_mode": "usd"
+      },
+      "short_period": "1m",
+      "signal_algo": "diff",
+      "trade_enabled": true,
+      "trend_position": {
+        "contracts": 0.2,
+        "enabled": true,
+        "exchange_algo_backup": true,
+        "notional_usd": 1,
+        "period_mode": "dual",
+        "size_mode": "usd",
+        "stop_loss": {
+          "enabled": false,
+          "type": "fixed",
+          "fixed_pct": 3,
+          "atr_multiple": 1.5
+        },
+        "take_profit": {
+          "enabled": false,
+          "category": "none",
+          "fixed_target": {
+            "mode": "pct",
+            "pct": 5,
+            "r_multiple": 2,
+            "atr_multiple": 3
+          },
+          "trailing": {
+            "mode": "pullback_pct",
+            "activate_pct": 1,
+            "pullback_pct": 2,
+            "chandelier_atr": 3,
+            "r_levels": [
+              [
+                1,
+                0
+              ],
+              [
+                2,
+                1
+              ],
+              [
+                3,
+                2
+              ]
+            ]
+          },
+          "momentum": {
+            "mode": "hist_decay",
+            "decay_bars": 3,
+            "lookback": 30,
+            "min_profit_pct": 0.5
+          },
+          "channel": {
+            "mode": "outer",
+            "min_profit_pct": 0
+          },
+          "ladder": {
+            "levels": [
+              {
+                "pct": 2,
+                "close_ratio": 0.33
+              },
+              {
+                "pct": 4,
+                "close_ratio": 0.5
+              },
+              {
+                "pct": 6,
+                "close_ratio": 1
+              }
+            ]
+          },
+          "time_stop": {
+            "enabled": false,
+            "max_bars": 24,
+            "min_profit_pct": 1
+          }
+        }
+      },
+      "verbose_lifecycle": true
+    },
+    {
+      "entry_price_type": "close",
+      "exit_price_type": "open",
+      "instId": "TRUMP-USDT-SWAP",
+      "leverage": 10,
+      "long_period": "1H",
+      "manual_direction": "long",
+      "range_position": {
+        "boll_amend_min_pct": 0.001,
+        "boll_dev": 2,
+        "boll_period": 20,
+        "contracts": 0.2,
+        "enabled": true,
+        "notional_usd": 0.6,
+        "size_mode": "usd"
+      },
+      "short_period": "1m",
+      "signal_algo": "diff",
+      "trade_enabled": true,
+      "trend_position": {
+        "contracts": 0.2,
+        "enabled": true,
+        "exchange_algo_backup": true,
+        "notional_usd": 1,
+        "period_mode": "dual",
+        "size_mode": "usd",
+        "stop_loss": {
+          "enabled": false,
+          "type": "fixed",
+          "fixed_pct": 3,
+          "atr_multiple": 1.5
+        },
+        "take_profit": {
+          "enabled": false,
+          "category": "none",
+          "fixed_target": {
+            "mode": "pct",
+            "pct": 5,
+            "r_multiple": 2,
+            "atr_multiple": 3
+          },
+          "trailing": {
+            "mode": "pullback_pct",
+            "activate_pct": 1,
+            "pullback_pct": 2,
+            "chandelier_atr": 3,
+            "r_levels": [
+              [
+                1,
+                0
+              ],
+              [
+                2,
+                1
+              ],
+              [
+                3,
+                2
+              ]
+            ]
+          },
+          "momentum": {
+            "mode": "hist_decay",
+            "decay_bars": 3,
+            "lookback": 30,
+            "min_profit_pct": 0.5
+          },
+          "channel": {
+            "mode": "outer",
+            "min_profit_pct": 0
+          },
+          "ladder": {
+            "levels": [
+              {
+                "pct": 2,
+                "close_ratio": 0.33
+              },
+              {
+                "pct": 4,
+                "close_ratio": 0.5
+              },
+              {
+                "pct": 6,
+                "close_ratio": 1
+              }
+            ]
+          },
+          "time_stop": {
+            "enabled": false,
+            "max_bars": 24,
+            "min_profit_pct": 1
           }
         }
       },
@@ -254,295 +446,7 @@
       "exit_price_type": "open",
       "instId": "PENGU-USDT-SWAP",
       "leverage": 10,
-      "long_period": "4H",
-      "manual_direction": "auto",
-      "range_position": {
-        "boll_amend_min_pct": 0.001,
-        "boll_dev": 2,
-        "boll_period": 20,
-        "contracts": 6,
-        "enabled": false,
-        "notional_usd": 2,
-        "size_mode": "contracts"
-      },
-      "short_period": "15m",
-      "signal_algo": "diff",
-      "trade_enabled": false,
-      "trend_position": {
-        "contracts": 20,
-        "enabled": true,
-        "exchange_algo_backup": true,
-        "notional_usd": 20,
-        "period_mode": "dual",
-        "size_mode": "usd",
-        "stop_loss": {
-          "atr_multiple": 1.5,
-          "enabled": false,
-          "fixed_pct": 3,
-          "type": "fixed"
-        },
-        "take_profit": {
-          "category": "none",
-          "channel": {
-            "min_profit_pct": 0,
-            "mode": "outer"
-          },
-          "enabled": false,
-          "fixed_target": {
-            "atr_multiple": 3,
-            "mode": "pct",
-            "pct": 5,
-            "r_multiple": 2
-          },
-          "ladder": {
-            "levels": [
-              {
-                "close_ratio": 0.33,
-                "pct": 2
-              },
-              {
-                "close_ratio": 0.5,
-                "pct": 4
-              },
-              {
-                "close_ratio": 1,
-                "pct": 6
-              }
-            ]
-          },
-          "momentum": {
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5,
-            "mode": "hist_decay"
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
-          },
-          "trailing": {
-            "activate_pct": 1,
-            "chandelier_atr": 3,
-            "mode": "pullback_pct",
-            "pullback_pct": 2,
-            "r_levels": [
-              [
-                1,
-                0
-              ],
-              [
-                2,
-                1
-              ],
-              [
-                3,
-                2
-              ]
-            ]
-          }
-        }
-      },
-      "verbose_lifecycle": true
-    },
-    {
-      "entry_price_type": "close",
-      "exit_price_type": "open",
-      "instId": "POL-USDT-SWAP",
-      "leverage": 10,
-      "long_period": "4H",
-      "manual_direction": "long",
-      "range_position": {
-        "boll_amend_min_pct": 0.001,
-        "boll_dev": 2,
-        "boll_period": 20,
-        "contracts": 1,
-        "enabled": true,
-        "notional_usd": 2,
-        "size_mode": "usd"
-      },
-      "short_period": "5m",
-      "signal_algo": "diff",
-      "trade_enabled": true,
-      "trend_position": {
-        "contracts": 20,
-        "enabled": true,
-        "exchange_algo_backup": true,
-        "notional_usd": 2,
-        "period_mode": "dual",
-        "size_mode": "usd",
-        "stop_loss": {
-          "enabled": false,
-          "type": "fixed",
-          "fixed_pct": 3,
-          "atr_multiple": 1.5
-        },
-        "take_profit": {
-          "enabled": false,
-          "category": "none",
-          "fixed_target": {
-            "mode": "pct",
-            "pct": 5,
-            "r_multiple": 2,
-            "atr_multiple": 3
-          },
-          "trailing": {
-            "mode": "pullback_pct",
-            "activate_pct": 1,
-            "pullback_pct": 2,
-            "chandelier_atr": 3,
-            "r_levels": [
-              [
-                1,
-                0
-              ],
-              [
-                2,
-                1
-              ],
-              [
-                3,
-                2
-              ]
-            ]
-          },
-          "momentum": {
-            "mode": "hist_decay",
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5
-          },
-          "channel": {
-            "mode": "outer",
-            "min_profit_pct": 0
-          },
-          "ladder": {
-            "levels": [
-              {
-                "pct": 2,
-                "close_ratio": 0.33
-              },
-              {
-                "pct": 4,
-                "close_ratio": 0.5
-              },
-              {
-                "pct": 6,
-                "close_ratio": 1
-              }
-            ]
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
-          }
-        }
-      },
-      "verbose_lifecycle": true
-    },
-    {
-      "entry_price_type": "close",
-      "exit_price_type": "open",
-      "instId": "INJ-USDT-SWAP",
-      "leverage": 10,
-      "long_period": "1D",
-      "manual_direction": "auto",
-      "range_position": {
-        "boll_amend_min_pct": 0.001,
-        "boll_dev": 2,
-        "boll_period": 20,
-        "contracts": 6,
-        "enabled": true,
-        "notional_usd": 2,
-        "size_mode": "contracts"
-      },
-      "short_period": "15m",
-      "signal_algo": "diff",
-      "trade_enabled": false,
-      "trend_position": {
-        "contracts": 20,
-        "enabled": true,
-        "exchange_algo_backup": true,
-        "notional_usd": 10,
-        "period_mode": "dual",
-        "size_mode": "usd",
-        "stop_loss": {
-          "atr_multiple": 1.5,
-          "enabled": false,
-          "fixed_pct": 3,
-          "type": "fixed"
-        },
-        "take_profit": {
-          "category": "none",
-          "channel": {
-            "min_profit_pct": 0,
-            "mode": "outer"
-          },
-          "enabled": false,
-          "fixed_target": {
-            "atr_multiple": 3,
-            "mode": "pct",
-            "pct": 5,
-            "r_multiple": 2
-          },
-          "ladder": {
-            "levels": [
-              {
-                "close_ratio": 0.33,
-                "pct": 2
-              },
-              {
-                "close_ratio": 0.5,
-                "pct": 4
-              },
-              {
-                "close_ratio": 1,
-                "pct": 6
-              }
-            ]
-          },
-          "momentum": {
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5,
-            "mode": "hist_decay"
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
-          },
-          "trailing": {
-            "activate_pct": 1,
-            "chandelier_atr": 3,
-            "mode": "pullback_pct",
-            "pullback_pct": 2,
-            "r_levels": [
-              [
-                1,
-                0
-              ],
-              [
-                2,
-                1
-              ],
-              [
-                3,
-                2
-              ]
-            ]
-          }
-        }
-      },
-      "verbose_lifecycle": true
-    },
-    {
-      "entry_price_type": "close",
-      "exit_price_type": "open",
-      "instId": "NEAR-USDT-SWAP",
-      "leverage": 10,
-      "long_period": "4H",
+      "long_period": "1H",
       "manual_direction": "long",
       "range_position": {
         "boll_amend_min_pct": 0.001,
@@ -550,106 +454,10 @@
         "boll_period": 20,
         "contracts": 0.2,
         "enabled": true,
-        "notional_usd": 1,
+        "notional_usd": 0.6,
         "size_mode": "usd"
       },
-      "short_period": "5m",
-      "signal_algo": "diff",
-      "trade_enabled": true,
-      "trend_position": {
-        "contracts": 0.2,
-        "enabled": true,
-        "exchange_algo_backup": true,
-        "notional_usd": 2,
-        "period_mode": "dual",
-        "size_mode": "usd",
-        "stop_loss": {
-          "enabled": false,
-          "type": "fixed",
-          "fixed_pct": 3,
-          "atr_multiple": 1.5
-        },
-        "take_profit": {
-          "enabled": false,
-          "category": "none",
-          "fixed_target": {
-            "mode": "pct",
-            "pct": 5,
-            "r_multiple": 2,
-            "atr_multiple": 3
-          },
-          "trailing": {
-            "mode": "pullback_pct",
-            "activate_pct": 1,
-            "pullback_pct": 2,
-            "chandelier_atr": 3,
-            "r_levels": [
-              [
-                1,
-                0
-              ],
-              [
-                2,
-                1
-              ],
-              [
-                3,
-                2
-              ]
-            ]
-          },
-          "momentum": {
-            "mode": "hist_decay",
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5
-          },
-          "channel": {
-            "mode": "outer",
-            "min_profit_pct": 0
-          },
-          "ladder": {
-            "levels": [
-              {
-                "pct": 2,
-                "close_ratio": 0.33
-              },
-              {
-                "pct": 4,
-                "close_ratio": 0.5
-              },
-              {
-                "pct": 6,
-                "close_ratio": 1
-              }
-            ]
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
-          }
-        }
-      },
-      "verbose_lifecycle": true
-    },
-    {
-      "entry_price_type": "close",
-      "exit_price_type": "open",
-      "instId": "XRP-USDT-SWAP",
-      "leverage": 10,
-      "long_period": "4H",
-      "manual_direction": "auto",
-      "range_position": {
-        "boll_amend_min_pct": 0.001,
-        "boll_dev": 2,
-        "boll_period": 20,
-        "contracts": 0.2,
-        "enabled": true,
-        "notional_usd": 0.5,
-        "size_mode": "usd"
-      },
-      "short_period": "5m",
+      "short_period": "1m",
       "signal_algo": "diff",
       "trade_enabled": true,
       "trend_position": {
@@ -724,102 +532,6 @@
             "enabled": false,
             "max_bars": 24,
             "min_profit_pct": 1
-          }
-        }
-      },
-      "verbose_lifecycle": true
-    },
-    {
-      "entry_price_type": "close",
-      "exit_price_type": "open",
-      "instId": "DOS-USDT-SWAP",
-      "leverage": 10,
-      "long_period": "4H",
-      "manual_direction": "auto",
-      "range_position": {
-        "boll_amend_min_pct": 0.001,
-        "boll_dev": 2,
-        "boll_period": 20,
-        "contracts": 0.2,
-        "enabled": false,
-        "notional_usd": 0.2,
-        "size_mode": "usd"
-      },
-      "short_period": "5m",
-      "signal_algo": "diff",
-      "trade_enabled": false,
-      "trend_position": {
-        "contracts": 0.2,
-        "enabled": true,
-        "exchange_algo_backup": true,
-        "notional_usd": 20,
-        "period_mode": "dual",
-        "size_mode": "usd",
-        "stop_loss": {
-          "atr_multiple": 1.5,
-          "enabled": false,
-          "fixed_pct": 3,
-          "type": "fixed"
-        },
-        "take_profit": {
-          "category": "none",
-          "channel": {
-            "min_profit_pct": 0,
-            "mode": "outer"
-          },
-          "enabled": false,
-          "fixed_target": {
-            "atr_multiple": 3,
-            "mode": "pct",
-            "pct": 5,
-            "r_multiple": 2
-          },
-          "ladder": {
-            "levels": [
-              {
-                "close_ratio": 0.33,
-                "pct": 2
-              },
-              {
-                "close_ratio": 0.5,
-                "pct": 4
-              },
-              {
-                "close_ratio": 1,
-                "pct": 6
-              }
-            ]
-          },
-          "momentum": {
-            "decay_bars": 3,
-            "lookback": 30,
-            "min_profit_pct": 0.5,
-            "mode": "hist_decay"
-          },
-          "time_stop": {
-            "enabled": false,
-            "max_bars": 24,
-            "min_profit_pct": 1
-          },
-          "trailing": {
-            "activate_pct": 1,
-            "chandelier_atr": 3,
-            "mode": "pullback_pct",
-            "pullback_pct": 2,
-            "r_levels": [
-              [
-                1,
-                0
-              ],
-              [
-                2,
-                1
-              ],
-              [
-                3,
-                2
-              ]
-            ]
           }
         }
       },
@@ -843,6 +555,17 @@
     "reverse_position_guard": {
       "enabled": true,
       "grace_minutes": 10
+    },
+    "risk_alerts": {
+      "enabled": true,
+      "place_fail_rounds": 3,
+      "sl_tp_fail_rounds": 2,
+      "ledger_divergence_enabled": true,
+      "shrink_alert_frac": 0.5,
+      "absorb_alert_frac": 1.0,
+      "algo_fail_rounds": 3,
+      "persist_fail_rounds": 3,
+      "link_alert_rounds": 3
     },
     "risk_control": {
       "emergency_stop": false,

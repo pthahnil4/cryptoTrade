@@ -289,7 +289,7 @@
                     <div class="trading-control-actions">
                         <label style="font-size:0.85rem;color:#555;display:flex;align-items:center;gap:6px">
                             账号
-                            <select id="trading-account" class="m-select" style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;font-size:0.85rem">
+                            <select id="trading-account" class="m-select" onchange="onTradingAccountChange()" style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;font-size:0.85rem">
                                 <option value="">加载中...</option>
                             </select>
                         </label>
@@ -339,6 +339,7 @@
                     <div style="display:flex;gap:8px">
                         <button class="m-btn m-btn-primary m-btn-sm" onclick="saveTradingConfig()">💾 保存</button>
                         <button class="m-btn m-btn-success m-btn-sm" onclick="quickApplyToAll()" title="将当前币种的完整配置同步应用到所有其他币种">🚀 一键应用</button>
+                        <button class="m-btn m-btn-info m-btn-sm" id="btn-refresh-marketcap" onclick="refreshFixedMarketcap()" title="拉取 CoinGecko 实时市值榜，筛选 OKX 有 USDT 线性永续的市值前50热门币，整体替换固定币种池并同步币种库(DB/CSV)；失败不做任何改动">🔄 更新市值列表</button>
                         <button class="m-btn m-btn-secondary m-btn-xs m-btn-outline m-btn-pill" onclick="showQuickApplyHelp()" title="查看一键应用说明" style="width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:.8rem;">?</button>
                     </div>
                 </div>
@@ -436,6 +437,44 @@
                     </select>
                     <span class="config-hint">趋势跟踪仓位的限价平仓取值（反转bar的 open/close）</span>
                 </div>
+                </div>
+            </div>
+
+            <!-- 固定币种详情（市值监控池） -->
+            <div class="config-section" id="fixed-coin-detail-section">
+                <div class="config-section-header">
+                    <div>
+                        <h3 class="config-section-title">💰 固定币种详情</h3>
+                        <p class="config-section-desc">市值 Top50 监控池（CoinGecko 实时市值榜 × OKX USDT 线性永续校验），按市值降序排列；流动性列为 24H成交额/流通市值 比率（越高越活跃）</p>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center">
+                        <span id="fcd-meta" style="font-size:.78rem;color:var(--text-muted)"></span>
+                        <button class="m-btn m-btn-primary m-btn-sm" id="fcd-refresh-btn" onclick="loadFixedCoinDetails(true)">🔄 刷新数据</button>
+                    </div>
+                </div>
+                <style>
+                    #fixed-coin-detail-section .fcd-wrap { overflow-x: auto; }
+                    #fixed-coin-detail-section table.fcd-table { width: 100%; border-collapse: collapse; font-size: .85rem; min-width: 860px; }
+                    #fixed-coin-detail-section .fcd-table th, #fixed-coin-detail-section .fcd-table td {
+                        padding: 7px 10px; border-bottom: 1px solid var(--border-color); text-align: right; white-space: nowrap;
+                    }
+                    #fixed-coin-detail-section .fcd-table th { background: #f8f9fa; color: #666; font-weight: 600; }
+                    #fixed-coin-detail-section .fcd-table th:first-child, #fixed-coin-detail-section .fcd-table td:first-child,
+                    #fixed-coin-detail-section .fcd-table th:nth-child(2), #fixed-coin-detail-section .fcd-table td:nth-child(2) { text-align: left; }
+                    #fixed-coin-detail-section .fcd-up { color: #16a085; } #fixed-coin-detail-section .fcd-down { color: #e74c3c; }
+                    #fixed-coin-detail-section .fcd-muted { color: #bbb; }
+                </style>
+                <div class="fcd-wrap">
+                    <div id="fcd-placeholder" style="padding:18px;text-align:center;color:var(--text-muted);font-size:.85rem">正在加载固定币种实时行情…</div>
+                    <table class="fcd-table" id="fcd-table" style="display:none">
+                        <thead>
+                            <tr>
+                                <th>#</th><th>币种</th><th>合约</th><th>市值排名</th>
+                                <th>当前价格(USD)</th><th>24H涨跌</th><th>24H成交额</th><th>流通市值</th><th>流动性%</th><th>来源</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fcd-tbody"></tbody>
+                    </table>
                 </div>
             </div>
 
@@ -1124,7 +1163,7 @@
                         <h3 class="config-section-title">实盘分析记录</h3>
                         <p class="config-section-desc">手动快照币种实时价格与长短周期方向，记录个人涨跌判断与分析原因；记录满「N×短周期」后自动回填近/远窗口价格用于命中率复盘</p>
                     </div>
-                    <button class="m-btn m-btn-primary m-btn-sm" onclick="loadAnalysisRecords()">🔄 刷新列表</button>
+                    <button class="m-btn m-btn-primary m-btn-sm" onclick="loadAnalysisRecords()" title="重新拉取分析记录列表，并顺带回填已到期的近/远窗口复盘价格（不影响币种下拉，币种每次进入已自动同步）">🔄 刷新记录</button>
                 </div>
 
                 <div class="compare-filter">
@@ -1211,6 +1250,7 @@
                 <label>开始 <input type="date" id="ana-filter-start" class="config-input" style="width:auto"></label>
                 <label>结束 <input type="date" id="ana-filter-end" class="config-input" style="width:auto"></label>
                 <button class="btn btn-primary" onclick="loadAnalysisRecords()">🔍 查询</button>
+                <button class="m-btn m-btn-danger m-btn-sm" style="margin-left:auto" onclick="batchDeleteAnalysisRecords(this)" title="删除列表里已勾选的分析记录（配合表头复选框全选）">🗑 批量删除</button>
             </div>
 
             <!-- 记录列表 -->
@@ -1218,12 +1258,13 @@
                 <table class="task-table">
                     <thead>
                         <tr>
+                            <th style="width:36px;text-align:center"><input type="checkbox" id="ana-check-all" onclick="toggleAllAnaRows(this)" title="全选/全不选"></th>
                             <th>时间</th><th>币种</th><th>快照价</th><th>短周期</th><th>长周期</th>
                             <th>个人判断</th><th>分析原因</th><th id="ana-th-near">近窗口后</th><th id="ana-th-far">远窗口后</th><th>结果</th><th>操作</th>
                         </tr>
                     </thead>
                     <tbody id="ana-tbody">
-                        <tr><td colspan="11" class="empty-state">点击「查询」加载分析记录</td></tr>
+                        <tr><td colspan="12" class="empty-state">点击「查询」加载分析记录</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1326,7 +1367,7 @@
         // 离开交易配置 Tab 时退出全局通用配置模式，避免其他 Tab 的保存误触发批量同步
         if (_globalApplyMode) { _globalApplyMode = false; refreshGlobalApplyUI(); }
 
-        if (tab === 'trading') loadTradingConfig();
+        if (tab === 'trading') { loadTradingConfig(); ensureFixedCoinDetails(); }
         if (tab === 'email') { loadEmailConfig(); loadTradingConfig(); }
         if (tab === 'logs') refreshLogs();
         if (tab === 'compare') initCompareTab();
@@ -1406,7 +1447,13 @@
             if (!sel) return;
             if (res.code !== 200 || !Array.isArray(res.data)) { sel.innerHTML = '<option value="">加载失败</option>'; return; }
             sel.innerHTML = res.data.map(a => '<option value="'+a.key+'"'+(a.is_default?' selected':'')+'>'+a.name+'</option>').join('');
+            // 账号下拉就绪后按当前选定账号加载其独立配置（各账号仓位/杠杆互不串味）
+            loadTradingConfig();
         }).catch(() => {});
+    }
+    // 切换账号 → 重新加载该账号的独立交易配置（本地测试账号与实盘主账号各一份）
+    function onTradingAccountChange() {
+        loadTradingConfig();
     }
     function startTrading() {
         const sel = document.getElementById('trading-account');
@@ -1811,8 +1858,11 @@
         fillCurrencyForm(list[_currentCoinIdx] || {});
     }
 
-    function loadTradingConfig() {
-        fetch('/api/task/config/trading').then(r=>r.json()).then(res => {
+    function loadTradingConfig(account) {
+        const _sel = document.getElementById('trading-account');
+        const _acct = (account !== undefined && account !== null) ? account : (_sel ? _sel.value : '');
+        const _url = '/api/task/config/trading' + (_acct ? ('?account=' + encodeURIComponent(_acct)) : '');
+        fetch(_url).then(r=>r.json()).then(res => {
             if (res.code !== 200) { showToast('加载交易配置失败: ' + res.message, 'error'); return; }
             _tradingConfig = res.data;
             _currentCoinIdx = 0;
@@ -1977,7 +2027,10 @@
     // 提交完整交易配置（单币种保存 / 全局同步保存 / 一键应用共用）
     // successMsg: 可选自定义成功提示（一键应用等场景使用）
     function postTradingConfig(successMsg) {
-        fetch('/api/task/config/trading', {
+        const _sel = document.getElementById('trading-account');
+        const _acct = _sel ? _sel.value : '';
+        const _url = '/api/task/config/trading' + (_acct ? ('?account=' + encodeURIComponent(_acct)) : '');
+        fetch(_url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(_tradingConfig)
@@ -2917,6 +2970,122 @@
                 showToast(res.message, res.code === 200 ? 'success' : 'error');
                 if (res.code === 200) loadCoinLibrary();
             }).catch(e => showToast('删除失败：' + e, 'error'));
+        });
+    }
+
+    // =================================================================
+    // 固定币种池：市值榜刷新 + 实时详情面板
+    // =================================================================
+    let _fcdLoaded = false;   // 首次切到交易配置 Tab 时自动拉一次
+
+    function ensureFixedCoinDetails() {
+        if (_fcdLoaded) return;
+        _fcdLoaded = true;
+        loadFixedCoinDetails(false);
+    }
+
+    // 大额美元数缩写：$1.23T / $456.7B / $78.9M / $1.2K
+    function fmtUsdBig(v) {
+        if (v === null || v === undefined || isNaN(v)) return '<span class="fcd-muted">—</span>';
+        const n = Number(v);
+        const units = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+        for (const [div, u] of units) {
+            if (Math.abs(n) >= div) return '$' + (n / div).toFixed(n / div >= 100 ? 1 : 2) + u;
+        }
+        return '$' + n.toFixed(2);
+    }
+
+    function fmtPrice(v) {
+        if (v === null || v === undefined || isNaN(v)) return '<span class="fcd-muted">—</span>';
+        const n = Number(v);
+        if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+        if (n >= 1) return n.toFixed(3);
+        return n.toPrecision(4);
+    }
+
+    function loadFixedCoinDetails(force) {
+        const btn = document.getElementById('fcd-refresh-btn');
+        const meta = document.getElementById('fcd-meta');
+        const ph = document.getElementById('fcd-placeholder');
+        const tb = document.getElementById('fcd-tbody');
+        const table = document.getElementById('fcd-table');
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ 拉取中…'; }
+        fetch('/api/strategy/fixed-coins/market-detail' + (force ? '?force=1' : ''))
+            .then(r => r.json()).then(res => {
+                if (res.code !== 200 || !res.data) {
+                    ph.style.display = ''; ph.textContent = '加载失败：' + (res.message || '未知错误');
+                    table.style.display = 'none';
+                    if (meta) meta.textContent = '';
+                    return;
+                }
+                const d = res.data;
+                const rows = d.coins || [];
+                tb.innerHTML = rows.map(function(c, i) {
+                    const chg = c.chg_24h_pct;
+                    const chgHtml = (chg === null || chg === undefined)
+                        ? '<span class="fcd-muted">—</span>'
+                        : '<span class="' + (chg >= 0 ? 'fcd-up' : 'fcd-down') + '">' +
+                          (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</span>';
+                    const rk = c.market_cap_rank
+                        ? '#' + c.market_cap_rank
+                        : '<span class="fcd-muted" title="未进市值榜前100（手动提升的币）">未入榜</span>';
+                    const liq = (c.liquidity_pct === null || c.liquidity_pct === undefined)
+                        ? '<span class="fcd-muted">—</span>' : c.liquidity_pct.toFixed(1) + '%';
+                    return '<tr>' +
+                        '<td class="fcd-muted">' + (i + 1) + '</td>' +
+                        '<td><strong>' + escapeHtml(c.symbol) + '</strong></td>' +
+                        '<td style="color:#888;font-size:.78rem">' + escapeHtml(c.inst_id) + '</td>' +
+                        '<td>' + rk + '</td>' +
+                        '<td>' + fmtPrice(c.price_usd) + '</td>' +
+                        '<td>' + chgHtml + '</td>' +
+                        '<td>' + fmtUsdBig(c.volume_24h_usd) + '</td>' +
+                        '<td>' + fmtUsdBig(c.market_cap_usd) + '</td>' +
+                        '<td>' + liq + '</td>' +
+                        '<td class="fcd-muted">' + escapeHtml(c.source || '—') + '</td>' +
+                        '</tr>';
+                }).join('');
+                ph.style.display = 'none';
+                table.style.display = rows.length ? '' : 'none';
+                if (!rows.length) { ph.style.display = ''; ph.textContent = '固定币种池为空，请先点「🔄 更新市值列表」'; }
+                if (meta) {
+                    const t = d.fetched_at ? new Date(d.fetched_at * 1000).toLocaleTimeString('zh-CN') : '';
+                    meta.textContent = '共 ' + rows.length + ' 个 | 数据时间 ' + t +
+                        (d.stale ? '（外网暂不可达，显示缓存）' : ' | CoinGecko');
+                }
+            }).catch(e => {
+                ph.style.display = ''; ph.textContent = '加载失败：' + e;
+                table.style.display = 'none';
+            }).finally(() => {
+                if (btn) { btn.disabled = false; btn.textContent = '🔄 刷新数据'; }
+            });
+    }
+
+    // 「🔄 更新市值列表」：二次确认后调后端重建固定池（config+DB+宇宙）
+    function refreshFixedMarketcap() {
+        const btn = document.getElementById('btn-refresh-marketcap');
+        MDialog.show({
+            title: '🔄 更新市值列表',
+            message: '将拉取 CoinGecko 实时市值榜，筛选 OKX 有 USDT 线性永续的<b>市值前 50</b> 热门币，' +
+                     '<b>整体替换</b>监控台的固定币种池（浮动币种保留不变，新币同步写入币种库）。<br>' +
+                     '替换后请在监控台点一次「批量更新趋势数据」补全新币指标。确定继续？',
+            okText: '开始更新',
+            onOk: function () {
+                if (btn) { btn.disabled = true; btn.textContent = '⏳ 更新中…'; }
+                fetch('/api/strategy/fixed-coins/refresh-marketcap', { method: 'POST' })
+                    .then(r => r.json()).then(res => {
+                        if (res.code === 200) {
+                            showToast('✅ ' + res.message, 'success');
+                            loadFixedCoinDetails(true);   // 池子变了，明细强制重拉
+                        } else {
+                            showToast('❌ 更新失败：' + res.message, 'error');
+                        }
+                    }).catch(e => {
+                        showToast('❌ 更新失败：' + e, 'error');
+                    }).finally(() => {
+                        if (btn) { btn.disabled = false; btn.textContent = '🔄 更新市值列表'; }
+                    });
+                return true;
+            }
         });
     }
 

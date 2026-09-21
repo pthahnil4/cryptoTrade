@@ -457,6 +457,9 @@ def trade_open_orders():
                 "accFillSz": order.get('accFillSz', '0'),
                 "state": order.get('state', ''),
                 "cTime": _ts_to_str(order.get('cTime', '0')),
+                # 客户订单号：下单时由 gen_cl_ord_id 打标，人工核实/对账时靠它一眼
+                # 定位是「哪一轮、哪个篮子」下的单（2026-09-11 打标上线时漏透出）
+                "clOrdId": order.get('clOrdId', ''),
                 "lever": order.get('lever', '')
             })
 
@@ -467,23 +470,34 @@ def trade_open_orders():
 
 
 # =============================================================================
-# 🔄 交易类 - 订单查询
+# 🔄 交易类 - 订单详情
 # GET /api/trade/order_info?instId=BTC-USDT-SWAP&ordId=xxx
+# GET /api/trade/order_info?instId=BTC-USDT-SWAP&clOrdId=xxx   (二选一)
 # =============================================================================
 @api_bp.route('/api/trade/order_info', methods=['GET'])
 def trade_order_info():
     """
     查询订单详情
+
+    ordId 与 clOrdId 至少给一个：交易日志/告警里透出的是本侧打标的 clOrdId，
+    只支持 ordId 就得先人肉翻日志找交易所单号，反查链路等于断在半路。
     """
     try:
         inst_id = request.args.get('instId', '')
         ord_id = request.args.get('ordId', '')
+        cl_ord_id = request.args.get('clOrdId', '')
         acct = request.args.get('account', '')
-        if not inst_id or not ord_id:
-            return jsonify({"code": 400, "message": "缺少参数 instId 或 ordId", "data": None})
+        if not inst_id or not (ord_id or cl_ord_id):
+            return jsonify({"code": 400, "message": "缺少参数 instId，且 ordId 与 clOrdId 至少给一个",
+                            "data": None})
 
         trade_api = _get_api_client('trade', acct or None)
-        result = _rl_call(trade_api, 'get_order', instId=inst_id, ordId=ord_id)
+        kwargs = {'instId': inst_id}
+        if ord_id:
+            kwargs['ordId'] = ord_id
+        else:
+            kwargs['clOrdId'] = cl_ord_id
+        result = _rl_call(trade_api, 'get_order', **kwargs)
 
         if not _okx_success(result) or not result.get('data'):
             return jsonify(_make_response(result))
@@ -502,7 +516,8 @@ def trade_order_info():
             "state": order.get('state', ''),
             "fee": order.get('fee', '0'),
             "cTime": _ts_to_str(order.get('cTime', '0')),
-            "uTime": _ts_to_str(order.get('uTime', '0'))
+            "uTime": _ts_to_str(order.get('uTime', '0')),
+            "clOrdId": order.get('clOrdId', '')
         }
         return jsonify({"code": 200, "message": "success", "data": data})
 
@@ -548,7 +563,8 @@ def trade_history():
                 "fillSz": order.get('accFillSz', '0'),
                 "state": order.get('state', ''),
                 "cTime": _ts_to_str(order.get('cTime', '0')),
-                "uTime": _ts_to_str(order.get('uTime', '0'))
+                "uTime": _ts_to_str(order.get('uTime', '0')),
+                "clOrdId": order.get('clOrdId', '')
             })
 
         return jsonify({"code": 200, "message": "success", "data": order_list})

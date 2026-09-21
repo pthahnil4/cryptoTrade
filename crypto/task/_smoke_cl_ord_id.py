@@ -15,8 +15,17 @@
 - 请求异常后先按客户号反查定性：found=按成功复用（**不再重发**）、
   absent=确认没落地（可以重发）、unknown=反查也失败（停手并提示需人工核实）。
 
+二次事故（2026-09-11 实盘）：打标本身"上线即全灭"——每笔委托都被交易所回
+`51000: Parameter clOrdId error`，区间仓/趋势仓一笔都挂不出去。根因是客户号里
+带了分隔符 `ct_<token>_<hash>`：OKX 的 clOrdId/algoClOrdId 实测只接受
+**纯字母数字、长度 1~32**（下划线/连字符/点号全部非法），而实现和下面的第 1 组
+断言一起照抄了 Binance 式的 `[A-Za-z0-9_-]{1,64}`，所以冒烟 29/29 全绿也拦不住。
+教训：**校验"合法性"的断言不能来自对文档/别的交易所的印象，必须来自交易所实测**；
+口径由只读探针 `crypto/task/_diag_cl_ord_id_charset.py` 出（它只查单不下单）。
+
 场景清单：
-1. gen_cl_ord_id 合法（字符集/长度）且互不相同
+1. gen_cl_ord_id 合法（OKX 实测口径：纯字母数字 ≤32）且互不相同，
+   并按源码扫出全部下单前缀逐一过一遍（防新增出口漏检）
 2. execute_trade 正常成功 → 带 clOrdId，返回 cl_ord_id
 3. 请求异常 + 反查命中 → 按成功返回、place 只被调用 1 次（没盲重发）
 4. 请求异常 + 反查明确"查无此单" → 返回失败、不带 need_verify（可安全重发）
@@ -25,10 +34,12 @@
 7. 追逐委托：反查也失败时只发 1 次就停手（改前会盲重试 3 次）
 8. 追逐委托：反查确认未落地时按原逻辑重发，最终成功
 9. TWAP/移动止损/计划止盈止损/强平 均带客户号（打标覆盖全）
+10. OKX 客户端 HTTP 超时已抬高（SDK 默认 5s 太短 → 下单频繁"结果未知"）
 
 何时重跑：改 trade_executor.py 的 gen_cl_ord_id / probe_order_by_cl_id /
 probe_algo_by_client_id / execute_trade / execute_reduce_only_order /
-execute_chase_limit_order 任一逻辑。
+execute_chase_limit_order / _apply_http_timeout 任一逻辑，或新增下单出口时。
+客户号字符集口径存疑时先跑只读探针 `crypto/task/_diag_cl_ord_id_charset.py`。
 """
 import os
 import re
@@ -132,14 +143,41 @@ def first(lst):
 
 
 # ---------------------------------------------------------------- 1 客户号格式
-print("\n[1] clOrdId 生成规则")
+# 【口径来源＝OKX 实测，不是文档抄写】2026-09-11 事故：本组断言原先写的是
+# 「字母数字下划线、≤64」（照搬 Binance 式假设），与交易所真实规矩一致地"错"，
+# 所以 29/29 全绿却拦不住实盘每笔委托都被拒 51000 Parameter clOrdId error。
+# 现在的规则由只读探针 _diag_cl_ord_id_charset.py 逐形态定性得出：
+#   纯字母数字 1~32 位；下划线/连字符/点号一律非法；33 位起超长非法。
+print("\n[1] clOrdId 生成规则（OKX 实测：纯字母数字 1~32 位）")
 ids = {gen_cl_ord_id('ct', seed=f'NEAR-USDT-SWAP|buy|0.2|3.14|limit') for _ in range(200)}
 sample = next(iter(ids))
-check("1a 字符集合法（字母数字_）", bool(re.fullmatch(r'[A-Za-z0-9_]+', sample)), sample)
-check("1b 长度 ≤64", len(sample) <= 64, len(sample))
+check("1a 字符集只含字母与数字（无下划线/连字符）",
+      bool(re.fullmatch(r'[A-Za-z0-9]{1,32}', sample)), sample)
+check("1b 长度 ≤32（OKX 实测上限，不是 64）", len(sample) <= 32, len(sample))
 check("1c 200 次不撞号", len(ids) == 200, len(ids))
 check("1d 超长被截断而非报错",
-      len(gen_cl_ord_id('x' * 100, seed='y' * 100)) <= 64)
+      len(gen_cl_ord_id('x' * 100, seed='y' * 100)) <= 32)
+check("1e 截断后仍是纯字母数字",
+      bool(re.fullmatch(r'[A-Za-z0-9]{1,32}', gen_cl_ord_id('x' * 100, seed='y' * 100))))
+# 分隔符只能被剔除，不能被"洗白"成合法字符
+check("1f 带分隔符的前缀也被净化",
+      bool(re.fullmatch(r'[A-Za-z0-9]{1,32}', gen_cl_ord_id('ct_chase-1', seed='a|b'))),
+      gen_cl_ord_id('ct_chase-1', seed='a|b'))
+# 代码里所有下单出口用到的前缀逐一过一遍：前缀清单**从源码扫出来**，
+# 不再靠手写（手写清单会漏，正是"静态核对假完备"的老坑）
+import utils.trade_executor as _te_mod  # noqa: E402
+with open(_te_mod.__file__, encoding='utf-8') as _fh:
+    _src = _fh.read()
+_prefixes = sorted(set(re.findall(r"gen_cl_ord_id\(\s*'([^']*)'", _src)))
+check("1g 源码中的前缀清单非空（扫描本身有效）", len(_prefixes) >= 5, _prefixes)
+_bad_pfx = [p for p in _prefixes
+            if not re.fullmatch(r'[A-Za-z0-9]{1,32}',
+                                gen_cl_ord_id(p, seed='BTC-USDT-SWAP|buy|0.1|100|limit'))]
+check("1h 每个下单出口的客户号都合法", not _bad_pfx,
+      f"扫描到 {len(_prefixes)} 个前缀，非法={_bad_pfx}")
+# 唯一性靠 token（毫秒时间戳+uuid）：即便同秒并发也不能撞号
+burst = {gen_cl_ord_id('ct', seed=f'X-USDT-SWAP|buy|{i}') for i in range(500)}
+check("1i 同秒 500 次并发不撞号", len(burst) == 500, len(burst))
 
 # ---------------------------------------------------------------- 2~5 普通委托
 print("\n[2] execute_trade 正常成功")
@@ -295,6 +333,31 @@ ex.trade_api.place_script = [OK_ORDER]
 ex.close_position('NEAR-USDT-SWAP')
 check("9d 一键强平带 clOrdId", bool(first(ex.trade_api.place_calls).get('clOrdId')),
       first(ex.trade_api.place_calls))
+
+# ---------------------------------------------------------------- 10 HTTP 超时
+# 现网另一半年根因：SDK 默认读超时 5s，链路一抖下单就变成"结果未知"（必须人工
+# 核实的最坏状态）。这里只验配置生效与"绝不因设超时而崩"，不发任何网络请求。
+print("\n[10] OKX 客户端 HTTP 超时（下单结果未知的另一半年根因）")
+import utils.trade_executor as _te  # noqa: E402
+check("10a 超时值不低于 SDK 默认且可被环境变量抬高",
+      _te._OKX_HTTP_TIMEOUT_SEC >= 5.0, f"{_te._OKX_HTTP_TIMEOUT_SEC}s")
+_pub = _te.PublicData.PublicAPI(flag='0')          # 只建对象，不发请求
+_te._apply_http_timeout(_pub)
+check("10b 真实 SDK 客户端读超时被抬高",
+      abs(float(getattr(_pub.timeout, 'read', 0)) - _te._OKX_HTTP_TIMEOUT_SEC) < 1e-6,
+      f"{getattr(_pub.timeout, 'read', None)}s")
+
+
+class _NoTimeoutAttr:
+    __slots__ = ()                                  # 赋值 timeout 必抛 AttributeError
+
+
+_te._apply_http_timeout(_NoTimeoutAttr())
+check("10c 设置失败只告警不上抛（不因限流件带崩交易链路）", True)
+
+_with_wrap = _src.count('_apply_http_timeout(')
+check("10d trade_executor 内所有 OKX 客户端都套了超时（含重建路径）",
+      _with_wrap >= 6, f"_apply_http_timeout( 出现 {_with_wrap} 次")
 
 print("\n" + "=" * 52)
 print(f"  PASS {len(PASS)}  /  FAIL {len(FAIL)}")

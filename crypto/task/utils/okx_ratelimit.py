@@ -71,6 +71,7 @@ DEFAULT_RATES: Dict[str, float] = {
     'algo_query': 3.0,       # GET /trade/algo-orders、/trade/algo-order
     'positions': 5.0,        # GET /account/positions
     'balance': 3.0,          # GET /account/balance、/account/max-order-size
+    'account_risk': 3.0,     # GET /account/account-position-risk（维持保证金/账户等级）
     'instruments': 3.0,      # GET /public/instruments
     'leverage': 3.0,         # GET /account/leverage-info
 }

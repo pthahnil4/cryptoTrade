@@ -179,6 +179,16 @@ def delete_record(session, rec_id: int) -> bool:
     return (result.rowcount or 0) > 0
 
 
+def delete_records(session, rec_ids: List[int]) -> int:
+    """批量删除记录，返回实际删除的条数（不存在的 id 自动忽略）。"""
+    ids = [int(i) for i in (rec_ids or []) if str(i).strip() != '']
+    if not ids:
+        return 0
+    result = session.execute(
+        sa_delete(TaskAnalysisRecord).where(TaskAnalysisRecord.id.in_(ids)))
+    return result.rowcount or 0
+
+
 # =============================================================================
 # 复盘价格惰性回填
 # =============================================================================

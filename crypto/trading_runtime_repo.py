@@ -80,26 +80,45 @@ def _write(runtime: dict) -> bool:
         return False
 
 
+def _update_runtime(changes: dict):
+    """锁内读取并合并，避免启停与自动恢复开关读改写互相覆盖。"""
+    result = _merge(changes)
+    result['updated_at'] = _now()
+
+    def transform(current):
+        nonlocal result
+        result = _merge(current)
+        result.update(changes)
+        result['updated_at'] = _now()
+        return result
+
+    try:
+        with session_scope() as s:
+            config_store_repo.patch_json_config(
+                s, config_store_repo.KEY_TRADING_RUNTIME, transform)
+        return result, True
+    except Exception as e:
+        logger.error('[TradingRuntime] 合并期望状态失败（启停不受影响）: %s', e)
+        return result, False
+
+
 def set_desired_running(running: bool, account=None, event: str = '') -> bool:
     """记录「用户希望的运行状态」：启动成功置 True、停止置 False。
 
     account 为 None 时保留原值（例如停止路径不再带账号信息）。
     """
-    rt = load_runtime()
-    rt['desired_running'] = bool(running)
+    changes = {'desired_running': bool(running),
+               'last_event': event or ('start' if running else 'stop')}
     if account is not None:
-        rt['account'] = str(account) if account else None
+        changes['account'] = str(account) if account else None
+    rt, saved = _update_runtime(changes)
     if running and not rt.get('account') and account is None:
         logger.warning('[TradingRuntime] 记录运行为 True 但没有账号信息，'
                        '重启自动拉起将跳过')
-    rt['last_event'] = event or ('start' if running else 'stop')
-    return _write(rt)
+    return saved
 
 
 def set_auto_resume(enabled: bool, event: str = 'auto_resume_toggle') -> dict:
     """打开/关闭「重启后自动拉起实盘」开关，返回最新状态"""
-    rt = load_runtime()
-    rt['auto_resume'] = bool(enabled)
-    rt['last_event'] = event
-    _write(rt)
+    rt, _saved = _update_runtime({'auto_resume': bool(enabled), 'last_event': event})
     return rt

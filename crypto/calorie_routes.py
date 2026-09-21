@@ -253,6 +253,10 @@ def _ensure_food_seed(session):
     foods = repo.load_foods(session)
     if foods:
         return foods
+    repo.lock_config(session)
+    foods = repo.load_foods(session, for_update=True)
+    if foods:
+        return foods
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     for i, item in enumerate(_DEFAULT_FOODS, 1):
         repo.add_food(session, {
@@ -262,8 +266,9 @@ def _ensure_food_seed(session):
             'calories': item['calories'],
             'category': item['category'],
             'created_at': now
-        })
-    return repo.load_foods(session)
+        }, flush=False)
+    session.flush()
+    return repo.load_foods(session, for_update=True)
 
 
 def _find_or_create_food(session, food_name, food_calories=None):
@@ -296,6 +301,51 @@ def _parse_food_names(food_str):
     if not food_str or not food_str.strip():
         return []
     return [f.strip() for f in food_str.split(',') if f.strip()]
+
+
+def _meal_item_total(item):
+    """单条明细的摄入量 = 单位热量 × 数量。
+
+    优先采用前端传来的 total_calories；quantity 缺失/非法时按 1 处理，
+    兼容旧契约（calories 即该行绝对热量）。
+    """
+    total = item.get('total_calories')
+    if total is not None:
+        try:
+            return round(float(total), 2)
+        except (ValueError, TypeError):
+            pass
+    try:
+        unit_cal = float(item.get('calories', 0) or 0)
+    except (ValueError, TypeError):
+        unit_cal = 0.0
+    try:
+        qty = float(item.get('quantity', 1) or 1)
+    except (ValueError, TypeError):
+        qty = 1.0
+    if qty <= 0:
+        qty = 1.0
+    return round(unit_cal * qty, 2)
+
+
+def _normalize_meal_foods(foods):
+    """规整明细数组：补齐 quantity/unit/total_calories，保证存储结构与 API 回显一致"""
+    normalized = []
+    for item in foods:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        try:
+            qty = float(entry.get('quantity', 1) or 1)
+        except (ValueError, TypeError):
+            qty = 1.0
+        if qty <= 0:
+            qty = 1.0
+        entry['quantity'] = round(qty, 3)
+        entry['unit'] = str(entry.get('unit', '') or '')[:32]
+        entry['total_calories'] = _meal_item_total(entry)
+        normalized.append(entry)
+    return normalized
 
 
 def _recalc_cumulative(records):
@@ -361,13 +411,15 @@ def api_save_record():
     evening_weight = req.get('evening_weight')
     daily_steps = req.get('daily_steps', 0)
 
-    # 处理多食物数组（支持新格式：foods 数组；也兼容旧格式：单 food + cal）
+    # 处理多食物数组（支持新格式：foods 数组，明细带 quantity/unit/total_calories；
+    # 也兼容旧格式：无 quantity 的明细按 quantity=1 计）
     breakfast_foods = req.get('breakfast_foods', [])
     lunch_foods = req.get('lunch_foods', [])
     dinner_foods = req.get('dinner_foods', [])
 
     if breakfast_foods and isinstance(breakfast_foods, list):
-        breakfast_calories = sum(float(f.get('calories', 0) or 0) for f in breakfast_foods)
+        breakfast_foods = _normalize_meal_foods(breakfast_foods)
+        breakfast_calories = round(sum(_meal_item_total(f) for f in breakfast_foods), 2)
         breakfast_food = ', '.join(f.get('name', '') for f in breakfast_foods if f.get('name'))
     else:
         breakfast_foods = []
@@ -375,7 +427,8 @@ def api_save_record():
         breakfast_calories = req.get('breakfast_calories', 0)
 
     if lunch_foods and isinstance(lunch_foods, list):
-        lunch_calories = sum(float(f.get('calories', 0) or 0) for f in lunch_foods)
+        lunch_foods = _normalize_meal_foods(lunch_foods)
+        lunch_calories = round(sum(_meal_item_total(f) for f in lunch_foods), 2)
         lunch_food = ', '.join(f.get('name', '') for f in lunch_foods if f.get('name'))
     else:
         lunch_foods = []
@@ -383,7 +436,8 @@ def api_save_record():
         lunch_calories = req.get('lunch_calories', 0)
 
     if dinner_foods and isinstance(dinner_foods, list):
-        dinner_calories = sum(float(f.get('calories', 0) or 0) for f in dinner_foods)
+        dinner_foods = _normalize_meal_foods(dinner_foods)
+        dinner_calories = round(sum(_meal_item_total(f) for f in dinner_foods), 2)
         dinner_food = ', '.join(f.get('name', '') for f in dinner_foods if f.get('name'))
     else:
         dinner_foods = []
@@ -421,9 +475,9 @@ def api_save_record():
     except (ValueError, TypeError):
         daily_steps = 0
 
-    # 事务内：读配置→计算→写入→重算累计→食物自动入库
+    # 先锁定累计值写入作用域，再读取配置；避免并发补录互相覆盖累计值。
     with session_scope() as session:
-        config = repo.load_config(session)
+        config = repo.lock_config(session)
 
         # 计算各项指标
         calculator = CalorieCalculator(config)
@@ -458,32 +512,20 @@ def api_save_record():
             'updated_at': now
         }
 
-        # 更新时保留原 created_at（与 JSON 版行为一致）
-        existing = repo.get_record(session, date)
-        if existing:
-            record['created_at'] = existing.get('created_at') or now
-
+        # upsert_record 已保留 created_at，无需提前再读一遍主记录和三餐。
         repo.upsert_record(session, record)
 
-        # 重新计算全部记录的累积缺口（合并为一条批量 UPDATE，避免逐条往返）
-        records = _recalc_cumulative(repo.load_records(session))
-        repo.bulk_update_records(session, [
-            {'id': r['id'], 'cumulative_deficit': r['cumulative_deficit']}
-            for r in records])
+        before = repo.load_record_metrics(session)
+        records = _recalc_cumulative([dict(r) for r in before])
+        repo.bulk_update_records(session, repo.changed_metrics(before, records))
 
         # 处理食物自动入库（new_foods 仅返回本次新建的，对齐 JSON 版契约）
-        new_foods = []
         all_food_names = (
             _parse_food_names(breakfast_food) +
             _parse_food_names(lunch_food) +
             _parse_food_names(dinner_food)
         )
-        for name in all_food_names:
-            if repo.find_food_by_name(session, name):
-                continue
-            added = _find_or_create_food(session, name)
-            if added:
-                new_foods.append(added)
+        new_foods = repo.add_missing_foods(session, all_food_names)
 
         # 更新后的记录（含重算后的累计值）与统计看板
         updated_record = repo.get_record(session, date)
@@ -501,16 +543,13 @@ def api_save_record():
 def api_delete_record(record_id):
     """删除一条记录"""
     with session_scope() as session:
+        config = repo.lock_config(session)
         if not repo.delete_record(session, record_id):
             return jsonify({'success': False, 'error': '记录不存在'}), 404
 
-        # 重新计算剩余记录的累积缺口（合并为一条批量 UPDATE，避免逐条往返）
-        records = _recalc_cumulative(repo.load_records(session))
-        repo.bulk_update_records(session, [
-            {'id': r['id'], 'cumulative_deficit': r['cumulative_deficit']}
-            for r in records])
-
-        config = repo.load_config(session)
+        before = repo.load_record_metrics(session)
+        records = _recalc_cumulative([dict(r) for r in before])
+        repo.bulk_update_records(session, repo.changed_metrics(before, records))
 
     calculator = CalorieCalculator(config)
     dashboard = calculator.calc_dashboard(records)
@@ -571,6 +610,7 @@ def api_add_food():
 
     food_db = None  # 兼容占位：查重与写入均在事务内完成
     with session_scope() as session:
+        repo.lock_config(session)
         _ensure_food_seed(session)
 
         # 检查是否已存在（不区分大小写）
@@ -600,6 +640,7 @@ def api_update_food(food_id):
         return jsonify({'success': False, 'error': '无效的请求数据'}), 400
 
     with session_scope() as session:
+        repo.lock_config(session)
         target = repo.get_food(session, food_id)
         if not target:
             return jsonify({'success': False, 'error': '食物不存在'}), 404
@@ -631,6 +672,7 @@ def api_update_food(food_id):
 def api_delete_food(food_id):
     """删除食物"""
     with session_scope() as session:
+        repo.lock_config(session)
         if not repo.delete_food(session, food_id):
             return jsonify({'success': False, 'error': '食物不存在'}), 404
 
@@ -658,7 +700,7 @@ def api_update_config():
         return jsonify({'success': False, 'error': '无效的请求数据'}), 400
 
     with session_scope() as session:
-        config = repo.load_config(session)
+        config = repo.lock_config(session)
 
         # 更新可配置项
         for key in ('height', 'age', 'step_frequency', 'weight_factor', 'target_deficit'):
@@ -676,8 +718,8 @@ def api_update_config():
         # 配置变化后重新计算所有记录：先在内存算好每条的新值，再合并为一条
         # 批量 UPDATE 写回，避免逐条 UPDATE 在远端 MySQL 上产生 N 次网络往返
         calculator = CalorieCalculator(config)
-        raw_records = repo.load_records(session)
-        updates = []
+        before = repo.load_record_metrics(session)
+        raw_records = [dict(r) for r in before]
         for record in raw_records:
             mw = record.get('morning_weight')
             bmr = calculator.calc_bmr(mw)
@@ -692,17 +734,9 @@ def api_update_config():
             record['intake_deficit'] = intake_deficit
             record['exercise_calories'] = exercise_calories
             record['calorie_deficit'] = calorie_deficit
-            updates.append({
-                'id': record['id'], 'bmr': bmr,
-                'intake_deficit': intake_deficit,
-                'exercise_calories': exercise_calories,
-                'calorie_deficit': calorie_deficit})
 
         records = _recalc_cumulative(raw_records)
-        cum_map = {r['id']: r['cumulative_deficit'] for r in records}
-        for u in updates:
-            u['cumulative_deficit'] = cum_map[u['id']]
-        repo.bulk_update_records(session, updates)
+        repo.bulk_update_records(session, repo.changed_metrics(before, records))
 
     dashboard = calculator.calc_dashboard(records)
 

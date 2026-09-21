@@ -64,7 +64,7 @@
 {% include 'nav.html' %}
 <div class="sys-page">
     <h1>🖥️ 系统状态</h1>
-    <p class="sys-desc">进程内存自监控（每 5 分钟）+ 系统级健康检查（每 1 分钟）。内存超限自动预警并自重启，历史趋势用于排查内存泄漏。</p>
+    <p class="sys-desc">进程内存自监控（每 2 分钟）+ 系统级健康检查（每 1 分钟）。内存超限自动预警并自重启，历史趋势用于排查内存泄漏。重启后先看「本次启动归因」，它说明进程是初次上线、撞线自愈、还是被系统杀掉的。</p>
 
     <!-- 状态卡片 -->
     <div class="card status-card">
@@ -127,6 +127,18 @@ function fmt(v, suffix) {
     return (v == null) ? '—' : v + (suffix || '');
 }
 
+// 启动归因展示名（键名与 crypto/process_lifecycle.py 的 BOOT_LABELS 一致，
+// 文案是卡片上用的简称）
+const BOOT_LABELS = {
+    first_run: '初次启动',
+    mem_restart: '内存超限自愈',
+    daily_restart: '每日主动归零',
+    abnormal_death: '异常死亡后重启',
+    parallel_instance: '并发实例（旧进程还在跑）',
+    cold_start: '冷启动',
+    unknown: '原因未知'
+};
+
 // =================================================================
 // 系统概况
 // =================================================================
@@ -144,6 +156,7 @@ function loadStatus() {
         if (wd.rss_mb != null) parts.push('当前RSS ' + Number(wd.rss_mb).toFixed(1) + 'MB');
         parts.push('预警 ' + wd.warn_mb + 'MB / 强退 ' + wd.kill_mb + 'MB');
         if (wd.last_check) parts.push('上次检查 ' + wd.last_check);
+        if (d.boot) parts.push('启动归因 ' + (BOOT_LABELS[d.boot.reason] || d.boot.reason));
         detail.textContent = parts.join('　');
 
         // 指标网格
@@ -170,6 +183,15 @@ function loadStatus() {
             { label: '系统负载（1分钟）', value: fmt(snap.load_1min),
               cls: (snap.load_1min != null && snap.cpu_count && snap.load_1min / snap.cpu_count > 2) ? 'warn' : 'ok',
               sub: snap.cpu_count ? snap.cpu_count + ' 核' : '' },
+            { label: '本次启动归因',
+              value: d.boot ? (BOOT_LABELS[d.boot.reason] || d.boot.reason) : '未归因',
+              // 异常死亡（崩溃/被 OOM 杀）与原因未知要显眼，其余按正常展示
+              cls: !d.boot ? 'ok' : (['abnormal_death', 'unknown'].indexOf(d.boot.reason) >= 0 ? 'warn' : 'ok'),
+              sub: d.boot
+                  ? ('boot #' + (d.boot.boot_seq || '?')
+                     + (d.boot.heartbeat_lag_sec != null ? ' · 上次心跳距今 ' + d.boot.heartbeat_lag_sec + 's' : ''))
+                  : '后台线程未启动（如设了 CRYPTO_NO_BACKGROUND）或归因层不可用'
+            },
         ];
         document.getElementById('metricGrid').innerHTML = items.map(it =>
             '<div class="metric-item">' +

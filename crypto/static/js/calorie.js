@@ -15,7 +15,9 @@ let state = {
     foodCache: [],      // 食物搜索缓存
     editingId: null,    // 正在编辑的记录ID
     formCollapsed: false,
-    mealFoods: { breakfast: [], lunch: [], dinner: [] }  // 每餐多食物列表
+    mealFoods: { breakfast: [], lunch: [], dinner: [] },  // 每餐多食物列表
+    // 从搜索建议选中的食物单位快照（点「添加」时随明细一并提交）
+    mealPickUnit: { breakfast: '', lunch: '', dinner: '' }
 };
 
 // =============================================================================
@@ -133,10 +135,23 @@ function getMealFoods(meal) {
     return state.mealFoods[meal] || [];
 }
 
-/** 计算某餐的总热量 */
+/** 取明细数量（兼容旧数据：无 quantity 或非法值按 1 计） */
+function foodQty(f) {
+    const q = (typeof f.quantity === 'number') ? f.quantity : parseFloat(f.quantity);
+    return (isFinite(q) && q > 0) ? q : 1;
+}
+
+/** 明细行总热量 = 单位热量 × 数量（旧数据无 quantity 时即原绝对热量） */
+function foodTotalCal(f) {
+    const t = (typeof f.total_calories === 'number') ? f.total_calories : parseFloat(f.total_calories);
+    if (isFinite(t)) return t;
+    return Math.round((f.calories || 0) * foodQty(f) * 100) / 100;
+}
+
+/** 计算某餐的总热量（按明细 total_calories 累加，保留2位避免浮点尾数） */
 function calcMealCalories(meal) {
     const foods = getMealFoods(meal);
-    return foods.reduce((sum, f) => sum + (f.calories || 0), 0);
+    return Math.round(foods.reduce((sum, f) => sum + foodTotalCal(f), 0) * 100) / 100;
 }
 
 /** 计算三餐总摄入 */
@@ -161,9 +176,16 @@ function renderMealFoods(meal) {
     let html = '';
     foods.forEach((f, idx) => {
         if (!f.name && !f.calories) return;
+        const qty = foodQty(f);
+        const total = foodTotalCal(f);
+        // 标签展示「食物名 × 数量 (单位)」，数量可内联修改，总热量实时重算
         html += '<span class="meal-food-chip">' +
-            '<span class="chip-name">' + (f.name || '食物') + '</span>' +
-            '<span class="chip-cal">' + (f.calories || 0) + ' kcal</span>' +
+            '<span class="chip-name">' + escHtml(f.name || '食物') + '</span>' +
+            '<span class="chip-qty-wrap">×<input class="chip-qty" type="number" min="0.1" step="0.1" value="' + qty + '"' +
+            ' data-meal="' + meal + '" data-idx="' + idx + '" title="数量（支持小数，如 0.8）"' +
+            ' onchange="setMealFoodQty(this.getAttribute(\'data-meal\'), +this.getAttribute(\'data-idx\'), this.value)"></span>' +
+            (f.unit ? '<span class="chip-unit">(' + escHtml(f.unit) + ')</span>' : '') +
+            '<span class="chip-cal">' + total + ' kcal</span>' +
             '<button class="chip-remove" onclick="removeMealFood(\'' + meal + '\', ' + idx + ')" title="移除">✕</button>' +
             '</span>';
     });
@@ -173,22 +195,47 @@ function renderMealFoods(meal) {
     if (totalEl) totalEl.textContent = total + ' kcal';
 }
 
-/** 向某餐添加食物 */
+/** 修改某餐某条明细的数量，重算该行总热量并联动预览指标 */
+function setMealFoodQty(meal, idx, value) {
+    const list = getMealFoods(meal);
+    const f = list[idx];
+    if (!f) return;
+    let qty = parseFloat(value);
+    if (!isFinite(qty) || qty <= 0) qty = 1;
+    f.quantity = Math.round(qty * 1000) / 1000;
+    f.total_calories = Math.round((f.calories || 0) * f.quantity * 100) / 100;
+    renderMealFoods(meal);
+    updatePreview();
+}
+
+/** 向某餐添加食物（热量框填单位热量，数量×单位热量=该行总热量） */
 function commitMealFood(meal) {
     const searchInput = document.querySelector('.meal-food-search[data-meal="' + meal + '"]');
     const calInput = document.querySelector('.meal-food-cal[data-meal="' + meal + '"]');
+    const qtyInput = document.querySelector('.meal-food-qty[data-meal="' + meal + '"]');
 
     if (!searchInput) return;
 
     const name = searchInput.value.trim();
     const cal = parseFloat(calInput ? calInput.value : 0) || 0;
+    let qty = parseFloat(qtyInput ? qtyInput.value : '');
+    if (!isFinite(qty) || qty <= 0) qty = 1;
+    qty = Math.round(qty * 1000) / 1000;
 
     if (!name && cal <= 0) return;
 
-    state.mealFoods[meal].push({ name: name || '食物', calories: cal });
+    state.mealFoods[meal].push({
+        name: name || '食物',
+        calories: cal,
+        quantity: qty,
+        unit: state.mealPickUnit[meal] || '',
+        total_calories: Math.round(cal * qty * 100) / 100
+    });
 
     searchInput.value = '';
     if (calInput) calInput.value = '';
+    if (qtyInput) qtyInput.value = '1';
+    state.mealPickUnit[meal] = '';
 
     // 隐藏建议列表
     const suggestEl = document.querySelector('.food-suggest[data-suggest="' + meal + '"]');
@@ -205,18 +252,33 @@ function removeMealFood(meal, idx) {
     updatePreview();
 }
 
-/** 设置某餐的食物列表（用于编辑回填） */
+/** 设置某餐的食物列表（用于编辑回填，兼容无 quantity 的历史明细） */
 function setMealFoods(meal, foods) {
-    state.mealFoods[meal] = (foods || []).map(f => ({
-        name: f.name || '',
-        calories: typeof f.calories === 'number' ? f.calories : (parseFloat(f.calories) || 0)
-    }));
+    state.mealFoods[meal] = (foods || []).map(f => {
+        const cal = typeof f.calories === 'number' ? f.calories : (parseFloat(f.calories) || 0);
+        const qty = foodQty(f);
+        return {
+            name: f.name || '',
+            calories: cal,
+            quantity: qty,
+            unit: f.unit || '',
+            total_calories: Math.round(cal * qty * 100) / 100
+        };
+    });
     renderMealFoods(meal);
+}
+
+/** 重置某餐添加行的数量与单位快照 */
+function resetMealAddRow(meal) {
+    state.mealPickUnit[meal] = '';
+    const qtyInput = document.querySelector('.meal-food-qty[data-meal="' + meal + '"]');
+    if (qtyInput) qtyInput.value = '1';
 }
 
 /** 清空所有餐的食物列表 */
 function clearAllMealFoods() {
     state.mealFoods = { breakfast: [], lunch: [], dinner: [] };
+    ['breakfast', 'lunch', 'dinner'].forEach(resetMealAddRow);
     renderMealFoods('breakfast');
     renderMealFoods('lunch');
     renderMealFoods('dinner');
@@ -249,14 +311,19 @@ function setupFoodSearch() {
             activeIdx = idx;
         }
 
-        /** 选中某个候选项：回填食物名称与热量到输入框，并自动提交到该餐列表 */
+        /** 选中某个候选项：将食物名与单位热量回填输入框，数量重置为 1，
+         *  由用户确认/修改数量后再点「添加」提交（不再自动提交清空输入框） */
         function pickFood(idx) {
             const f = currentFoods[idx];
             if (!f) return;
+            const qtyInput = document.querySelector('.meal-food-qty[data-meal="' + meal + '"]');
             input.value = f.name;
             if (calInput) calInput.value = f.calories;
+            if (qtyInput) qtyInput.value = '1';
+            state.mealPickUnit[meal] = f.unit || '';
             hideSuggest();
-            commitMealFood(meal);
+            // 焦点移到数量框方便直接调整；不改数量时可直接点「添加」或再按回车提交
+            if (qtyInput) { qtyInput.focus(); qtyInput.select(); }
         }
 
         /** 渲染建议列表（无结果时给出提示，回车可直接把手输食物入库） */
@@ -348,6 +415,17 @@ function setupFoodSearch() {
 
         if (calInput) {
             calInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitMealFood(meal);
+                }
+            });
+        }
+
+        // 数量框回车同样直接提交该条明细
+        const qtyEl = document.querySelector('.meal-food-qty[data-meal="' + meal + '"]');
+        if (qtyEl) {
+            qtyEl.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter') {
                     e.preventDefault();
                     commitMealFood(meal);
@@ -690,15 +768,16 @@ function renderHistory() {
         '</tr></thead><tbody>';
 
     for (const r of records) {
-        // 显示食物名称（优先使用 foods 数组，兼容旧格式）
+        // 显示食物名称与数量（优先使用 foods 数组，兼容旧格式；数量非 1 时后缀 ×N）
+        const foodLabel = f => (f.name || '') + (foodQty(f) !== 1 ? ' ×' + foodQty(f) : '');
         const bf = r.breakfast_foods && r.breakfast_foods.length
-            ? r.breakfast_foods.map(f => f.name || '').filter(Boolean).join(', ')
+            ? r.breakfast_foods.map(foodLabel).filter(Boolean).join(', ')
             : (r.breakfast_food || '');
         const lf = r.lunch_foods && r.lunch_foods.length
-            ? r.lunch_foods.map(f => f.name || '').filter(Boolean).join(', ')
+            ? r.lunch_foods.map(foodLabel).filter(Boolean).join(', ')
             : (r.lunch_food || '');
         const df = r.dinner_foods && r.dinner_foods.length
-            ? r.dinner_foods.map(f => f.name || '').filter(Boolean).join(', ')
+            ? r.dinner_foods.map(foodLabel).filter(Boolean).join(', ')
             : (r.dinner_food || '');
 
         const totalIntake = ((r.breakfast_calories || 0) + (r.lunch_calories || 0) + (r.dinner_calories || 0));

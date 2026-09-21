@@ -22,6 +22,8 @@ A7~A9 finishing 第三态、收尾期间启动被拒（双 trader 竞态已挡�
 A10~A11 线程退出后可正常启动；未运行时停止只提示不报错
 B1~B6 自愈：开关关闭不动作但发告警、开关打开+期望运行才拉起、来源记
        auto_resume、拉起结果留痕、上次是停止状态则绝不自作主张下单
+B12   显式传 delay_seconds 而不传 boot_info = 调用方自己拿定主意，
+       不走启动归因策略（归因策略的覆盖在 _smoke_boot_resume.py）
 
 何时重跑：改 crypto/task/scheduler.py 的 start/stop/get_trading_status/
 schedule_auto_resume 任一逻辑，或改 trading_runtime_repo.py。
@@ -103,11 +105,14 @@ class FakeRepo:
 sched_mod._runtime_repo = FakeRepo
 
 # 邮件通知打桩：冒烟阶段绝不能往真实收件箱发信
+# （_notify_* 现在都是实例方法，桩用普通函数接 self；why 为拦下原因）
 NOTIFY = []
-sched_mod.TaskScheduler._notify_auto_resume_result = staticmethod(
-    lambda ok, msg, account, rt: NOTIFY.append(('result', ok, msg)))
-sched_mod.TaskScheduler._notify_auto_resume_skipped = staticmethod(
-    lambda rt: NOTIFY.append(('skipped', rt.get('account'))))
+sched_mod.TaskScheduler._notify_auto_resume_result = \
+    lambda self, ok, msg, account, rt: NOTIFY.append(('result', ok, msg))
+sched_mod.TaskScheduler._notify_auto_resume_skipped = \
+    lambda self, rt, why='': NOTIFY.append(('skipped', rt.get('account'), why))
+sched_mod.TaskScheduler._notify_resume_pending = \
+    lambda self, plan, delay: NOTIFY.append(('pending', plan.get('reason'), delay))
 
 ts = sched_mod.TaskScheduler()
 
@@ -149,6 +154,8 @@ time.sleep(0.6)
 check("B1 开关关闭时不自动拉起", not ts._trading_running)
 check("B5 开关关闭但本应在跑 → 发告警（不再静默停摆）",
       any(c[0] == 'skipped' and c[1] == 'acctE' for c in NOTIFY), NOTIFY)
+check("B12 不传 boot_info 即走老语义（不做归因策略，无拦下原因）",
+      any(c[0] == 'skipped' and c[2] == '' for c in NOTIFY), NOTIFY)
 
 RT.update({"desired_running": True, "account": "acctF", "auto_resume": True})
 ts.schedule_auto_resume(delay_seconds=0.1)

@@ -39,6 +39,18 @@ except Exception as _rt_err:  # pragma: no cover - 仅包外独立运行时报
     logging.getLogger(__name__).warning(
         f'[TaskScheduler] trading_runtime_repo 不可用，重启自动拉起功能关闭: {_rt_err}')
 
+# 启动归因与自愈策略（为什么重启 / 该不该现在起 / 要等多久）。同样只影响
+# 「重启自愈」这一个能力，取不到时退化成“不自动拉起”，不会拖垮调度器启动。
+try:
+    from .. import process_lifecycle as _lifecycle
+except Exception as _lc_err:  # pragma: no cover - 包外裸模块身份时的兼容分支
+    try:
+        import process_lifecycle as _lifecycle
+    except Exception:
+        _lifecycle = None
+        logging.getLogger(__name__).warning(
+            f'[TaskScheduler] process_lifecycle 不可用，重启自愈按保守处理: {_lc_err}')
+
 
 class TaskScheduler:
     """定时任务调度管理器"""
@@ -70,6 +82,10 @@ class TaskScheduler:
         self._stop_join_seconds = float(os.environ.get('TRADING_STOP_JOIN_SECONDS', 15) or 15)
         # 重启自动拉起（只允许一个后台尝试线程）
         self._auto_resume_thread = None
+        # 本次启动的归因结果与自愈计划（由 app.py 启动尾声传入，
+        # 邮件与页面展示用；没传入时为 None = 不走归因策略）
+        self._boot_info = None
+        self._resume_plan = None
 
     def start(self):
         """启动调度器（幂等，多次调用只启动一次）"""
@@ -320,9 +336,53 @@ class TaskScheduler:
             'stop_join_seconds': self._stop_join_seconds,
         }
 
+    def get_loop_liveness(self):
+        """读实盘交易主循环存活状态（供 alert_monitor liveness 旁路检测，只读、绝不抛）。
+
+        进程心跳（memory_history）只能证明"进程还活着"，证明不了交易循环还在跑圈：
+        主循环可能在某一批次内卡死（网络挂起/锁死锁），或线程被致命异常悄悄带走。
+        主循环每轮开始时把 self.last_execution['batch'] 刷成当前时间（trend_range_trader
+        第 2679 行），一旦停滞或线程死亡，该时间戳便不再推进 → (now - ts) 持续增长可被检出。
+
+        返回 {running, thread_alive, last_batch_ts, interval_seconds}：
+        - running：调度器侧"用户希望它在跑"的标志（停止后不再判停滞）；
+        - thread_alive：交易线程是否存活，标志为真而线程为假 = 意外死亡；
+        - last_batch_ts：最近一轮批次起始时间戳，None = 尚未跑出可判定的轮次；
+        - interval_seconds：主循环执行间隔（用于把停滞阈值按轮次倍数放大）。
+        """
+        try:
+            thread = self._trading_thread
+            thread_alive = bool(thread and thread.is_alive())
+            trader = self._trading_scheduler
+            last_batch_ts = None
+            interval_seconds = 60
+            if trader is not None:
+                try:
+                    last_batch_ts = (getattr(trader, 'last_execution', {}) or {}).get('batch') or None
+                except Exception:
+                    last_batch_ts = None
+                interval_seconds = getattr(trader, '_default_interval', 60) or 60
+            return {
+                'running': bool(self._trading_running),
+                'thread_alive': thread_alive,
+                'last_batch_ts': last_batch_ts,
+                'interval_seconds': int(interval_seconds),
+            }
+        except Exception as e:
+            logger.warning(f'[TaskScheduler] 读取主循环存活状态失败: {e}')
+            return {'running': False, 'thread_alive': False,
+                    'last_batch_ts': None, 'interval_seconds': 60}
+
     def get_runtime_status(self):
-        """读「期望运行状态 + 自动拉起开关」（只在页面加载/切换时调，不在轮询热路径）"""
-        return self._runtime_snapshot()
+        """读「期望运行状态 + 自动拉起开关 + 本次启动归因」（页面加载/切换时调，不在轮询热路径）
+
+        boot / resume_plan 是排障关键信息：用户看到“重启后实盘没起来”，
+        第一句必然是“它到底知不知道自己是为什么重启的”。
+        """
+        data = self._runtime_snapshot()
+        data['boot'] = self._boot_info
+        data['resume_plan'] = self._resume_plan
+        return data
 
     # ---------------------------------------------------------------
     # 重启自愈：记录期望状态 + 按开关自动拉起
@@ -356,20 +416,67 @@ class TaskScheduler:
         logger.info(f'[TaskScheduler] 重启自动拉起实盘开关已{"打开" if rt.get("auto_resume") else "关闭"}')
         return rt
 
-    def schedule_auto_resume(self, delay_seconds: float = 20.0):
+    def schedule_auto_resume(self, delay_seconds=None, boot_info=None):
         """进程启动后延时尝试自动拉起（幂等，多次调用只起一个线程）
 
-        延时是为了等 database.warmup_async 把库探完，避免重启初期抢不到连接。
+        两种调用方式必须分清：
+        - 真实启动路径（app.py）：只传 boot_info（process_lifecycle 的归因结果），
+          不传 delay_seconds。起不起、等多久、要不要先发预告信，全部交给
+          ``plan_resume`` 按「夜间直接接回 / 白天留 10 分钟否决窗 / 重启风暴熔断」定；
+        - 显式传 delay_seconds 而不传 boot_info：视为调用方自己拿定主意
+          （冒烟脚本、事后人工补一次拉起尝试），跳过归因策略直接按给的延时试。
+
+        延时本身是为了等 database.warmup_async 把库探完，避免重启初期抢不到连接。
         线程本身 daemon，失败不重试：下一次重启就是下一次机会。
         """
         if self._auto_resume_thread is not None and self._auto_resume_thread.is_alive():
             return
+        self._boot_info = boot_info if isinstance(boot_info, dict) else None
+        plan = self._plan_boot_resume(self._boot_info) if self._boot_info else None
+        self._resume_plan = plan
+        if delay_seconds is None:
+            delay_seconds = float(plan['delay_seconds']) if plan else 20.0
+        if plan is not None:
+            logger.info(
+                f"[TaskScheduler] 自愈计划[{plan.get('reason')}] "
+                f"{'允许' if plan.get('allowed') else '拒绝'} / "
+                f"延时 {delay_seconds:g}s / 窗口 {plan.get('window')} / {plan.get('why')}")
         self._auto_resume_thread = threading.Thread(
             target=self._auto_resume_worker,
-            args=(delay_seconds,), daemon=True, name='TradingAutoResume')
+            args=(delay_seconds, plan), daemon=True, name='TradingAutoResume')
         self._auto_resume_thread.start()
 
-    def _auto_resume_worker(self, delay_seconds: float):
+    @staticmethod
+    def _plan_boot_resume(boot_info):
+        """把归因结果换成自愈计划；任何一层坏了都回到「不自动拉起」这个保守值"""
+        fallback = {'reason': (boot_info or {}).get('reason'), 'allowed': False,
+                    'delay_seconds': 0.0, 'pre_notify': False, 'silent': False,
+                    'window': None, 'selfheal_count': 0,
+                    'why': '归因/策略层不可用，按保守处理：不自动拉起', 'resume_at': ''}
+        if _lifecycle is None:
+            logger.warning('[TaskScheduler] process_lifecycle 不可用，本次不自动拉起')
+            return fallback
+        try:
+            return _lifecycle.plan_resume(boot_info)
+        except Exception as e:
+            logger.warning(f'[TaskScheduler] 自愈计划计算失败，按保守处理: {e}')
+            return fallback
+
+    def _auto_resume_worker(self, delay_seconds: float, plan: dict = None):
+        # 归因结论直接拦下的（初次上线 / 熔断 / 原因未知）在这里早退。
+        # 但“本应在跑却没起”仍须发信，否则又变成静默停摆。
+        if plan is not None and not plan.get('allowed', True):
+            rt = self._runtime_snapshot()
+            why = plan.get('why', '')
+            logger.warning(f'[TaskScheduler] 重启自愈按策略跳过：{why}')
+            if rt.get('desired_running') and not plan.get('silent'):
+                self._notify_auto_resume_skipped(rt, why)
+            return
+
+        if plan is not None and plan.get('pre_notify') and delay_seconds > 0:
+            # 白天窗口：先给一封「N 分钟后自动拉起」的预告，留出人工干预时间
+            self._notify_resume_pending(plan, delay_seconds)
+
         try:
             if delay_seconds > 0:
                 threading.Event().wait(delay_seconds)
@@ -377,7 +484,9 @@ class TaskScheduler:
             pass
 
         if self._trading_running:
-            return  # 已经被人工起过了，不重复起
+            return  # 已经被人工起过了，不重复起（预告窗内你点了启动，就在这里生效）
+        # 期望状态在睡完之后才读：这段时间里你去页面点「停止交易」会清掉
+        # desired_running，本次拉起自然作废 —— 这就是现成的人工否决通道。
         rt = self._runtime_snapshot()
         if not rt.get('auto_resume'):
             if rt.get('desired_running'):
@@ -394,19 +503,64 @@ class TaskScheduler:
             logger.info(f'[TaskScheduler] 自动拉起成功: {msg}')
         else:
             logger.error(f'[TaskScheduler] 自动拉起失败: {msg}')
+        # 每日主动归零属计划内重启，成功接回不再发信（否则天天一封噪声）
+        if ok and plan is not None and plan.get('silent'):
+            return
         self._notify_auto_resume_result(ok, msg, account, rt)
 
-    @staticmethod
-    def _notify_auto_resume_skipped(rt):
-        """开关未打开但实盘本应在跑：必须发信，否则又是静默停摆"""
-        TaskScheduler._notify_auto_resume_result(
+    def _notify_auto_resume_skipped(self, rt, why=''):
+        """开关未打开 / 被策略拦下，但实盘本应在跑：必须发信，否则又是静默停摆"""
+        self._notify_auto_resume_result(
             False,
-            '自动拉起开关未打开，本次重启后实盘保持停止，请手动点击「启动交易」',
+            why or '自动拉起开关未打开，本次重启后实盘保持停止，请手动点击「启动交易」',
             rt.get('account'), rt)
 
-    @staticmethod
-    def _notify_auto_resume_result(ok: bool, msg: str, account, rt: dict):
-        """重启自愈结果邮件（成/败都发）；发不出去只记日志，不影响交易线程"""
+    def _format_boot_line(self):
+        """把本次启动归因压成一行（邮件正文用）。没有归因信息时返回空字串"""
+        info = self._boot_info or {}
+        if not info:
+            return ''
+        line = ' / '.join([str(p) for p in (info.get('reason'), info.get('label')) if p])
+        if info.get('detail'):
+            line += '：' + str(info['detail'])
+        plan = self._resume_plan or {}
+        cnt = plan.get('selfheal_count')
+        if cnt:
+            line += f'（窗口内自愈类重启已 {int(cnt)} 次）'
+        if info.get('boot_seq'):
+            line += f"  [boot #{info['boot_seq']}]"
+        return line
+
+    def _notify_resume_pending(self, plan, delay_seconds):
+        """白天窗口的预告信：告诉你「多久之后会自动开始下单」，留出人工否决时间
+
+        为什么不等到结果再发：白天延时的意义就是给你一段时间先看看持仓和挂单，
+        事后再告知就成了“通知你已经下单了”。
+        """
+        try:
+            rt = self._runtime_snapshot()
+            mins = max(1, int(round(float(delay_seconds) / 60.0)))
+            resume_at = str(plan.get('resume_at') or '')
+            when = resume_at or (f'约 {mins} 分钟后')
+            boot = self._format_boot_line()
+            body = ('事件: 进程重启后，实盘调度器计划自动接回\n'
+                    f'预计执行时刻: {when}\n'
+                    + (f'启动归因: {boot}\n' if boot else '')
+                    + f'策略说明: {plan.get("why", "")}\n'
+                    f'账号: {rt.get("account") or "默认"}\n'
+                    f'期望运行: {rt.get("desired_running")}  '
+                    f'自动拉起开关: {rt.get("auto_resume")}\n\n'
+                    f'这 {mins} 分钟是核实时间：\n'
+                    '  • 现在就可以打开 /task 页面核对持仓与挂单，也可以直接点'
+                    '「启动交易」—— 人工启动优先，自动拉起会自行让位；\n'
+                    '  • 不想让它起来，就点「停止交易」（会清除期望运行标记，'
+                    '本次拉起随即作废）。')
+            self._send_resume_mail(f'⏳ 实盘将于 {when} 自动接回 - 请核实', body, '预告')
+        except Exception as e:
+            logger.warning(f'[TaskScheduler] 自愈预告邮件准备失败: {e}')
+
+    def _send_resume_mail(self, subject: str, content: str, label: str):
+        """自愈相关邮件的统一出口；发不出去只记日志，绝不拖挂交易线程"""
         try:
             try:
                 from ..notification.email_tool import EmailTool
@@ -418,21 +572,36 @@ class TaskScheduler:
                     pass
             except ImportError:  # 包外独立运行时的兼容分支
                 from notification.email_tool import EmailTool
-                from config.email_config import get_admin_email
-                to_email = get_admin_email()
-            tool = EmailTool()
-            body = ('事件: 进程重启后的实盘自愈尝试\n'
-                    f'结果: {"已自动拉起" if ok else "未拉起/拉起失败"}\n'
-                    f'说明: {msg}\n'
-                    f'账号: {account or "默认"}\n'
-                    f'期望运行: {rt.get("desired_running")}  自动拉起开关: {rt.get("auto_resume")}\n'
-                    f'上次状态变更: {rt.get("last_event")} @ {rt.get("updated_at")}\n\n'
-                    '请确认持仓与挂单是否符合预期；如需停止，在页面点「停止交易」即可（会同时清除期望运行标记）。')
-            tool.send_system_notification(
-                to_email=to_email, content=body,
-                subject=f'[实盘自愈] {"已自动拉起" if ok else "未自动拉起"} - 请核实')
+                try:
+                    from config.email_config import get_admin_email
+                    to_email = get_admin_email()
+                except Exception:
+                    to_email = None
+            EmailTool().send_system_notification(
+                to_email=to_email, content=content, subject=subject)
+            logger.info(f'[TaskScheduler] 自愈{label}邮件已发出: {subject}')
         except Exception as e:
-            logger.warning(f'[TaskScheduler] 自愈结果邮件发送失败: {e}')
+            logger.warning(f'[TaskScheduler] 自愈{label}邮件发送失败: {e}')
+
+    def _notify_auto_resume_result(self, ok: bool, msg: str, account, rt: dict):
+        """重启自愈结果邮件（成/败都发）
+
+        正文一定带上「这次是怎么起来的」：没有归因，收信人无法判断该不该担心 ——
+        同样是不拉起，初次上线很正常，被 OOM 连斩三次就是事故。
+        """
+        boot = self._format_boot_line()
+        body = ('事件: 进程重启后的实盘自愈尝试\n'
+                f'结果: {"已自动拉起" if ok else "未拉起/拉起失败"}\n'
+                + (f'启动归因: {boot}\n' if boot else '')
+                + f'说明: {msg}\n'
+                f'账号: {account or "默认"}\n'
+                f'期望运行: {rt.get("desired_running")}  '
+                f'自动拉起开关: {rt.get("auto_resume")}\n'
+                f'上次状态变更: {rt.get("last_event")} @ {rt.get("updated_at")}\n\n'
+                '请确认持仓与挂单是否符合预期；如需停止，在页面点「停止交易」'
+                '即可（会同时清除期望运行标记）。')
+        self._send_resume_mail(
+            f'[实盘自愈] {"已自动拉起" if ok else "未自动拉起"} - 请核实', body, '结果')
 
 
     def force_close_positions(self, close_type='all'):
@@ -547,3 +716,30 @@ def register_default_jobs():
             logger.info('[TaskScheduler] 分析纪律已关闭，巡检任务未注册')
     except Exception as e:
         logger.warning(f'[TaskScheduler] 分析纪律巡检任务注册失败（不影响其他任务）: {e}')
+
+    # 注册每日内存主动归零重启（默认 04:03）：把“被动涨到 kill 阈值才撞线”
+    # 换成“低波动窗口主动清零”。它自己会按三个条件拒绝执行（水位太低 /
+    # 策略引擎忙 / 开关没开但实盘本应在跑），所以关掉自动拉起开关时不会
+    # 把实盘重启成一个静默停摆窗口。
+    try:
+        from .memory_daily_reset import register_daily_reset_job
+        job_id, at_text = register_daily_reset_job()
+        if job_id:
+            logger.info(f'[TaskScheduler] 已注册每日内存主动归零重启任务（{at_text}）')
+        else:
+            logger.info(f'[TaskScheduler] 每日内存归零未注册（{at_text}）')
+    except Exception as e:
+        logger.warning(f'[TaskScheduler] 每日内存归零任务注册失败（不影响其他任务）: {e}')
+
+    # 注册盘感影子预测任务（整点批跑 + 10 分钟满窗结算）。双闸门：
+    # 未配 CRYPTO_LLM_* 或 CRYPTO_INSTINCT_AUTO=0 时不注册（空转不如缺席）；
+    # 只写 instinct_* 表，永不触达交易执行链路。
+    try:
+        from ..instinct.predict_service import register_instinct_jobs
+        job_id, note = register_instinct_jobs()
+        if job_id:
+            logger.info(f'[TaskScheduler] 已注册盘感影子预测任务（{note}）')
+        else:
+            logger.info(f'[TaskScheduler] 盘感影子预测未注册（{note}）')
+    except Exception as e:
+        logger.warning(f'[TaskScheduler] 盘感影子预测任务注册失败（不影响其他任务）: {e}')

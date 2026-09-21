@@ -37,7 +37,7 @@ import logging
 import datetime
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, func, case
 
 from .models import TaskAnalysisRecord, AnalysisReminderLog, PlanSlot, PlanCard
 from . import config_store_repo
@@ -101,10 +101,12 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return merged
 
 
-def load_config() -> dict:
-    """读取纪律配置：带 TTL 缓存的 kv_store 优先，无数据/DB 不可用时用默认值"""
+def load_config(session=None) -> dict:
+    """读取纪律配置；可复用请求会话，不跨请求缓存闸门配置。"""
     try:
-        saved = config_store_repo.load_json_config_cached(KEY_DISCIPLINE_CONFIG)
+        saved = (config_store_repo.load_json_config(session, KEY_DISCIPLINE_CONFIG)
+                 if session is not None else
+                 config_store_repo.load_json_config_cached(KEY_DISCIPLINE_CONFIG))
         return _deep_merge(DEFAULT_DISCIPLINE_CONFIG, saved or {})
     except Exception as e:
         logger.warning(f'[Discipline] 读取配置失败，使用默认配置: {e}')
@@ -118,12 +120,15 @@ def save_config(cfg: dict):
         config_store_repo.save_json_config(s, KEY_DISCIPLINE_CONFIG, cfg)
 
 
-def load_state() -> dict:
-    """读取运行时状态（当前仅一次性豁免）；异常返回空"""
+def load_state(session=None) -> dict:
+    """读取运行时状态；可复用请求会话，异常返回空。"""
     try:
-        from .database import session_scope
-        with session_scope() as s:
-            state = config_store_repo.load_json_config(s, KEY_DISCIPLINE_STATE)
+        if session is not None:
+            state = config_store_repo.load_json_config(session, KEY_DISCIPLINE_STATE)
+        else:
+            from .database import session_scope
+            with session_scope() as s:
+                state = config_store_repo.load_json_config(s, KEY_DISCIPLINE_STATE)
         return state if isinstance(state, dict) else {}
     except Exception as e:
         logger.warning(f'[Discipline] 读取运行时状态失败: {e}')
@@ -157,9 +162,10 @@ def set_exempt(hours: float) -> str:
     return until_str if hours > 0 else ''
 
 
-def exempt_until(cfg: dict = None) -> Optional[datetime.datetime]:
+def exempt_until(cfg: dict = None, state=None) -> Optional[datetime.datetime]:
     """当前豁免截止时刻；未豁免/已过期返回 None"""
-    raw = str((load_state() or {}).get('exempt_until') or '').strip()
+    state = load_state() if state is None else state
+    raw = str(state.get('exempt_until') or '').strip()
     if not raw:
         return None
     try:
@@ -231,9 +237,10 @@ def end_maintenance() -> bool:
     return True
 
 
-def maintenance_until() -> Optional[datetime.datetime]:
+def maintenance_until(state=None) -> Optional[datetime.datetime]:
     """维护截止时刻；未在维护/已过期返回 None（过期即自动失效，不依赖清理）"""
-    raw = str((load_state() or {}).get('maintenance_until') or '').strip()
+    state = load_state() if state is None else state
+    raw = str(state.get('maintenance_until') or '').strip()
     if not raw:
         return None
     try:
@@ -243,9 +250,10 @@ def maintenance_until() -> Optional[datetime.datetime]:
     return until if until > datetime.datetime.now() else None
 
 
-def maintenance_reason() -> str:
+def maintenance_reason(state=None) -> str:
     """进入维护时留下的原因（只用于日志与状态展示）"""
-    return str((load_state() or {}).get('maintenance_reason') or '').strip()
+    state = load_state() if state is None else state
+    return str(state.get('maintenance_reason') or '').strip()
 
 
 # =============================================================================
@@ -369,14 +377,23 @@ def classify_source(ts_str: str, grace_minutes: int,
     return 'live' if abs((now - ts).total_seconds()) <= max(0, int(grace_minutes)) * 60 else 'backfill'
 
 
-def tracked_currencies() -> List[Dict]:
+def tracked_currencies(session=None) -> List[Dict]:
     """交易配置里的 currencies 数组原样（带周期/算法/取价/BOLL 等策略参数）。
 
     提醒邮件要算“当前策略行情”就得拿到这些参数——只用 instId 会退成默认
     5m/4H，与实盘不同源，发出来的方向也就不能当作参考。读取失败返回空列表。
     """
     try:
-        cfg = config_store_repo.load_json_config_cached(config_store_repo.KEY_STRATEGY_CONFIG)
+        if session is None:
+            cfg = config_store_repo.load_live_strategy_config_cached()
+        else:
+            runtime = config_store_repo.load_json_config(
+                session, config_store_repo.KEY_TRADING_RUNTIME) or {}
+            account = runtime.get('account')
+            cfg = config_store_repo.load_json_config(
+                session, config_store_repo.strategy_config_key(account))
+            if account and cfg is None:
+                cfg = config_store_repo.load_json_config(session, config_store_repo.KEY_STRATEGY_CONFIG)
         return [c for c in (cfg or {}).get('currencies', [])
                 if isinstance(c, dict) and str(c.get('instId') or '').strip()]
     except Exception as e:
@@ -384,9 +401,10 @@ def tracked_currencies() -> List[Dict]:
         return []
 
 
-def tracked_inst_ids() -> List[str]:
+def tracked_inst_ids(session=None) -> List[str]:
     """交易配置中当前跟踪的币种（require_cover_tracked 的覆盖基准）"""
-    return [str(c.get('instId') or '').strip() for c in tracked_currencies()]
+    currencies = tracked_currencies() if session is None else tracked_currencies(session)
+    return [str(c.get('instId') or '').strip() for c in currencies]
 
 
 # =============================================================================
@@ -403,7 +421,7 @@ def slot_records(session, slot: str) -> List[dict]:
     return [r.to_dict() for r in rows]
 
 
-def evaluate_slot(session, slot: str, cfg: dict = None) -> dict:
+def evaluate_slot(session, slot: str, cfg: dict = None, tracked=None) -> dict:
     """判定单个小时槽是否合格。
 
     返回 dict：
@@ -416,7 +434,7 @@ def evaluate_slot(session, slot: str, cfg: dict = None) -> dict:
     active = is_slot_active(slot, cfg)
     records = slot_records(session, slot) if slot else []
     covered = sorted({str(r.get('inst_id') or '') for r in records if r.get('inst_id')})
-    tracked = tracked_inst_ids() if cfg.get('require_cover_tracked') else []
+    tracked = (tracked_inst_ids() if tracked is None else tracked) if cfg.get('require_cover_tracked') else []
     missing_coins = [c for c in tracked if c not in set(covered)]
 
     count_ok = len(records) >= required
@@ -514,14 +532,15 @@ def parse_dt(text: str, default: datetime.datetime = None) -> datetime.datetime:
 def build_status(session, cfg: dict = None, now: datetime.datetime = None) -> dict:
     """构建 discipline/status 载荷：当小时进度 + 今日合规 + streak + 打扰开关。
 
-    只跑 2~3 条索引查询（当小时槽明细 / 今日台账 / streak 日聚合），
-    配合 load_json_config_cached 的 TTL 缓存，60s 轮询成本可忽略。
+    配置/状态/跟踪币种每请求仅取一次，当小时评估与今日汇总共用。
     """
-    cfg = cfg if cfg is not None else load_config()
+    cfg = cfg if cfg is not None else load_config(session)
+    state = load_state(session)
+    tracked = tracked_inst_ids(session)
     now = now or datetime.datetime.now()
     slot = hour_slot_of(now)
-    ev = evaluate_slot(session, slot, cfg)
-    until = exempt_until(cfg)
+    ev = evaluate_slot(session, slot, cfg, tracked=tracked)
+    until = exempt_until(cfg, state=state)
 
     elapsed = int((now - slot_start(slot)).total_seconds() // 60)
     grace = max(0, int(cfg.get('grace_minutes', 15) or 0))
@@ -534,7 +553,7 @@ def build_status(session, cfg: dict = None, now: datetime.datetime = None) -> di
                   and until is None and elapsed >= banner_after)
 
     today = now.strftime('%Y-%m-%d')
-    mu = maintenance_until()
+    mu = maintenance_until(state=state)
     return {
         'enabled': bool(cfg.get('enabled', True)),
         'strict_mode': str(cfg.get('strict_mode', 'strict')),
@@ -561,12 +580,12 @@ def build_status(session, cfg: dict = None, now: datetime.datetime = None) -> di
         # 维护暂停期间不判定也不提醒：得把这个状态一并给出，否则前端
         # 只会看到一个不动的缺口，容易被当成漏判。
         'maintenance_until': mu.strftime(_TS_FMT) if mu else '',
-        'maintenance_reason': maintenance_reason() if mu else '',
-        'today': today_summary(session, today, cfg, now),
+        'maintenance_reason': maintenance_reason(state=state) if mu else '',
+        'today': today_summary(session, today, cfg, now, current_evaluation=ev),
         'streak': streak_summary(session, today),
         'browser': {k: browser_cfg.get(k) for k in
                     ('banner', 'sound', 'desktop_notify', 'poll_seconds')},
-        'tracked': tracked_inst_ids(),
+        'tracked': tracked,
     }
 
 
@@ -579,7 +598,7 @@ def _log_rows_by_date(session, date_str: str) -> Dict[str, dict]:
 
 
 def today_summary(session, date_str: str, cfg: dict,
-                  now: datetime.datetime = None) -> dict:
+                  now: datetime.datetime = None, current_evaluation=None) -> dict:
     """今日合规概览：已完结槽取台账，当前槽实时判定（台账可能还没写到）。
 
     台账未覆盖的历史槽一律跳过不计入分母：功能上线首日、巡检停机期间
@@ -598,7 +617,10 @@ def today_summary(session, date_str: str, cfg: dict,
         if row is None:
             # 台账未覆盖：当前槽实时判定（还在进行中，用户看得到才有用），历史槽跳过
             if s == cur_slot:
-                status = ST_SATISFIED if evaluate_slot(session, s, cfg)['ok'] else ST_MISSING
+                ev = current_evaluation
+                if ev is None or ev.get('hour_slot') != s:
+                    ev = evaluate_slot(session, s, cfg)
+                status = ST_SATISFIED if ev['ok'] else ST_MISSING
             else:
                 pending_n += 1
                 continue
@@ -631,11 +653,13 @@ def today_summary(session, date_str: str, cfg: dict,
 def streak_summary(session, today: str) -> dict:
     """连续全合规天数（当日无 missing 即计入；今日未过完则从昨天起算）"""
     rows = session.execute(
-        select(AnalysisReminderLog.stat_date, AnalysisReminderLog.status)
+        select(AnalysisReminderLog.stat_date,
+               func.max(case((AnalysisReminderLog.status == ST_MISSING, 1), else_=0)))
+        .group_by(AnalysisReminderLog.stat_date)
         .order_by(AnalysisReminderLog.stat_date.asc())
     ).all()
-    bad_days = {d for d, st in rows if st == ST_MISSING}
-    all_days = sorted({d for d, _ in rows})
+    bad_days = {d for d, missing in rows if missing}
+    all_days = [d for d, _ in rows]
 
     def _prev(day_str):
         return (datetime.datetime.strptime(day_str, '%Y-%m-%d')
@@ -676,13 +700,15 @@ def _attribution(session, start_date: str) -> dict:
         .distinct()).all() if r[0]}
 
     rows = session.execute(
-        select(PlanSlot, PlanCard.type)
+        select(PlanSlot.filled_at, PlanSlot.hit, PlanSlot.prediction,
+               PlanSlot.actual, PlanSlot.analysis_ids)
         .join(PlanCard, PlanSlot.card_id == PlanCard.id)
-        .where(PlanCard.type == 'trade', PlanSlot.filled == True)   # noqa: E712
+        .where(PlanCard.type == 'trade', PlanSlot.filled == True,   # noqa: E712
+               PlanSlot.filled_at >= start_date)
     ).all()
 
     buckets = {'with': {'total': 0, 'hit': 0}, 'without': {'total': 0, 'hit': 0}}
-    for slot, _ctype in rows:
+    for slot in rows:
         fa = str(slot.filled_at or '')
         if not fa or fa[:10] < start_date:
             continue
@@ -762,12 +788,13 @@ def build_board(session, days: int = 30, cfg: dict = None) -> dict:
 
     # 补记率（诚实指标）：统计区间内 backfill 记录占比
     start_slot = f'{start_date} 00'
-    rec_rows = session.execute(
-        select(TaskAnalysisRecord.source)
+    rec_total, rec_backfill = session.execute(
+        select(func.count(), func.coalesce(func.sum(
+            case((TaskAnalysisRecord.source == 'backfill', 1), else_=0)), 0))
+        .select_from(TaskAnalysisRecord)
         .where(TaskAnalysisRecord.hour_slot >= start_slot)
-    ).all()
-    rec_total = len(rec_rows)
-    rec_backfill = sum(1 for r in rec_rows if (r[0] or 'live') == 'backfill')
+    ).one()
+    rec_total, rec_backfill = int(rec_total), int(rec_backfill)
 
     judged_total = tot_ok + tot_miss
     return {

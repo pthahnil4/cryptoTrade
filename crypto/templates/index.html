@@ -12,6 +12,11 @@
         <header>
             <h1>MACD & ADX Pro3 策略监控台</h1>
             <p class="subtitle">前后端分离架构 | 实时数据刷新</p>
+            <!-- 手册与币种导览入口：只挂在监控台页面，不占全局导航栏 -->
+            <div style="margin-top:10px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+                <a href="/monitor-guide" class="m-btn m-btn-secondary m-btn-sm" title="监控台全部按钮与功能模块的分页操作手册">📚 操作手册</a>
+                <a href="/top-coins" class="m-btn m-btn-info m-btn-sm" title="市值前50固定币种实时行情与简介">🪙 Top50币种导览</a>
+            </div>
         </header>
 
         <main>
@@ -27,6 +32,9 @@
                         <button id="select-all-starred-btn" class="m-btn m-btn-warning m-btn-xs m-btn-outline m-btn-pill" title="选中所有已星标币种">★ 全选星标</button>
                         <button id="reset-starred-btn" class="m-btn m-btn-warning m-btn-xs m-btn-outline m-btn-pill" title="清除所有星标">☆ 重置星标</button>
                         <button id="clear-floating-btn" class="m-btn m-btn-danger m-btn-xs m-btn-outline m-btn-pill" title="一键移除所有浮动币种">🗑️ 清空浮动币种</button>
+                        <button id="remove-fixed-btn" class="m-btn m-btn-danger m-btn-xs m-btn-outline m-btn-pill" title="将选中的固定币种移出监控，并从币种库(CSV)彻底删除（清理已下架币种，不会被同步带回）" disabled>➖ 移除选中</button>
+                        <button id="promote-fixed-btn" class="m-btn m-btn-success m-btn-xs m-btn-outline m-btn-pill" title="将选中的浮动币种提升为固定币种（同时写入币种库，CSV同步不会丢弃）" disabled>⬆ 提升为固定</button>
+                        <button id="sync-csv-fixed-btn" class="m-btn m-btn-info m-btn-xs m-btn-outline m-btn-pill" title="以币种库(CSV)为准对齐固定列表（已移除的下架币不会复活，浮动币种保留不变）">📥 CSV同步固定</button>
                         <button id="save-coins-btn" class="m-btn m-btn-primary m-btn-sm">保存选择</button>
                     </div>
                 </div>
@@ -140,6 +148,7 @@
                     <span class="batch-title">📊 批量多周期趋势分析</span>
                     <div class="batch-header-btns">
                         <button id="batch-star-checked-btn" class="m-btn m-btn-warning m-btn-sm" title="将勾选的币种设为星标">⭐ 勾选星标</button>
+                        <button id="toggle-indicators-btn" class="m-btn m-btn-info m-btn-sm" title="显示/隐藏 ADX、ATR、SAR、ER 等指标列">🙈 隐藏指标</button>
                         <button id="collapse-indicators-btn" class="m-btn m-btn-secondary m-btn-sm" title="收缩/展开指标列">📋 简洁视图</button>
                         <button id="fullscreen-btn" class="m-btn m-btn-info m-btn-sm" title="全屏展开">⛶ 全屏</button>
                         <button id="batch-start-btn" class="m-btn m-btn-primary m-btn-sm">🚀 批量更新趋势数据</button>
@@ -152,6 +161,15 @@
                         <div id="progress-bar" class="progress-bar-inner" style="width:0%">0%</div>
                     </div>
                     <div id="progress-msg" class="progress-text">等待开始...</div>
+                </div>
+
+                <!-- 实时日志面板 -->
+                <div id="batch-log-panel" style="display:none;margin:8px 0;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:#f5f7fa;font-size:0.82rem;color:#555;">
+                        <span>📟 实时日志 <span id="batch-log-count"></span></span>
+                        <button id="batch-log-toggle" class="m-btn m-btn-sm m-btn-secondary" style="font-size:0.72rem;padding:2px 8px;">收起</button>
+                    </div>
+                    <div id="batch-log-body" style="max-height:220px;overflow-y:auto;padding:8px 12px;background:#1e1e1e;color:#d4d4d4;font-family:Consolas,'Courier New',monospace;font-size:0.78rem;line-height:1.5;white-space:pre-wrap;word-break:break-all;"></div>
                 </div>
 
                 <!-- 统计条 -->
@@ -257,6 +275,7 @@
                                 <th class="indicator-col" data-period="15m" data-col="ADX_15m" data-type="number">ADX_15m</th>
                                 <th class="indicator-col" data-period="15m" data-col="ATR_15m" data-type="number">ATR%_15m</th>
                                 <th class="indicator-col" data-period="15m" data-col="SAR_15m" data-type="number">SAR_15m</th>
+                                <th class="indicator-col" data-period="15m" data-col="ER_15m" data-type="number">ER_15m</th>
                                 <!-- 1H 周期 -->
                                 <th class="core-col" data-period="1H" data-col="1H_趋势" data-type="text">1H趋势</th>
                                 <th class="core-col" data-period="1H" data-col="1H_交易价格" data-type="number">1H交易价</th>
@@ -266,6 +285,7 @@
                                 <th class="indicator-col" data-period="1H" data-col="ADX_1H" data-type="number">ADX_1H</th>
                                 <th class="indicator-col" data-period="1H" data-col="ATR_1H" data-type="number">ATR%_1H</th>
                                 <th class="indicator-col" data-period="1H" data-col="SAR_1H" data-type="number">SAR_1H</th>
+                                <th class="indicator-col" data-period="1H" data-col="ER_1H" data-type="number">ER_1H</th>
                                 <!-- 4H 周期 -->
                                 <th class="core-col" data-period="4H" data-col="4H_趋势" data-type="text">4H趋势</th>
                                 <th class="core-col" data-period="4H" data-col="4H_交易价格" data-type="number">4H交易价</th>
@@ -275,6 +295,7 @@
                                 <th class="indicator-col" data-period="4H" data-col="ADX_4H" data-type="number">ADX_4H</th>
                                 <th class="indicator-col" data-period="4H" data-col="ATR_4H" data-type="number">ATR%_4H</th>
                                 <th class="indicator-col" data-period="4H" data-col="SAR_4H" data-type="number">SAR_4H</th>
+                                <th class="indicator-col" data-period="4H" data-col="ER_4H" data-type="number">ER_4H</th>
                                 <!-- 1D 周期 -->
                                 <th class="core-col" data-period="1D" data-col="1D_趋势" data-type="text">1D趋势</th>
                                 <th class="core-col" data-period="1D" data-col="1D_交易价格" data-type="number">1D交易价</th>
@@ -284,6 +305,7 @@
                                 <th class="indicator-col" data-period="1D" data-col="ADX_1D" data-type="number">ADX_1D</th>
                                 <th class="indicator-col" data-period="1D" data-col="ATR_1D" data-type="number">ATR%_1D</th>
                                 <th class="indicator-col" data-period="1D" data-col="SAR_1D" data-type="number">SAR_1D</th>
+                                <th class="indicator-col" data-period="1D" data-col="ER_1D" data-type="number">ER_1D</th>
                                 <!-- 时间列（次要，简洁视图隐藏） -->
                                 <th class="indicator-col" data-period="15m" data-col="15m_交易时间" data-type="text">15m时间</th>
                                 <th class="indicator-col" data-period="1H" data-col="1H_交易时间" data-type="text">1H时间</th>
@@ -299,6 +321,9 @@
             </section>
         </main>
     </div>
+
+    <!-- Toast 轻提示（复用共享 .task-toast 样式，供币种管理等操作反馈） -->
+    <div id="toast" class="task-toast"></div>
 
     <!-- 引入外部 JS 文件 -->
     <script src="{{ url_for('static', filename='js/mdialog.js') }}"></script>

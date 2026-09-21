@@ -20,6 +20,8 @@
     }
 
     let anaInited = false;
+    let _anaAccount = '';      // 分析功能当前绑定的交易账号（与「交易配置」页下拉同源，随每次进入同步）
+
     let _anaSnapshot = null;   // 当前快照数据（保存时随表单提交）
     let _anaRecords = [];      // 当前列表数据（编辑/删除时用 id 索引）
     let _anaSnapSeq = 0;       // 单币快照请求序号：丢弃过期响应，防快速连点竞态
@@ -109,25 +111,51 @@
         return '<span class="badge badge-watch">观望</span>';
     }
 
-    function initAnalysisTab() {
-        if (anaInited) { return; }
-        anaInited = true;
-        fetch('/api/task/config/trading').then(r => r.json()).then(res => {
+    // 快照请求的账号参数：与币种列表同源（交易配置页选了哪个账号，快照就按哪个账号读配置）。
+    // 独立页 /analysis 无账号下拉 → 传空 → 后端按运行/默认账号解析，仍与交易配置页默认口径一致。
+    function _anaAccountParam(sep) {
+        return _anaAccount ? (sep + 'account=' + encodeURIComponent(_anaAccount)) : '';
+    }
+
+    // 每次进入分析页/Tab 都重新拉取交易配置，同步币种下拉列表（在「交易配置」Tab
+    // 增删保存后回到这里不会残留旧币种）；主/筛选两个下拉都整体重建，避免重复累积，
+    // 并尽量保留上一次的选择。账号取「交易配置」页下拉当前值（task.html 有 #trading-account；
+    // 独立页无此控件则留空由后端按默认账号解析），确保两页币种完全一致。
+    function reloadAnalysisCoins() {
+        const acctSel = document.getElementById('trading-account');
+        _anaAccount = acctSel ? String(acctSel.value || '') : '';
+        fetch('/api/task/config/trading' + _anaAccountParam('?')).then(r => r.json()).then(res => {
             if (res.code !== 200) { showToast('加载币种列表失败: ' + res.message, 'error'); return; }
             const coins = (res.data.currencies || []).map(c => c.instId).filter(Boolean);
             const sel = document.getElementById('ana-inst');
             const fSel = document.getElementById('ana-filter-inst');
+            const cur = sel.value, curFilter = fSel.value;
+            // 主选择器：整体重建
             sel.innerHTML = '';
             coins.forEach(id => {
                 const opt = document.createElement('option');
                 opt.value = id; opt.textContent = id;
                 sel.appendChild(opt);
-                const fOpt = opt.cloneNode(true);
-                fSel.appendChild(fOpt);
             });
-            if (!coins.length) sel.innerHTML = '<option value="">无已配置币种</option>';
+            if (!coins.length) { sel.innerHTML = '<option value="">无已配置币种</option>'; }
+            // 筛选选择器：保留首项「全部」，清空其余后按最新币种重建，避免重复累积
+            Array.prototype.slice.call(fSel.options, 1).forEach(o => o.remove());
+            coins.forEach(id => {
+                const opt = document.createElement('option');
+                opt.value = id; opt.textContent = id;
+                fSel.appendChild(opt);
+            });
+            // 尽量保留上次选择（币种已被删除时自动回落到首项）
+            if (coins.indexOf(cur) >= 0) { sel.value = cur; }
+            if (curFilter === '' || coins.indexOf(curFilter) >= 0) { fSel.value = curFilter; }
         }).catch(e => showToast('加载币种列表失败: ' + e, 'error'));
-        loadAnalysisRecords();
+    }
+
+    function initAnalysisTab() {
+        const firstTime = !anaInited;
+        anaInited = true;
+        reloadAnalysisCoins();
+        if (firstTime) { loadAnalysisRecords(); }
     }
 
     function genAnalysisSnapshot() {
@@ -153,7 +181,7 @@
         _anaSnapAbort = ctrl;
         clearTimeout(_anaSnapTimer);
         _anaSnapTimer = setTimeout(function() { ctrl.abort(); }, 120000);
-        fetch('/api/task/analysis/snapshot?instId=' + encodeURIComponent(inst),
+        fetch('/api/task/analysis/snapshot?instId=' + encodeURIComponent(inst) + _anaAccountParam('&'),
               {signal: ctrl.signal})
             .then(r => r.json()).then(res => {
                 if (reqId !== _anaSnapSeq) { return; }   // 已有更新的请求，丢弃过期响应
@@ -262,6 +290,9 @@
     let _anaBatchSaveBusy = false; // 批量保存防重复提交
 
     function genBatchSnapshot(btn) {
+        // 触发时再同步一次账号（下拉可能已切换但尚未重新进入分析 Tab）
+        const _acctSel = document.getElementById('trading-account');
+        if (_acctSel) { _anaAccount = String(_acctSel.value || ''); }
         const box = document.getElementById('ana-batch-box');
         const msgEl = document.getElementById('ana-batch-msg');
         const reqId = ++_anaBatchSeq;
@@ -282,7 +313,7 @@
         _anaBatchAbort = ctrl;
         clearTimeout(_anaBatchTimer);
         _anaBatchTimer = setTimeout(function() { ctrl.abort(); }, 180000);
-        fetch('/api/task/analysis/snapshot_batch', {signal: ctrl.signal})
+        fetch('/api/task/analysis/snapshot_batch' + _anaAccountParam('?'), {signal: ctrl.signal})
             .then(r => r.json()).then(res => {
                 if (reqId !== _anaBatchSeq) { return; }   // 面板已关闭/已重新触发，丢弃过期响应
                 clearInterval(_anaBatchTick);
@@ -448,17 +479,17 @@
 
     function loadAnalysisRecords() {
         const tbody = document.getElementById('ana-tbody');
-        tbody.innerHTML = '<tr><td colspan="11" class="empty-state">加载中...（首次可能需回填复盘价格，稍慢）</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="12" class="empty-state">加载中...（首次可能需回填复盘价格，稍慢）</td></tr>';
         fetch('/api/task/analysis/records' + anaFilterParams()).then(r => r.json()).then(res => {
             if (res.code !== 200) {
-                tbody.innerHTML = '<tr><td colspan="11" class="empty-state">加载失败：' + escapeHtml(res.message || '') + '</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="12" class="empty-state">加载失败：' + escapeHtml(res.message || '') + '</td></tr>';
                 return;
             }
             _anaRecords = res.data.records || [];
             renderAnalysisStats(res.data.stats);
             renderAnalysisTable(_anaRecords);
         }).catch(e => {
-            tbody.innerHTML = '<tr><td colspan="11" class="empty-state">加载失败：' + escapeHtml(String(e)) + '</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="12" class="empty-state">加载失败：' + escapeHtml(String(e)) + '</td></tr>';
         });
     }
 
@@ -573,6 +604,7 @@
             (r.long_dir_prev && r.long_dir_prev !== r.long_dir
                 ? '<div style="font-size:0.7rem;color:#999;margin-top:2px">上时段 ' + (r.long_dir_prev === 'long' ? '多' : '空') + '</div>' : '');
         return '<tr data-id="' + r.id + '">' +
+            '<td style="text-align:center"><input type="checkbox" class="ana-row-pick" data-id="' + r.id + '" onclick="event.stopPropagation()"></td>' +
             '<td style="white-space:nowrap">' + escapeHtml(r.ts || '') + '</td>' +
             '<td>' + escapeHtml(r.inst_id || '') + '</td>' +
             '<td>' + anaFmtPrice(r.price) + '</td>' +
@@ -593,7 +625,7 @@
     function renderAnalysisTable(rows) {
         const tbody = document.getElementById('ana-tbody');
         if (!rows.length) {
-            tbody.innerHTML = '<tr><td colspan="11" class="empty-state">暂无分析记录，先生成快照并保存</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="12" class="empty-state">暂无分析记录，先生成快照并保存</td></tr>';
             return;
         }
         tbody.innerHTML = rows.map(anaRowHtml).join('');
@@ -691,7 +723,7 @@
         if (tr) { tr.remove(); }
         const tbody = document.getElementById('ana-tbody');
         if (!tbody.querySelector('tr[data-id]')) {
-            tbody.innerHTML = '<tr><td colspan="11" class="empty-state">暂无分析记录，先生成快照并保存</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="12" class="empty-state">暂无分析记录，先生成快照并保存</td></tr>';
         }
     }
 
@@ -749,6 +781,44 @@
         });
     }
 
+    /* ---- 批量删除：表头勾选框全选/反选，工具条按钮删除已勾选记录 ---- */
+    function toggleAllAnaRows(headCb) {
+        const pick = headCb ? headCb.checked : true;
+        document.querySelectorAll('#ana-tbody .ana-row-pick').forEach(c => { c.checked = pick; });
+    }
+
+    function batchDeleteAnalysisRecords(btn) {
+        const ids = Array.from(document.querySelectorAll('#ana-tbody .ana-row-pick:checked'))
+            .map(c => parseInt(c.dataset.id, 10)).filter(id => !isNaN(id));
+        if (!ids.length) { showToast('请先勾选要删除的记录', 'info'); return; }
+        MDialog.danger({
+            title: '🗑 批量删除分析记录',
+            message: '确定要删除勾选的 <b>' + ids.length + '</b> 条分析记录吗？此操作不可恢复。',
+            okText: '确认删除',
+            onOk: function() {
+                if (btn) { btn.disabled = true; }
+                fetch('/api/task/analysis/records_batch', {
+                    method: 'DELETE',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ids: ids})
+                }).then(r => r.json()).then(res => {
+                    showToast(res.message, res.code === 200 ? 'success' : 'error');
+                    if (res.code === 200) {
+                        // 本地移除这些行 + 重算统计（不整表重拉）
+                        const idset = {};
+                        ids.forEach(function(id) { idset[id] = true; });
+                        _anaRecords = _anaRecords.filter(r2 => !idset[r2.id]);
+                        ids.forEach(anaRemoveRow);
+                        refreshAnaStats();
+                        const head = document.getElementById('ana-check-all');
+                        if (head) { head.checked = false; }
+                    }
+                }).catch(e => showToast('批量删除失败: ' + e, 'error'))
+                  .finally(function() { if (btn) { btn.disabled = false; } });
+            }
+        });
+    }
+
     /* ---- 暴露给内联 onclick 与 switchTab 调用（其余保持 IIFE 私有） ---- */
     window.initAnalysisTab = initAnalysisTab;
     window.loadAnalysisRecords = loadAnalysisRecords;
@@ -761,4 +831,7 @@
     window.saveBatchSnapshots = saveBatchSnapshots;
     window.editAnalysisRecord = editAnalysisRecord;
     window.deleteAnalysisRecord = deleteAnalysisRecord;
+    window.toggleAllAnaRows = toggleAllAnaRows;
+    window.batchDeleteAnalysisRecords = batchDeleteAnalysisRecords;
+    window.reloadAnalysisCoins = reloadAnalysisCoins;
 })();

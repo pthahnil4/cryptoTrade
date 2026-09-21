@@ -202,6 +202,21 @@
             to   { opacity: 1; transform: scale(1); }
         }
         .meal-food-chip .chip-name { color: #0b5fa8; font-weight: 600; }
+        /* chip 内联数量：「食物名 × [数量] (单位)」，改数量实时重算该行总热量 */
+        .meal-food-chip .chip-qty-wrap {
+            display: inline-flex; align-items: center; gap: 1px;
+            color: #0b5fa8; font-weight: 600; font-size: .78rem;
+        }
+        .meal-food-chip .chip-qty {
+            width: 34px; border: none; border-radius: 6px; margin: 0 1px;
+            background: rgba(255, 255, 255, 0.75); color: #0b5fa8;
+            font-family: inherit; font-size: .74rem; font-weight: 600; text-align: center;
+            padding: 1px 2px; outline: none; appearance: textfield; -moz-appearance: textfield;
+        }
+        .meal-food-chip .chip-qty::-webkit-outer-spin-button,
+        .meal-food-chip .chip-qty::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        .meal-food-chip .chip-qty:focus { box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25); background: #fff; }
+        .meal-food-chip .chip-unit { color: #7a95ad; font-size: .72rem; white-space: nowrap; }
         .meal-food-chip .chip-cal {
             color: #5a7d99; font-size: .74rem; background: rgba(255, 255, 255, 0.7);
             border-radius: 8px; padding: 0 6px; font-variant-numeric: tabular-nums;
@@ -213,11 +228,12 @@
         }
         .meal-food-chip .chip-remove:hover { color: #fff; background: var(--danger-color); }
 
-        .meal-add-row { display: flex; gap: 8px; align-items: center; }
+        .meal-add-row { display: flex; gap: 6px; align-items: center; }
         .meal-add-row .food-input { flex: 1; position: relative; min-width: 0; }
-        .meal-add-row .cal-input { width: 82px; }
+        .meal-add-row .qty-input { width: 50px; }
+        .meal-add-row .cal-input { width: 72px; }
         .meal-add-row input {
-            padding: 7px 11px; border: 1.5px solid #e2e9f1; border-radius: 8px;
+            padding: 7px 8px; border: 1.5px solid #e2e9f1; border-radius: 8px;
             font-size: .85rem; outline: none; background: #fff;
             transition: border-color .2s, box-shadow .2s;
         }
@@ -584,7 +600,8 @@
                                 <input type="text" class="meal-food-search" data-meal="breakfast" placeholder="搜索食物名称..." autocomplete="off">
                                 <div class="food-suggest" data-suggest="breakfast"></div>
                             </div>
-                            <input type="number" class="cal-input meal-food-cal" data-meal="breakfast" step="0.1" placeholder="热量">
+                            <input type="number" class="qty-input meal-food-qty" data-meal="breakfast" step="0.1" min="0.1" value="1" placeholder="数量" title="数量（支持小数，如 0.8）">
+                            <input type="number" class="cal-input meal-food-cal" data-meal="breakfast" step="0.1" placeholder="热量" title="单位热量（kcal/单位），总热量 = 单位热量 × 数量">
                             <button class="m-btn m-btn-sm m-btn-primary m-btn-outline" onclick="commitMealFood('breakfast')" style="white-space:nowrap;">+ 添加</button>
                         </div>
                     </div>
@@ -597,7 +614,8 @@
                                 <input type="text" class="meal-food-search" data-meal="lunch" placeholder="搜索食物名称..." autocomplete="off">
                                 <div class="food-suggest" data-suggest="lunch"></div>
                             </div>
-                            <input type="number" class="cal-input meal-food-cal" data-meal="lunch" step="0.1" placeholder="热量">
+                            <input type="number" class="qty-input meal-food-qty" data-meal="lunch" step="0.1" min="0.1" value="1" placeholder="数量" title="数量（支持小数，如 0.8）">
+                            <input type="number" class="cal-input meal-food-cal" data-meal="lunch" step="0.1" placeholder="热量" title="单位热量（kcal/单位），总热量 = 单位热量 × 数量">
                             <button class="m-btn m-btn-sm m-btn-primary m-btn-outline" onclick="commitMealFood('lunch')" style="white-space:nowrap;">+ 添加</button>
                         </div>
                     </div>
@@ -610,7 +628,8 @@
                                 <input type="text" class="meal-food-search" data-meal="dinner" placeholder="搜索食物名称..." autocomplete="off">
                                 <div class="food-suggest" data-suggest="dinner"></div>
                             </div>
-                            <input type="number" class="cal-input meal-food-cal" data-meal="dinner" step="0.1" placeholder="热量">
+                            <input type="number" class="qty-input meal-food-qty" data-meal="dinner" step="0.1" min="0.1" value="1" placeholder="数量" title="数量（支持小数，如 0.8）">
+                            <input type="number" class="cal-input meal-food-cal" data-meal="dinner" step="0.1" placeholder="热量" title="单位热量（kcal/单位），总热量 = 单位热量 × 数量">
                             <button class="m-btn m-btn-sm m-btn-primary m-btn-outline" onclick="commitMealFood('dinner')" style="white-space:nowrap;">+ 添加</button>
                         </div>
                     </div>

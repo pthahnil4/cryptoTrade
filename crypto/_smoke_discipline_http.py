@@ -706,7 +706,7 @@ def _preflight_shared_process() -> bool:
     """
     import socket
 
-    port = int(os.environ.get('CRYPTO_WEB_PORT', '5000') or 5000)
+    port = int(os.environ.get('CRYPTO_WEB_PORT', '7777') or 7777)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
         sk.settimeout(0.4)
         live = sk.connect_ex(('127.0.0.1', port)) == 0

@@ -28,8 +28,31 @@ crypto/task/utils/trade_state.json
 data/instrument_spec_cache.json
 # 回测从交易所拉取的 K 线缓存（可重新下载）
 crypto/backtest/data_cache/
+# K 线抓取输出（体积较大，可由抓取工具重新生成）
+crypto/kline_fetcher/data/
 # 邮件 HTML 预览生成物
 data/mail_preview/
+# 隔离冒烟跑批（data/run_isolated_smoke.py）的本地临时库与逐用例日志：
+# 每次跑批都会重建，日志仅用于失败复盘，不入库
+data/tmp_isolated_smoke/
+data/isolated_smoke/
+*.sqlite
+# 本地测试数据库及其事务文件
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+# 配置快照、业务数据备份及诊断生成物（保留本机，不随源码发布）
+crypto/*.bak_*
+crypto/_universe_backup/
+data/plan_backups/
+data/_*.txt
+data/_okx_list_tools.json
+data/instinct_corpus_report.md
+data/instinct_wiki_report.md
 
 # ---------- 敏感连接串 / 实盘凭据 ----------
 # 远端 MySQL 完整连接串（含账号密码）。本地/服务器保留，不进版本库。

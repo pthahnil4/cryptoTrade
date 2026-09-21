@@ -221,16 +221,27 @@ def hybrid_state_machine_step(justice_flag, dealjustice_flag, modify_flag,
 _KLINE_TIMEOUT = dict(connect=15.0, read=20.0, write=15.0, pool=15.0)
 _KLINE_MAX_RETRIES = 4
 
-# K线缓存有效期（秒）：监控台轮询/批量分析高频访问同一 (instId, bar) 时复用缓存，
-# 避免反复全量下载 K 线，显著降低 OKX 连接压力。
-_KLINE_CACHE_TTL = 60
+# K线缓存"新鲜期"（秒）：按周期分级——一根K线走完的时间尺度决定多久内视为新鲜、
+# 直接复用不再请求，避免 4H/1D 这类慢周期被反复全量下载。
+_KLINE_CACHE_TTL_BY_BAR = {
+    '15m': 90,
+    '1H': 150,
+    '4H': 300,
+    '1D': 900,
+}
+_KLINE_CACHE_TTL_DEFAULT = 60
 
-# 单页K线条数：OKX mark-price-candles 接口 limit 上限为 300（已实测），
-# 一次拉更多可把 500 根K线从 5 次请求降到 2 次，批量分析提速明显。
+
+def _ttl_for_bar(bar):
+    """返回该周期的缓存新鲜期（秒）。未登记的周期用默认 60s。"""
+    return _KLINE_CACHE_TTL_BY_BAR.get(str(bar), _KLINE_CACHE_TTL_DEFAULT)
+
+# 单页K线条数：实测 OKX 行情接口（成交价/指数/标记价K线）单次 limit 上限=300（默认100）。
 _KLINE_PAGE_LIMIT = 300
 
-# 策略计算所需的目标K线数量（与原 5 页×100 根一致）
-_KLINE_TARGET_COUNT = 500
+# 策略计算所需的目标K线数量：500→300，使趋势主取数"一页即可拿满、免翻页"。
+# （MACD/ADX/ATR/SAR 暖机约 30~60 根即收敛，300 根足够；落地前经 500 vs 300 A/B 回归。）
+_KLINE_TARGET_COUNT = 300
 
 # 共享 MarketAPI 客户端：okx SDK 基于 httpx.Client（http2=True），httpx.Client 线程安全，
 # 可在监控台请求/批量分析线程间复用同一 HTTP/2 长连接。高频新建连接容易被 OKX
@@ -241,6 +252,40 @@ _market_api_lock = threading.Lock()
 # (instId, bar) -> (时间戳, 原始K线列表)
 _kline_cache = {}
 _kline_cache_lock = threading.Lock()
+
+# run 作用域的批量预热缓存（仅批量分析路径使用）：
+# 批量任务先"锁外并发预热"把K线写进这里，随后"锁内串行计算"直接命中，
+# 使 PRO3_LOCK 的持有时长从（等网络+下载+计算）缩到（纯计算）。
+# 与实盘/监控台主链路隔离——非批量运行期本字典始终为空，不影响实盘取数。
+_batch_kline_cache = {}
+_batch_kline_cache_lock = threading.Lock()
+_BATCH_KLINE_HOLD = 900  # 预热数据在本轮内最长视为有效（秒），run 结束即清空
+
+
+def store_batch_kline(instId, bar, combined_data):
+    """批量预热阶段写入 run 级缓存；同时写常规缓存，供本轮之后（TTL内）复用。"""
+    now = time.time()
+    snapshot = list(combined_data)
+    with _batch_kline_cache_lock:
+        _batch_kline_cache[(instId, bar)] = (now, snapshot)
+    with _kline_cache_lock:
+        _kline_cache[(instId, bar)] = (now, snapshot)
+
+
+def clear_batch_cache():
+    """清空 run 级缓存。批量任务 finally 必须调用，避免残留数据泄漏给实盘/后续轮次。"""
+    with _batch_kline_cache_lock:
+        _batch_kline_cache.clear()
+
+
+def get_batch_kline(instId, bar):
+    """读取已预热的原始K线列表（未预热或已超 hold 返回 None）。"""
+    now = time.time()
+    with _batch_kline_cache_lock:
+        cached = _batch_kline_cache.get((instId, bar))
+    if cached and (now - cached[0]) < _BATCH_KLINE_HOLD:
+        return cached[1]
+    return None
 
 
 def _build_market_api(force_new=False):
@@ -314,8 +359,10 @@ def _request_candles(instId, bar, after=None, max_retries=_KLINE_MAX_RETRIES,
 def _fetch_kline_data(instId, bar, max_retries=_KLINE_MAX_RETRIES, allow_stale=False):
     """从OKX API获取K线数据（带缓存、超时、自动重试与弱网降级）。
 
-    - 同一 (instId, bar) 在 _KLINE_CACHE_TTL 秒内直接复用缓存（原始K线列表），
-      监控台轮询与批量分析不再重复全量下载，显著减轻 OKX 连接压力。
+    - 取数优先级：run 级批量预热缓存 `_batch_kline_cache`（批量路径锁外并发预写，
+      锁内直接命中 0 网络）→ 常规分级 TTL 缓存 `_kline_cache`（同一 (instId, bar) 在
+      `_ttl_for_bar(bar)` 秒内直接复用，15m/1H/4H/1D 各按周期新鲜度）→ 联网取数。
+    - 目标 _KLINE_TARGET_COUNT=300 = 单次 limit 上限，正常一页取满、免翻页。
     - 首页数据（最近K线）：重试 max_retries 次仍失败则抛出异常
       （由上层归入“无法获取数据”，本轮跳过不交易），因为无首页无法计算指标。
     - 历史翻页：单页重试仍失败时，保留已获取的数据降级返回，而非整体丢弃，
@@ -329,10 +376,17 @@ def _fetch_kline_data(instId, bar, max_retries=_KLINE_MAX_RETRIES, allow_stale=F
     now = time.time()
     with _kline_cache_lock:
         cached = _kline_cache.get(cache_key)
-        if cached and (now - cached[0]) < _KLINE_CACHE_TTL:
-            combined_data = cached[1]
-        else:
-            combined_data = None
+
+    # 1) 优先命中 run 级批量预热缓存（批量计算路径：锁外并发预写，锁内直接取用，0 网络）
+    with _batch_kline_cache_lock:
+        bc = _batch_kline_cache.get(cache_key)
+    if bc and (now - bc[0]) < _BATCH_KLINE_HOLD:
+        combined_data = bc[1]
+    # 2) 常规分级 TTL 缓存（新鲜期内复用，跨请求/跨轮回用）
+    elif cached and (now - cached[0]) < _ttl_for_bar(bar):
+        combined_data = cached[1]
+    else:
+        combined_data = None
 
     if combined_data is None:
         try:

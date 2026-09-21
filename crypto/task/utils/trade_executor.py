@@ -72,21 +72,64 @@ except ImportError:
 # 注意：本次刻意**不上**「确定性 clOrdId（同参数同 ID，靠交易所拒重来去重）」，
 # 因为那会改变下单语义——同币种同价同量的第二笔合法委托也会被当成重复单拒掉，
 # 是否要这层保险得由交易侧先定。
-_CL_ORD_ID_MAX_LEN = 64                     # OKX: clOrdId/algoClOrdId 1~64 位
-_CL_ORD_ID_BAD_CHARS = re.compile(r'[^A-Za-z0-9_-]')
+#
+# 【字符集口径必须按 OKX 实测，别照搬 Binance 假设】2026-09-11 实盘事故：
+# 打标上线后每一笔委托都被交易所拒回 `51000: Parameter clOrdId error`，
+# 双仓位挂单全灭（区间仓/趋势仓永远开不出去）。原因是实现想当然地按
+# 「字母/数字/下划线/连字符，1~64 位」生成 `ct_<token>_<hash>`，而 OKX 的规矩是
+# **只允许字母与数字（无下划线/连字符/点号）、长度 1~32**。
+# 定性证据（只读接口 GET /api/v5/trade/order?clOrdId= 逐形态探测，见
+# crypto/task/_diag_cl_ord_id_charset.py）：
+#   ct_1a08fa56…_abcdef   (带下划线 29 位) → 51000 Parameter clOrdId error
+#   ct-1a08fa56…-abcdef   (带连字符)       → 51000 Parameter clOrdId error
+#   ct.1a08fa56…          (带点号)         → 51000 Parameter clOrdId error
+#   ct1a08fa56…abcdef     (纯字母数字 ≤32) → 51603 Order does not exist（校验已过）
+#   33 位以上纯字母数字                    → 51000 Parameter clOrdId error
+# algoClOrdId（策略委托）另用只读接口 GET /api/v5/trade/order-algo?algoClOrdId=
+# 独立复测过同一组形态，结论完全一致（51000/51603 逐条对应）——别把"两处规则相同"
+# 当默认事实，它是测出来的；两处分开验的口径见同一目录下的探针脚本。
+_CL_ORD_ID_MAX_LEN = 32                    # OKX 实测硬上限
+_CL_ORD_ID_BAD_CHARS = re.compile(r'[^A-Za-z0-9]')   # 分隔符也算非法字符，一律剔除
 
 
 def gen_cl_ord_id(prefix: str = 'ct', seed: str = '') -> str:
     """生成合法且进程内唯一的客户订单号（clOrdId / algoClOrdId 通用）。
 
-    OKX 只接受字母/数字/下划线/连字符，长度 1~64；重复的 clOrdId 会被拒单，
-    所以尾部用「毫秒时间戳 + uuid」保证不撞号，seed 只用于日志里回溯下单参数。
+    纯字母数字、总长 ≤32（非法字符直接剔除而不是替换，保证任何 prefix/seed
+    都产出合法 ID）；中段「毫秒时间戳 + uuid」保证不撞号，尾部 seed 摘要只用于
+    日志里回溯下单参数——超长时优先牺牲摘要，绝不牺牲唯一性所需的 token。
     """
+    pfx = _CL_ORD_ID_BAD_CHARS.sub('', prefix or '')
     token = f"{int(time.time() * 1000):x}{uuid.uuid4().hex[:8]}"
-    cid = f"{prefix}_{token}" if prefix else token
+    cid = f"{pfx}{token}"
     if seed:
-        cid = f"{cid}_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:6]}"
-    return _CL_ORD_ID_BAD_CHARS.sub('', cid)[:_CL_ORD_ID_MAX_LEN]
+        cid += hashlib.sha1(seed.encode('utf-8')).hexdigest()[:6]
+    return cid[:_CL_ORD_ID_MAX_LEN]
+
+
+# =====================================================================
+# HTTP 超时（下单"结果未知"的第二大来源）
+# =====================================================================
+# OKX SDK 的客户端继承 httpx.Client 且没有暴露超时参数，默认读超时只有 5s。
+# 2026-09-11 现网日志：跨境链路一抖，下单/反查成片报 "The read operation timed
+# out"、"_ssl.c: The handshake operation timed out"，结果就是「单子是否落地未知」
+# ——必须停手人工核实的最坏状态。把超时拉到 20s（仍远小于一轮调度耗时）能显著
+# 降低误判率：客户端多等一会儿，远好过把已经落地的单当未知。
+# 可用环境变量 OKX_HTTP_TIMEOUT_SEC 覆盖（非法/过小值回落默认）。
+try:
+    _OKX_HTTP_TIMEOUT_SEC = max(5.0, float(os.environ.get('OKX_HTTP_TIMEOUT_SEC') or 20.0))
+except (TypeError, ValueError):
+    _OKX_HTTP_TIMEOUT_SEC = 20.0
+
+
+def _apply_http_timeout(client):
+    """给 OKX SDK 客户端设置 httpx 超时；设置失败绝不阻断交易链路（沿用默认）。"""
+    try:
+        import httpx
+        client.timeout = httpx.Timeout(_OKX_HTTP_TIMEOUT_SEC)
+    except Exception as e:
+        logger.warning(f"OKX 客户端超时未生效（沿用 SDK 默认 5s）: {type(e).__name__}: {e}")
+    return client
 
 
 class TradeExecutor:
@@ -109,13 +152,15 @@ class TradeExecutor:
         self._api_secret_key = api_secret_key
         self._passphrase = passphrase
         
-        # 初始化API客户端
-        self.market_api = MarketData.MarketAPI(flag=flag)
-        self.trade_api = Trade.TradeAPI(api_key, api_secret_key, passphrase, False, flag)
+        # 初始化API客户端（统一放宽 httpx 超时，理由见 _apply_http_timeout）
+        self.market_api = _apply_http_timeout(MarketData.MarketAPI(flag=flag))
+        self.trade_api = _apply_http_timeout(
+            Trade.TradeAPI(api_key, api_secret_key, passphrase, False, flag))
         # 新版 SDK 构造函数首参是 api_key，公共接口免鉴权须用关键字 flag 传参，
         # 不能传 False 作首参（会被当成 api_key 塞进请求头直接抛 TypeError）
-        self.public_api = PublicData.PublicAPI(flag=flag)
-        self.account_api = Account.AccountAPI(api_key, api_secret_key, passphrase, False, flag)
+        self.public_api = _apply_http_timeout(PublicData.PublicAPI(flag=flag))
+        self.account_api = _apply_http_timeout(
+            Account.AccountAPI(api_key, api_secret_key, passphrase, False, flag))
         
         # 防重机制初始化
         self.strategy_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trade_state.json')
@@ -1593,8 +1638,8 @@ class TradeExecutor:
         形式常为空，即日志里看到的“获取持仓信息异常: ”）。重建客户端可新建连接。
         """
         try:
-            self.account_api = Account.AccountAPI(
-                self._api_key, self._api_secret_key, self._passphrase, False, self.flag)
+            self.account_api = _apply_http_timeout(Account.AccountAPI(
+                self._api_key, self._api_secret_key, self._passphrase, False, self.flag))
             logger.info("[持仓] 已重建账户API连接")
             return True
         except Exception as e:

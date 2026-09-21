@@ -50,6 +50,7 @@
         /* ============ 筛选栏 ============ */
         .ana-filter { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
         .ana-filter label { display: flex; align-items: center; gap: 6px; font-size: 0.86rem; color: #555; }
+        .ana-filter .ana-spacer { flex: 1; }
 
         /* ============ 数据表格：table-layout:fixed + colgroup 精确分配列宽 ============ */
         .ana-table-wrap { overflow-x: auto; border-radius: 8px; border: 1px solid var(--border-color); background: var(--card-bg); }
@@ -122,7 +123,7 @@
                 </label>
                 <button id="ana-snap-btn" class="m-btn m-btn-primary" onclick="genAnalysisSnapshot()">📸 生成快照</button>
                 <button id="ana-batch-btn" class="m-btn m-btn-success" onclick="genBatchSnapshot(this)">🚀 一键批量快照</button>
-                <button class="m-btn m-btn-secondary m-btn-sm" onclick="loadAnalysisRecords()">🔄 刷新列表</button>
+                <button class="m-btn m-btn-secondary m-btn-sm" onclick="loadAnalysisRecords()" title="重新拉取分析记录列表，并顺带回填已到期的近/远窗口复盘价格（不影响币种下拉，币种每次进入页面已自动同步）">🔄 刷新记录</button>
                 <span class="ana-spacer"></span>
                 <span id="ana-snap-ts"></span>
             </div>
@@ -170,18 +171,21 @@
                 <label>开始 <input type="date" id="ana-filter-start" class="config-input" style="width:auto"></label>
                 <label>结束 <input type="date" id="ana-filter-end" class="config-input" style="width:auto"></label>
                 <button class="m-btn m-btn-primary m-btn-sm" onclick="loadAnalysisRecords()">🔍 查询</button>
+                <span class="ana-spacer"></span>
+                <button class="m-btn m-btn-danger m-btn-sm" onclick="batchDeleteAnalysisRecords(this)" title="删除列表里已勾选的分析记录（配合表头复选框全选）">🗑 批量删除</button>
             </div>
 
             <div class="ana-table-wrap">
                 <table class="ana-table">
                     <colgroup>
+                        <col style="width:3%"><!-- 勾选 -->
                         <col style="width:11%"><!-- 时间 -->
-                        <col style="width:9%"><!-- 币种 -->
+                        <col style="width:8%"><!-- 币种 -->
                         <col style="width:7%"><!-- 快照价 -->
-                        <col style="width:9%"><!-- 短周期 -->
-                        <col style="width:11%"><!-- 长周期 -->
-                        <col style="width:7%"><!-- 个人判断 -->
-                        <col style="width:16%"><!-- 分析原因 -->
+                        <col style="width:8%"><!-- 短周期 -->
+                        <col style="width:10%"><!-- 长周期 -->
+                        <col style="width:6%"><!-- 个人判断 -->
+                        <col style="width:15%"><!-- 分析原因 -->
                         <col style="width:8%"><!-- 近窗口后 -->
                         <col style="width:8%"><!-- 远窗口后 -->
                         <col style="width:8%"><!-- 结果 -->
@@ -189,12 +193,13 @@
                     </colgroup>
                     <thead>
                         <tr>
+                            <th style="text-align:center"><input type="checkbox" id="ana-check-all" onclick="toggleAllAnaRows(this)" title="全选/全不选"></th>
                             <th>时间</th><th>币种</th><th>快照价</th><th>短周期</th><th>长周期</th>
                             <th>个人判断</th><th>分析原因</th><th id="ana-th-near">近窗口后</th><th id="ana-th-far">远窗口后</th><th>结果</th><th>操作</th>
                         </tr>
                     </thead>
                     <tbody id="ana-tbody">
-                        <tr><td colspan="11" class="empty-state">加载中...</td></tr>
+                        <tr><td colspan="12" class="empty-state">加载中...</td></tr>
                     </tbody>
                 </table>
             </div>

@@ -76,11 +76,12 @@ from crypto.api_config import get_api_config
 # reverse_guard_state.json / manual_pause_state.json）：DB 不可用时
 # 仅告警不中断交易，与 JSON 版容错行为一致
 try:
-    from crypto.database import session_scope
+    from crypto.database import session_scope, db_health
     from crypto import trader_state_repo as state_repo
     from crypto import config_store_repo
 except ImportError:
     session_scope = None
+    db_health = None
     state_repo = None
     config_store_repo = None
 
@@ -112,6 +113,15 @@ class TrendRangeTrader:
         # 止盈冷却提示去重：进入冷却后 task_log 首轮提示一次，后续轮只写结构化流水（防刷屏）
         self._tp_cd_logged = set()
 
+        # 插针临时禁开仓（spike_guard，行为开关默认关闭）：
+        #   _spike_prev   {inst_id: {'price','ts'}} 上一处理轮的现价与时间戳（环比基准）
+        #   _spike_until  {inst_id: 恢复自动开仓时间戳} 判定插针后暂停开仓的到期时间
+        #   _spike_logged 进入暂停后 task_log 首轮提示去重（防刷屏）
+        # 内存态即可：暂停仅数分钟，重启丢失由其它冷却/交易所兜底委托补位。
+        self._spike_prev = {}
+        self._spike_until = {}
+        self._spike_logged = set()
+
         # 止盈评估引擎（六类主止盈单选 + 时间止盈兜底，运行时状态持久化）
         self.tp_engine = TakeProfitEngine()
 
@@ -142,6 +152,24 @@ class TrendRangeTrader:
         # 连续分析失败计数（inst_id → 连续失败轮数）：达阈值升级为告警邮件，
         # 避免 OKX API/网络持续故障时系统“静默失效”而持仓裸露
         self._consec_fail = {}
+
+        # 下单连续被交易所拒/失败计数（inst_id → 连续"有拒单"的轮数）：
+        # analyze_and_trade_real 只要分析+持仓查询成功就返回 success=True，
+        # 单笔挂单被拒不会降级 success，因而 _note_cycle_result 抓不到它——
+        # 交易所持续拒单（51008/价格过滤/最小量）时心跳照常、实则一单没挂上。
+        # 本计数补上这个静默失效盲区，达阈值发风控告警（见 _handle_place_failures）。
+        self._place_fail_streak = {}
+        # 止盈/止损平仓失败连续轮数（inst_id → 计数）：止损名义在、实则没平=
+        # 持仓裸露，需专项升级告警而非只靠通用交易失败邮件（见 _alert_sl_tp_fail）。
+        self._sltp_fail_streak = {}
+        # P2-b 兜底委托不在位：key=f"{inst_id}|{direction}" → 连续"该挂却挂不上"的轮数
+        # （趋势仓有持仓+有有效触发价，但交易所侧兜底委托始终不在位=宕机时最后防线缺失）。
+        self._algo_fail_streak = {}
+        # P2-c 持久化降级：DB 连接连续失败达阈值只发一封叫醒级告警，恢复后清 latch（可发缓解）。
+        self._persist_alerted = False
+        # P2-d 链路健康聚合：连续"全批币种 OKX 读失败"的轮数 + 是否已发聚合告警（恢复后复位）。
+        self._link_bad_rounds = 0
+        self._link_alerted = False
 
         # 获取实盘 API 配置（按指定账号）
         api_config = get_api_config(self.account)
@@ -275,8 +303,11 @@ class TrendRangeTrader:
         """
         if session_scope is not None and config_store_repo is not None:
             try:
-                cfg = config_store_repo.load_json_config_cached(
-                    config_store_repo.KEY_STRATEGY_CONFIG)
+                # 按账号隔离：优先读本账号专属配置 strategy_config:{account}，
+                # 缺失回退全局 key，再回退本地文件。多账号共用一个库时，本地
+                # 测试账号不会读到实盘主账号的仓位参数（否则保证金不足 51008）。
+                cfg = config_store_repo.load_strategy_config_cached(
+                    getattr(self, 'account', None))
                 if cfg is not None:
                     return cfg
             except Exception as e:
@@ -404,6 +435,111 @@ class TrendRangeTrader:
             self._tp_close_until.pop(inst_id, None)
             self._tp_cd_logged.discard(inst_id)
             task_log.info(f"{inst_id} | 【止盈止损冷却】冷却结束，恢复自动开仓")
+            return 0.0
+        return remaining
+
+    # =================================================================
+    # 插针临时禁开仓（spike_guard）— 行为开关默认关闭，须实盘校准阈值后再开
+    # 单轮环比价格突变视为插针，暂停自动开新仓 N 分钟（平仓/撤单照常），
+    # 避免在插针造成的极端价位追价开仓。整体 fail-safe：任何异常只记日志。
+    # =================================================================
+
+    _SPIKE_GUARD_DEFAULTS = {
+        'spike_enabled': False,        # 行为开关：默认关闭，开启才会暂停开仓
+        'spike_change_pct': 5.0,       # 单轮环比涨跌 ≥ 此% 判为插针
+        'spike_min_gap_seconds': 30,   # 距上轮 < 此秒不判定（防重启首轮/异常快轮误伤）
+        'spike_pause_minutes': 5,      # 判定插针后暂停自动开新仓分钟数
+    }
+
+    def _spike_guard_cfg(self) -> Dict:
+        """读取插针保护配置（global_settings.spike_guard，热加载、按账号隔离）；
+        缺省字段用 _SPIKE_GUARD_DEFAULTS 兜底，读不到即返回缺省（不抛）。"""
+        try:
+            sg = ((self._load_config().get('global_settings', {}) or {})
+                  .get('spike_guard', {}) or {})
+        except Exception:
+            sg = {}
+        out = dict(self._SPIKE_GUARD_DEFAULTS)
+        for k, v in sg.items():
+            if v is not None:
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _classify_spike(prev, cur_price, cur_ts, sg_cfg):
+        """单轮环比插针判定（纯函数，不碰 self）。prev={'price','ts'} 上一轮现价/时间戳。
+        返回 (is_spike, change_pct)。数据缺失 / 无基准(首轮) / 间隔过小一律
+        (False, pct或0.0)——宁漏不误伤，避免刚重启或异常快轮把正常波动当插针。"""
+        try:
+            prev_price = float((prev or {}).get('price') or 0)
+            prev_ts = float((prev or {}).get('ts') or 0)
+            cur_price = float(cur_price)
+            cur_ts = float(cur_ts)
+        except (TypeError, ValueError):
+            return False, 0.0
+        if cur_price <= 0 or prev_price <= 0 or prev_ts <= 0:
+            return False, 0.0
+        if (cur_ts - prev_ts) < float(sg_cfg.get('spike_min_gap_seconds', 30)):
+            return False, 0.0
+        pct = (cur_price / prev_price - 1.0) * 100.0
+        return abs(pct) >= float(sg_cfg.get('spike_change_pct', 5.0)), pct
+
+    def _note_spike_guard(self, inst_id: str, cur_price: float, run_id: str = ''):
+        """每处理轮调用：与上一轮现价环比，命中插针则设暂停到期并发风控邮件（叫醒级）。
+        只更新环比基准与暂停状态，实际开仓拦截由主循环 5d 闸门完成。整体 fail-safe。"""
+        try:
+            now = time.time()
+            sg = self._spike_guard_cfg()
+            prev = self._spike_prev.get(inst_id)
+            is_spike, pct = self._classify_spike(prev, cur_price, now, sg)
+            # 无论开关都刷新环比基准，保证开启瞬间基准新鲜（不拿陈旧价乱判）
+            try:
+                if cur_price and float(cur_price) > 0:
+                    self._spike_prev[inst_id] = {'price': float(cur_price), 'ts': now}
+            except (TypeError, ValueError):
+                pass
+            if not sg.get('spike_enabled', False) or not is_spike:
+                return
+            pause_min = float(sg.get('spike_pause_minutes', 5))
+            if pause_min <= 0:
+                return
+            until = now + pause_min * 60
+            was_paused = float(self._spike_until.get(inst_id, 0) or 0) > now
+            self._spike_until[inst_id] = max(
+                float(self._spike_until.get(inst_id, 0) or 0), until)
+            rid = f"[{run_id}] " if run_id else ''
+            direction = '急涨' if pct >= 0 else '急跌'
+            task_log.warning(
+                f"{rid}{inst_id} | 【插针保护】单轮环比{direction}{pct:+.2f}% "
+                f"≥ 阈值{sg.get('spike_change_pct', 5.0)}%，暂停自动开新仓{pause_min:.0f}分钟")
+            trade_log.info(
+                f"{rid}插针保护 | 触发 | {inst_id} | 环比{pct:+.2f}% | "
+                f"暂停开仓{pause_min:.0f}分钟 | 平仓/撤单照常")
+            if not was_paused:   # 已在暂停中则不重复发信（延长即可）
+                self._safe_risk_alert(
+                    inst_id, f'插针检测·暂停自动开新仓 {pause_min:.0f} 分钟',
+                    rows=[('环比涨跌', f'{pct:+.2f}%（{direction}）'),
+                          ('上一轮现价', f"{(prev or {}).get('price', 0):.6g}"),
+                          ('本轮现价', f'{float(cur_price):.6g}'),
+                          ('判定阈值', f"{sg.get('spike_change_pct', 5.0)}%"),
+                          ('暂停时长', f'{pause_min:.0f} 分钟（期间平仓/撤单照常）'),
+                          ('说明', '插针保护已触发，系统暂停该币自动开新仓，到期自动恢复；'
+                                '如判定为误伤可将 global_settings.spike_guard.spike_enabled '
+                                '设为 false 或调高 spike_change_pct。')],
+                    level='critical')
+        except Exception as e:
+            task_log.error(f"{inst_id} | 插针保护处理异常（不影响交易）: {e}")
+
+    def _spike_pause_remaining(self, inst_id: str) -> float:
+        """插针暂停剩余秒数（<=0 未暂停；到期自动清除记录与去重集）。"""
+        until = float(self._spike_until.get(inst_id, 0) or 0)
+        if until <= 0:
+            return 0.0
+        remaining = until - time.time()
+        if remaining <= 0:
+            self._spike_until.pop(inst_id, None)
+            self._spike_logged.discard(inst_id)
+            task_log.info(f"{inst_id} | 【插针保护】暂停结束，恢复自动开仓")
             return 0.0
         return remaining
 
@@ -888,9 +1024,18 @@ class TrendRangeTrader:
     POS_DUST = 0.01
 
     def _steps(self, inst_id: str) -> tuple:
-        """该合约的 (lotSz 下单步长, minSz 最小下单量)，规格缺失回退 (0.1, 0.1)。"""
+        """该合约的 (lotSz 下单步长, minSz 最小下单量)，规格缺失回退 (0.1, 0.1)。
+
+        区分两种"没规格"：spec_cache 压根没注入（离线冒烟用 __new__ 造的裸对象，
+        生产 __init__ 必然注入）属正常兜底路径，静默返回；已注入却读失败才是真故障，
+        必须告警。改前两者共用 except，导致每跑一次冒烟就往实盘日志里灌一批
+        "读取合约下单步长失败: 'TrendRangeTrader' object has no attribute ..." 假故障行。
+        """
+        spec_cache = getattr(self, 'spec_cache', None)
+        if spec_cache is None:
+            return 0.1, 0.1
         try:
-            return self.spec_cache.steps(inst_id)
+            return spec_cache.steps(inst_id)
         except Exception as e:
             task_log.warning(f"{inst_id} | 读取合约下单步长失败，按兜底0.1张: {e}")
             return 0.1, 0.1
@@ -1304,6 +1449,305 @@ class TrendRangeTrader:
         return True
 
     # =================================================================
+    # 执行类静默失效告警（下单被拒 / 结果未知孤儿单 / 止盈止损平仓失败）
+    # 阈值来自 global_settings.risk_alerts，热加载、按账号隔离；缺省见下。
+    # 所有方法整体 fail-safe：任何异常只记日志，绝不影响交易主流程、绝不抛出。
+    # =================================================================
+
+    _RISK_ALERT_DEFAULTS = {
+        'enabled': True,
+        'place_fail_rounds': 3,     # 单币连续 N 轮下单被拒 → 升级告警
+        'sl_tp_fail_rounds': 2,     # 止盈/止损连续 N 轮平仓失败 → 升级告警
+        # P2-a 账本与真实持仓大幅背离（缩减≈强平/爆仓，吸收≈人工加仓）
+        'ledger_divergence_enabled': True,
+        'shrink_alert_frac': 0.5,   # 缩减后仅保留 ≤ 此比例（真实/账本）→ critical（默认丢一半）
+        'absorb_alert_frac': 1.0,   # 吸收量 ≥ 账本原合计的此倍数 → warning（默认翻倍）
+        # P2-b 兜底委托不在位（该挂的交易所侧保险连续挂不上/被撤且重挂仍失败）
+        'algo_fail_rounds': 3,      # 连续 N 轮"该挂在位却缺失" → 升级告警
+        # P2-c 持久化降级（MySQL 记账层连续不可用，重启即丢冷却/计时/方向状态）
+        'persist_fail_rounds': 3,   # DB 连接连续失败 ≥ 此数 → 降级叫醒告警
+        # P2-d 链路健康聚合（整批币种 OKX 读接口成片超时/失败=链路级故障）
+        'link_alert_rounds': 3,     # 连续 N 轮全批读失败 → 聚合系统告警（区别单币 _note_cycle_result）
+    }
+
+    def _risk_alerts_cfg(self) -> Dict:
+        """读取风控告警配置（热加载），缺省字段用 _RISK_ALERT_DEFAULTS 兜底。"""
+        try:
+            ra = ((self._load_config().get('global_settings', {}) or {})
+                  .get('risk_alerts', {}) or {})
+        except Exception:
+            ra = {}
+        out = dict(self._RISK_ALERT_DEFAULTS)
+        for k, v in ra.items():
+            if v is not None:
+                out[k] = v
+        return out
+
+    def _safe_risk_alert(self, inst_id: str, title: str,
+                         rows: List[tuple], level: str = 'critical'):
+        """发送风控告警邮件，异常吞掉只记日志（发信失败不得影响交易）。"""
+        try:
+            self.message_notifier.send_risk_alert(
+                inst_id, title, detail_rows=rows, level=level)
+        except Exception as e:
+            task_log.error(f"{inst_id} | 风控告警邮件发送失败（{title}）: {e}")
+
+    def _handle_place_failures(self, inst_id: str, run_id: str):
+        """排空本轮下单失败记录并分级处理：
+        - need_verify（结果未知、该单可能已落地）→ 立即升级"请人工核实"邮件（P0-3），
+          不核实就重发=重复开仓，故不等阈值、首轮即发；
+        - 普通拒单（51008/价格过滤/最小量）→ 计入连续轮数，达阈值发"下单持续被拒"
+          告警（P0-1）；某轮无拒单即复位计数。
+        """
+        try:
+            fails = self.pos_mgr.drain_place_failures()
+        except Exception as e:
+            task_log.warning(f"{inst_id} | 排空下单失败记录异常: {e}")
+            return
+        if not fails:
+            self._place_fail_streak.pop(inst_id, None)   # 本轮干净 → 复位连续计数
+            return
+        cfg = self._risk_alerts_cfg()
+        if not cfg.get('enabled', True):
+            return
+        rid = f"[{run_id}] " if run_id else ''
+        verify = [f for f in fails if f.get('need_verify')]
+        rejected = [f for f in fails if not f.get('need_verify')]
+
+        def _brief(f):
+            b_cn = '趋势仓' if f['bucket'] == BUCKET_TREND else '区间仓'
+            s_cn = '开仓' if f['slot'] == 'entry' else '平仓'
+            return f"{b_cn}·{s_cn} {f['amount']:g}张@{f['price']:.6g}"
+
+        # P0-3：结果未知的孤儿单 —— 立即升级人工核实（不重发=可能重复开仓）
+        if verify:
+            first = verify[0]
+            self._safe_risk_alert(
+                inst_id, "下单结果未知，疑似孤儿单", level='critical',
+                rows=[('异常单数', f'{len(verify)} 笔'),
+                      ('最新一笔', _brief(first)),
+                      ('交易所返回', str(first['error'])[:200]),
+                      ('处置建议', '请先在交易所核对该挂单/成交是否已存在，确认为未落地后再重发。'
+                               '系统下轮会自动重试挂单，若该单其实已成交可能造成重复开仓，务必人工确认。')])
+            task_log.error(
+                f"{rid}{inst_id} | 【下单结果未知】{len(verify)}笔需人工核实："
+                f"{_brief(first)}")
+
+        # P0-1：普通拒单连续计数（need_verify 不计入，避免与核实信重复）
+        if rejected:
+            streak = self._place_fail_streak.get(inst_id, 0) + 1
+            self._place_fail_streak[inst_id] = streak
+            thr = max(1, int(cfg.get('place_fail_rounds', 3)))
+            if streak >= thr and (streak - thr) % thr == 0:   # 每 thr 轮重复提醒一次
+                first = rejected[0]
+                errs = '、'.join(sorted({str(f['error'])[:60] for f in rejected}))[:300]
+                self._safe_risk_alert(
+                    inst_id, f"下单连续被拒（已{streak}轮）", level='critical',
+                    rows=[('连续拒单轮数', f'{streak} 轮（阈值{thr}）'),
+                          ('本轮拒单笔数', f'{len(rejected)} 笔'),
+                          ('最新篮子/单型', _brief(first)),
+                          ('错误摘要', errs),
+                          ('影响', '系统可能一单未挂而交易停摆（保证金不足51008/价格过滤/'
+                                   '低于最小量等），但心跳日志照常不体现，请及时检查余额与下单参数。')])
+                task_log.error(
+                    f"{rid}{inst_id} | 【下单连续被拒】已{streak}轮，阈值{thr}，"
+                    f"最新：{_brief(first)}｜{first['error']}")
+        else:
+            # 本轮只有 need_verify、无普通拒单 → 不推进"连续被拒"计数
+            self._place_fail_streak.pop(inst_id, None)
+
+    def _handle_ledger_divergence(self, inst_id: str, run_id: str):
+        """账本与真实持仓大幅背离（P2-a）：在动作前那次 reconcile 之后排空背离事件。
+        - 缩减（真实 << 账本）：非本程序动作导致的持仓凭空消失，几乎只有强平/爆仓/
+          账户被人工平仓才会出现 → 保留比例 ≤ shrink_alert_frac 时叫醒级告警；
+        - 吸收（真实 >> 账本）：人工同向加仓/入账遗漏 → 倍数 ≥ absorb_alert_frac 时提示级。
+        缩减后对账已把账本封顶到真实，程序随即失去对原仓位的覆盖，故须"告警 + 留痕"。
+        """
+        try:
+            events = self.pos_mgr.drain_divergences()
+        except Exception as e:
+            task_log.warning(f"{inst_id} | 排空账本背离记录异常: {e}")
+            return
+        if not events:
+            return
+        cfg = self._risk_alerts_cfg()
+        if not cfg.get('enabled', True) or not cfg.get('ledger_divergence_enabled', True):
+            return
+        rid = f"[{run_id}] " if run_id else ''
+        try:
+            shrink_thr = float(cfg.get('shrink_alert_frac', 0.5))
+            absorb_thr = float(cfg.get('absorb_alert_frac', 1.0))
+        except Exception:
+            shrink_thr, absorb_thr = 0.5, 1.0
+        for ev in events:
+            try:
+                dcn = '多头' if ev.get('direction') == 'long' else '空头'
+                if ev.get('kind') == 'shrink':
+                    scale = float(ev.get('scale', 1) or 0)
+                    if scale > shrink_thr:
+                        continue
+                    lost = max(0.0, (1 - scale) * 100)
+                    self._safe_risk_alert(
+                        inst_id, f'账本大幅背离·{dcn}持仓被系统外削减', level='critical',
+                        rows=[('背离类型', '缩减（真实持仓 < 本地账本）'),
+                              ('方向', dcn),
+                              ('保留比例', f'仅约 {scale * 100:.1f}%（凭空消失约 {lost:.1f}%）'),
+                              ('账本→真实', f"{ev.get('total', 0):g}张 → {ev.get('real', 0):g}张"),
+                              ('篮子明细', str(ev.get('detail', ''))[:300]),
+                              ('影响', '本轮任何程序平仓动作之前，账本就远高于交易所真实持仓，'
+                                       '通常意味着已发生强平/爆仓或账户被人工平仓（非本程序所为）；'
+                                       '系统对原仓位的止盈止损/兜底覆盖即刻失效，请立即核对持仓与保证金。')])
+                    task_log.error(
+                        f"{rid}{inst_id} | 【账本背离·缩减】{dcn} 账本{ev.get('total', 0):g}→"
+                        f"真实{ev.get('real', 0):g}张(保留{scale * 100:.1f}%)：{ev.get('detail')}")
+                elif ev.get('kind') == 'absorb':
+                    ratio = float(ev.get('ratio', 0) or 0)
+                    # total<=0 多见于重启/接管人工仓（从零吸收），不作背离告警避免误报
+                    if float(ev.get('total', 0) or 0) <= 0 or ratio < absorb_thr:
+                        continue
+                    self._safe_risk_alert(
+                        inst_id, f'账本大幅背离·{dcn}持仓被大幅吸收', level='warning',
+                        rows=[('背离类型', '吸收（真实持仓 > 本地账本）'),
+                              ('方向', dcn),
+                              ('吸收倍数', f'超出账本约 {ratio * 100:.0f}%'),
+                              ('账本→真实', f"{ev.get('total', 0):g}张 → {ev.get('real', 0):g}张"),
+                              ('篮子明细', str(ev.get('detail', ''))[:300]),
+                              ('影响', '交易所侧出现大量账本外的同向持仓被吸收进册，通常为人工加仓'
+                                       '或上一轮入账遗漏；系统会按策略接管这部分，如非本人操作请核查。')])
+                    task_log.warning(
+                        f"{rid}{inst_id} | 【账本背离·吸收】{dcn} 超出账本{ratio * 100:.0f}%："
+                        f"{ev.get('detail')}")
+            except Exception as e:
+                # 背离事件在动作前处理，任何格式化/取值异常都不得外溢中断该币本轮交易
+                task_log.warning(f"{inst_id} | 账本背离事件处理异常（不影响交易）: {e}")
+
+    def _check_persistence_health(self, run_id: str):
+        """持久化层降级告警（P2-c）：读全局 DB 连接健康度（database.db_health），
+        连续连接类失败 ≥ persist_fail_rounds → 叫醒级告警。DB 挂掉时实盘仍按内存态
+        交易，但止盈止损冷却/反向持仓计时/长周期方向记录无法落库，期间一旦重启即丢
+        状态、按冷启动默认重新判定 → 可能误平/漏平。恢复后发缓解并复位。
+        仅在每轮结束调一次，全局 latch 去重；fail-safe，异常不影响交易。
+        """
+        try:
+            if db_health is None:
+                return
+            h = db_health() or {}
+            consec = int(h.get('consecutive_failures', 0) or 0)
+            cfg = self._risk_alerts_cfg()
+            thr = max(1, int(cfg.get('persist_fail_rounds', 3)))
+            rid = f"[{run_id}] " if run_id else ''
+            if consec >= thr:
+                if not self._persist_alerted:
+                    self._persist_alerted = True
+                    task_log.error(
+                        f"{rid}【持久化降级】MySQL 连接已连续失败 {consec} 次"
+                        f"（阈值{thr}），冷却/计时/方向记录无法落库")
+                    if cfg.get('enabled', True):
+                        last_ok = float(h.get('last_ok_ts', 0) or 0)
+                        self._safe_risk_alert(
+                            'SYSTEM', f'持久化层降级（DB 连续失败 {consec} 次）',
+                            level='critical',
+                            rows=[('连续失败次数', f'{consec}（阈值{thr}）'),
+                                  ('最近错误', str(h.get('last_error', ''))[:200]),
+                                  ('最近成功写入',
+                                   time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_ok))
+                                   if last_ok else '—'),
+                                  ('影响', '实盘仍按内存态交易，但止盈止损冷却/反向持仓计时/'
+                                           '长周期方向记录等状态无法持久化；此期间若重启或崩溃，'
+                                           '这些计时会丢失并按冷启动默认重新判定，可能触发误平/漏平。'
+                                           '请尽快检查 MySQL 服务与网络。')])
+            elif self._persist_alerted:
+                self._persist_alerted = False
+                task_log.info(f"{rid}【持久化恢复】MySQL 连接恢复正常，降级告警解除")
+                if cfg.get('enabled', True):
+                    self._safe_risk_alert(
+                        'SYSTEM', '持久化层已恢复', level='recover',
+                        rows=[('状态', 'MySQL 连接恢复正常，冷却/计时/方向记录重新落库')])
+        except Exception as e:
+            task_log.warning(f"持久化健康度检测异常（不影响交易）: {e}")
+
+    def _note_link_health(self, run_id: str, total: int, ok_cnt: int, link_fail_cnt: int):
+        """链路健康聚合告警（P2-d）：整批币种在同一轮内均因 OKX 读接口失败/超时
+        （分析取数失败、持仓查询失败）而"保持不动作"，且连续 link_alert_rounds 轮
+        → 发一封聚合系统邮件（区别于 _note_cycle_result 的单币连续失败、避免多币各发
+        一封）。恢复后清 latch 发缓解。只在多币种（total≥2）时判定，单币无法区分
+        "链路挂了"还是"这枚币自身问题"，交回 _note_cycle_result。fail-safe。
+        """
+        try:
+            cfg = self._risk_alerts_cfg()
+            thr = max(1, int(cfg.get('link_alert_rounds', 3)))
+            # 本轮是否"链路成片异常"：多币种、无一成功、且每个币种都是读失败
+            bad = (total >= 2 and ok_cnt == 0 and link_fail_cnt == total)
+            rid = f"[{run_id}] " if run_id else ''
+            if bad:
+                self._link_bad_rounds += 1
+                task_log.warning(
+                    f"{rid}【链路健康】全批 {total} 币种 OKX 读失败、无一成功"
+                    f"（连续{self._link_bad_rounds}轮）")
+                if (self._link_bad_rounds >= thr and not self._link_alerted
+                        and cfg.get('enabled', True)):
+                    self._link_alerted = True
+                    task_log.error(
+                        f"{rid}【链路成片异常】连续{self._link_bad_rounds}轮全批读失败，"
+                        f"升级聚合告警")
+                    try:
+                        self.message_notifier.send_system_alert(
+                            symbol='OKX链路',
+                            title=f'OKX 链路成片异常（连续{self._link_bad_rounds}轮全批读失败）',
+                            detail=(f'实盘调度连续 {self._link_bad_rounds} 轮内全部 {total} 个币种'
+                                    f'均因 OKX 只读接口失败/超时而"保持不动作"（既未分析成功也未取到持仓），'
+                                    f'系统在此期间不做任何开平仓决策。多为网络抖动、OKX 限频或接口故障成片所致。'
+                                    f'若持续，请检查出口网络 / OKX 状态 / 限频配置；'
+                                    f'持仓在链路恢复前仅剩交易所侧兜底委托保护。'))
+                    except Exception as e:
+                        task_log.warning(f"{rid} 链路聚合告警邮件发送失败: {e}")
+            else:
+                if self._link_alerted:
+                    self._link_alerted = False
+                    task_log.info(f"{rid}【链路恢复】读取恢复，成片异常告警解除")
+                    if cfg.get('enabled', True):
+                        try:
+                            self.message_notifier.send_system_alert(
+                                symbol='OKX链路', title='OKX 链路已恢复',
+                                detail='实盘调度读取恢复正常，链路成片异常告警解除。')
+                        except Exception:
+                            pass
+                self._link_bad_rounds = 0
+        except Exception as e:
+            task_log.warning(f"链路健康聚合异常（不影响交易）: {e}")
+
+    def _alert_sl_tp_fail(self, inst_id: str, kind_cn: str, side_cn: str,
+                          reason: str, held: float, avg_px: float, price: float,
+                          pnl_pct: float, run_id: str):
+        """止盈/止损触发但平仓未成功（P0-2）：连续计数达阈值升级为"名义止损失效、
+        持仓裸露"叫醒级告警。通用交易失败邮件已由 _close_amount 发过，此处是专项
+        升级 + 连续失败留痕；平仓成功时由调用方复位 _sltp_fail_streak。"""
+        try:
+            cfg = self._risk_alerts_cfg()
+            rid = f"[{run_id}] " if run_id else ''
+            streak = self._sltp_fail_streak.get(inst_id, 0) + 1
+            self._sltp_fail_streak[inst_id] = streak
+            task_log.error(
+                f"{rid}{inst_id} | 【{kind_cn}·平仓失败】{side_cn} | 已连续{streak}轮 | "
+                f"原因：{reason} | 平仓委托未成功，下轮重试")
+            if not cfg.get('enabled', True):
+                return
+            thr = max(1, int(cfg.get('sl_tp_fail_rounds', 2)))
+            if streak >= thr and (streak - thr) % thr == 0:
+                self._safe_risk_alert(
+                    inst_id, f"{kind_cn}触发但平仓未成功（已{streak}轮）",
+                    level='critical',
+                    rows=[('触发类型', f'{kind_cn}（{reason}）'),
+                          ('裸露仓位', f'{side_cn} {fmt_qty(held)}张 @均价{avg_px:.6g}'),
+                          ('当前价格', f'{price:.6g}'),
+                          ('浮动盈亏', fmt_pct(pnl_pct)),
+                          ('连续失败', f'{streak} 轮（阈值{thr}）'),
+                          ('风险', '止损/止盈名义已触发但仓位未实际平掉，等于此刻没有保护；'
+                                   '系统每轮自动重试，若持续失败请人工介入平仓并检查余额/接口。')])
+        except Exception as e:
+            task_log.warning(f"{inst_id} | 止盈止损失败告警异常: {e}")
+
+    # =================================================================
     # 止盈止损检查
     # =================================================================
 
@@ -1364,10 +1808,12 @@ class TrendRangeTrader:
                 ok = self._close_bucket(inst_id, BUCKET_TREND, direction, sl_reason,
                                         run_id, short_period, long_period, current_price)
                 if not ok:
-                    task_log.error(
-                        f"{rid}{inst_id} | 【止损·失败】{side_cn} | 平仓委托未成功，下轮重试")
-                elif self._start_tp_cooldown(inst_id, sl_reason, short_period, run_id):
-                    result['cooldown_started'] = True
+                    self._alert_sl_tp_fail(inst_id, '止损', side_cn, sl_reason,
+                                           held, avg_px, current_price, pnl_pct, run_id)
+                else:
+                    self._sltp_fail_streak.pop(inst_id, None)
+                    if self._start_tp_cooldown(inst_id, sl_reason, short_period, run_id):
+                        result['cooldown_started'] = True
                 result['details'].append(
                     f"{side_cn}止损触发({sl_reason}，盈亏{fmt_pct(pnl_pct)})"
                     f"→平{fmt_qty(held)}张{'成功' if ok else '失败'}")
@@ -1416,10 +1862,12 @@ class TrendRangeTrader:
                 ok = self._close_bucket(inst_id, BUCKET_TREND, direction, reason,
                                         run_id, short_period, long_period, current_price)
                 if not ok:
-                    task_log.error(
-                        f"{rid}{inst_id} | 【止盈·失败】{side_cn} | 平仓委托未成功，下轮重试")
-                elif self._start_tp_cooldown(inst_id, reason, short_period, run_id):
-                    result['cooldown_started'] = True
+                    self._alert_sl_tp_fail(inst_id, '止盈', side_cn, reason,
+                                           held, avg_px, current_price, pnl_pct, run_id)
+                else:
+                    self._sltp_fail_streak.pop(inst_id, None)
+                    if self._start_tp_cooldown(inst_id, reason, short_period, run_id):
+                        result['cooldown_started'] = True
                 result['details'].append(
                     f"{side_cn}止盈触发({reason}，盈亏{fmt_pct(pnl_pct)})"
                     f"→平{fmt_qty(held)}张{'成功' if ok else '失败'}")
@@ -1700,24 +2148,77 @@ class TrendRangeTrader:
         """
         backup_on = bool(tcfg.get('exchange_algo_backup', True)) and tcfg.get('enabled', True)
         atr_value = float((ctx['analysis'] or {}).get('atr_value', 0) or 0)
+        run_id = ctx.get('run_id', '')
         for direction in ('long', 'short'):
             held, avg_px = self.pos_mgr.get_position(inst_id, BUCKET_TREND, direction)
             if not backup_on or held <= 0.01 or avg_px <= 0:
-                # 开关关闭 / 无持仓 → 清除已挂兜底委托
+                # 开关关闭 / 无持仓 → 清除已挂兜底委托，并复位"保险缺失"计数（此时无保险可言缺失）
                 self.pos_mgr.sync_exchange_algo(inst_id, BUCKET_TREND, direction)
+                self._algo_fail_streak.pop(f"{inst_id}|{direction}", None)
                 continue
             levels = self.tp_engine.exchange_backup_levels(
                 tcfg.get('take_profit') or {}, tcfg.get('stop_loss') or {},
                 {'is_long': direction == 'long', 'avg_px': avg_px,
                  'atr_value': atr_value, 'sl_cfg': tcfg.get('stop_loss') or {}})
+            sl_px = levels.get('sl_trigger_px')
+            tp_px = levels.get('tp_trigger_px')
             act = self.pos_mgr.sync_exchange_algo(
                 inst_id, BUCKET_TREND, direction,
-                sl_trigger_px=levels.get('sl_trigger_px'),
-                tp_trigger_px=levels.get('tp_trigger_px'),
-                amount=held)
+                sl_trigger_px=sl_px, tp_trigger_px=tp_px, amount=held)
             if act and levels.get('note'):
                 task_log.info(
                     f"{ctx['rid']}{inst_id} | 【兜底委托】{levels['note']}")
+            # P2-b 兜底委托不在位：确有持仓且要求了静态触发价，但 sync 后交易所侧仍不在位
+            self._note_algo_backup(inst_id, direction, held, avg_px,
+                                   sl_px, tp_px, run_id)
+
+    def _note_algo_backup(self, inst_id: str, direction: str, held: float,
+                          avg_px: float, sl_px, tp_px, run_id: str):
+        """兜底委托"该挂在位却缺失"连续计数并升级告警（P2-b）。
+        交易所侧止盈止损是本地宕机/断网时的最后防线，sync_exchange_algo 挂失败或被撤
+        重挂又失败时仅 warning，静默期一长就等于裸奔。这里按 inst|direction 计连续轮数，
+        达阈值（每阈值轮重复提醒）升级叫醒级；恢复在位即复位。全程 fail-safe。
+        """
+        key = f"{inst_id}|{direction}"
+        try:
+            wants = (float(sl_px or 0) > 0) or (float(tp_px or 0) > 0)
+            if not wants:
+                # 无可表达的静态触发价（仅动态止盈，由 tp_engine 本地评估）→ 不判缺失
+                self._algo_fail_streak.pop(key, None)
+                return
+            if self.pos_mgr.algo_in_place(inst_id, BUCKET_TREND, direction):
+                if self._algo_fail_streak.pop(key, None):
+                    task_log.info(
+                        f"{inst_id} | 兜底委托恢复在位"
+                        f"（趋势仓{'多头' if direction == 'long' else '空头'}）")
+                return
+            cfg = self._risk_alerts_cfg()
+            streak = self._algo_fail_streak.get(key, 0) + 1
+            self._algo_fail_streak[key] = streak
+            dcn = '多头' if direction == 'long' else '空头'
+            rid = f"[{run_id}] " if run_id else ''
+            task_log.warning(
+                f"{rid}{inst_id} | 【兜底委托不在位】趋势仓{dcn} {held:g}张，"
+                f"交易所侧保险未挂上（已连续{streak}轮）")
+            if not cfg.get('enabled', True):
+                return
+            thr = max(1, int(cfg.get('algo_fail_rounds', 3)))
+            if streak >= thr and (streak - thr) % thr == 0:
+                sl_disp = f'{float(sl_px):.6g}' if float(sl_px or 0) > 0 else '—'
+                tp_disp = f'{float(tp_px):.6g}' if float(tp_px or 0) > 0 else '—'
+                self._safe_risk_alert(
+                    inst_id, f'兜底委托连续{streak}轮挂不上（趋势仓{dcn}）',
+                    level='critical',
+                    rows=[('篮子/方向', f'趋势跟踪·{dcn}'),
+                          ('持仓', f'{held:g}张 @ 均价{avg_px:.6g}'),
+                          ('期望触发价', f'止损 {sl_disp} / 止盈 {tp_disp}'),
+                          ('连续缺失轮数', f'{streak} 轮（阈值{thr}）'),
+                          ('影响', '交易所侧止盈止损兜底委托是程序宕机/断网时的最后一道防线；'
+                                   '连续多轮挂不上意味着此刻若本地失联，该仓位在交易所侧将无任何'
+                                   '自动平仓保护。请检查保证金是否足额、交易权限是否正常、OKX 策略'
+                                   '委托接口是否异常。')])
+        except Exception as e:
+            task_log.warning(f"{inst_id} | 兜底委托在位检测异常（不影响交易）: {e}")
     
     def _run_range_position(self, inst_id: str, rcfg: Dict, ctx: Dict) -> Dict:
         """区间波动仓位一轮调度：BOLL 边界限价开平、无限循环刷区间。"""
@@ -1983,7 +2484,7 @@ class TrendRangeTrader:
                 exit_price_type=exit_price_type)
             if not analysis:
                 task_log.warning(f"{rid}{inst_id} | 【分析失败】无法获取数据")
-                return {'success': False, 'error': '双周期趋势分析失败'}
+                return {'success': False, 'error': '双周期趋势分析失败', 'link_error': True}
 
             short_direction = analysis['direction']       # 'long' or 'short'
             # 长周期方向可能为 None（K线不足/计算异常），不能默认看多
@@ -2037,7 +2538,7 @@ class TrendRangeTrader:
                 task_log.warning(
                     f"{rid}{inst_id} | 【跳过本轮】持仓查询失败（网络/API），暂不交易，"
                     f"避免误判持仓量导致重复开仓")
-                return {'success': False, 'error': '持仓查询失败，跳过本轮'}
+                return {'success': False, 'error': '持仓查询失败，跳过本轮', 'link_error': True}
 
             # 3b. 观察模式切换（trade_enabled=false：只分析+发邮件，对交易所零操作）
             #     进入首轮：撤销全部未成交挂单，避免遗留挂单在不知情时成交
@@ -2096,6 +2597,11 @@ class TrendRangeTrader:
                 .get('fills') or []
             self.pos_mgr.reconcile(inst_id, pos_by_mode['cross'], pos_by_mode['isolated'],
                                    price=current_price)
+            # 4b-2. 账本大幅背离告警（P2-a）：紧接动作前对账排空背离事件（本轮任何程序
+            #       平仓之前，缩减≈强平/爆仓/账户被人工平仓、吸收≈人工加仓），及时叫醒并留痕。
+            #       平仓动作后 _refresh_positions 的再对账属程序自身行为，已在 set_context 复位，
+            #       不会重复计入。fail-safe，异常不影响主流程。
+            self._handle_ledger_divergence(inst_id, run_id)
             # 4c. 手动平仓检测：对账后账本缩减（系统外持仓减少）= 交易所侧手动平仓/强平，
             #     复用人工强平冷却禁止立即重新开仓（检测点在本轮任何程序平仓动作之前，
             #     程序自身平仓均已即时入账，不会误判）
@@ -2160,6 +2666,10 @@ class TrendRangeTrader:
                 self._notify_fills(inst_id, '区间波动', [
                     f for f in early_fills if f.get('bucket') == BUCKET_RANGE], ctx)
 
+            # 5a. 插针保护：与上一轮现价环比，命中即设暂停到期（并发改配置热生效）。
+            #     本轮命中会在下面 5d 闸门即时拦截开仓；开关默认关闭，未开启零副作用。
+            self._note_spike_guard(inst_id, current_price, run_id)
+
             # 5b. 人工强平冷却：冷却期内两个仓位都禁止开新仓（平仓/撤单照常）
             pause_remaining = self._manual_pause_remaining(inst_id)
             if pause_remaining > 0:
@@ -2192,6 +2702,24 @@ class TrendRangeTrader:
                         task_log.info(
                             f"{rid}{inst_id} | 【止盈止损冷却】剩余约{cd_left}个短周期"
                             f"({tp_cd_remaining / 60:.0f}分钟)，期间禁止开新仓")
+
+            # 5d. 插针临时禁开仓：spike_guard 判定插针后暂停期内，两个仓位禁止开新仓
+            #     （平仓/撤单照常）。观察模式对交易所零操作无需拦截；每轮写结构化流水，
+            #     task_log 仅进入暂停后首轮提示一次（防刷屏）。
+            if not watch:
+                spike_remaining = self._spike_pause_remaining(inst_id)
+                if spike_remaining > 0:
+                    ctx['trend_allow_entry'] = False
+                    ctx['range_allow_entry'] = False
+                    ctx['spike_pause_remaining'] = int(spike_remaining)
+                    trade_log.info(
+                        f"{rid}插针保护 | 拦截开仓 | {inst_id} | 趋势仓/区间仓均禁止 | "
+                        f"spike_pause_remaining={spike_remaining / 60:.1f}分钟")
+                    if inst_id not in self._spike_logged:
+                        self._spike_logged.add(inst_id)
+                        task_log.warning(
+                            f"{rid}{inst_id} | 【插针保护】暂停自动开新仓中，"
+                            f"剩余{spike_remaining / 60:.1f}分钟")
 
             # 6. 长周期方向反转处理
             #    区间仓：旧方向持仓直接强平（未成交挂单由 process_range 撤单换向）
@@ -2306,6 +2834,10 @@ class TrendRangeTrader:
                 trend_res = self._run_trend_position(inst_id, tcfg, ctx)
                 self._sync_trend_algo(inst_id, tcfg, ctx)
                 range_res = self._run_range_position(inst_id, rcfg, ctx)
+
+            # 9b. 本轮下单失败分级处理（P0-1 连续被拒升级 / P0-3 结果未知孤儿单核实）：
+            #     必须在挂单阶段结束后、心跳输出前排空；fail-safe，异常不影响主流程
+            self._handle_place_failures(inst_id, run_id)
 
             # 10. 本轮单行心跳：方向 + 持仓 + 动作，一行看清执行状态
             #     事件细节（挂单/成交/撤单/风控拦截等）已按场景模板单独输出
@@ -2448,6 +2980,7 @@ class TrendRangeTrader:
                 f"[{run_id}] ══ 第{self._run_count}轮开始 | {len(currency_list)}币种 ══")
 
             ok_cnt = 0
+            link_fail_cnt = 0
             for item in currency_list:
                 if self.stop_event.is_set():
                     break
@@ -2479,6 +3012,8 @@ class TrendRangeTrader:
                     self._note_cycle_result(inst_id, res)
                     if res and res.get('success'):
                         ok_cnt += 1
+                    elif res and res.get('link_error'):
+                        link_fail_cnt += 1
                 except Exception as e:
                     task_log.error(f"[{run_id}] {item.get('inst_id')} | 【执行异常】{e}")
                     self._note_cycle_result(item.get('inst_id'),
@@ -2488,6 +3023,10 @@ class TrendRangeTrader:
             # 本轮全部币种处理完毕后才写盘：确保磁盘方向 = “已完整执行”的方向；
             # 若中途崩溃/断网，重启后仍按旧方向比对，能重新触发长周期反转清理。
             self._save_directions()
+            # P2-c 持久化降级 / P2-d 链路健康聚合：每轮一次的全局旁路检查，读全局状态
+            # + latch 去重，绝不新增 OKX 调用、绝不影响交易主流程。
+            self._check_persistence_health(run_id)
+            self._note_link_health(run_id, len(currency_list), ok_cnt, link_fail_cnt)
             task_log.info(
                 f"[{run_id}] ══ 本轮结束 | 成功{ok_cnt}/{len(currency_list)} | "
                 f"耗时{elapsed}s ══")

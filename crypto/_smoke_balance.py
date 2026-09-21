@@ -10,8 +10,8 @@
   2. 清空后执行全部用例
   3. finally 中无条件恢复快照（无论用例成败）
 
-前置条件：环境变量 CRYPTO_DB_URL 已设置
-  （mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）
+前置条件：环境变量 CRYPTO_TEST_DB_URL 指向专用隔离测试库。
+未配置或不合规时退出码 2 —— 本用例会清空 balance_history，绝不允许在业务库上跑。
 """
 
 import os
@@ -27,8 +27,13 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-if not os.environ.get('CRYPTO_DB_URL', '').strip():
-    print('❌ 请先设置环境变量 CRYPTO_DB_URL（mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）')
+from crypto.test_isolation import (  # noqa: E402
+    require_isolated_test_db, ensure_test_schema, TestDbNotConfigured)
+
+try:
+    _TEST_DB_URL = require_isolated_test_db()
+except TestDbNotConfigured as e:
+    print(f'❌ {e}')
     sys.exit(2)
 
 from sqlalchemy import select, delete  # noqa: E402
@@ -37,7 +42,9 @@ from crypto import balance_repo as repo  # noqa: E402
 from crypto.database import session_scope  # noqa: E402
 from crypto.models import BalanceHistory  # noqa: E402
 
-print(f"[Smoke] 目标数据库: {os.environ['CRYPTO_DB_URL'].split('@')[-1]}")
+print(f"[Smoke] 目标数据库（隔离测试库）: {_TEST_DB_URL.split('@')[-1]}")
+# 表结构补齐：全新隔离库（或本地 SQLite 文件）首次跑时表还不存在；只建表不动数据
+ensure_test_schema()
 
 _ACC = 'smoke_test_acc'
 _NOW_MS = int(time.time() * 1000)

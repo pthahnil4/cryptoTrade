@@ -3,13 +3,15 @@
 """任务计划模块冒烟测试（MySQL 版）：用 Flask test_client 验证 plan_bp 全部 API
 
 测试隔离策略（保护真实数据）：
-  1. 运行前快照 plan_plans / plan_cards / plan_slots 三表
+  1. 必须设置 CRYPTO_TEST_DB_URL 指向专用测试库（库名含 test/smoke/ci/sandbox），
+     守卫会把它接成 CRYPTO_DB_URL 并把数据目录换到临时目录；
+  2. 运行前快照 plan_plans / plan_cards / plan_slots 三表
      + kv_store 中 task_plans_initialized 标记
-  2. 清空后执行全部 API 用例（空库自动预置默认计划）
-  3. finally 中无条件恢复快照（无论用例成败）
+  3. 清空后执行全部 API 用例（空库自动预置默认计划）
+  4. finally 中无条件恢复快照（无论用例成败）
 
-前置条件：环境变量 CRYPTO_DB_URL 已设置
-  （mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）
+前置条件：环境变量 CRYPTO_TEST_DB_URL 已设置且指向隔离测试库。
+未配置或不合规时直接退出码 2 —— 本用例会清空整表，绝不允许在业务库上跑。
 """
 
 import json
@@ -25,8 +27,13 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-if not os.environ.get('CRYPTO_DB_URL', '').strip():
-    print('❌ 请先设置环境变量 CRYPTO_DB_URL（mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）')
+from crypto.test_isolation import (  # noqa: E402
+    require_isolated_test_db, ensure_test_schema, TestDbNotConfigured)
+
+try:
+    _TEST_DB_URL = require_isolated_test_db()
+except TestDbNotConfigured as e:
+    print(f'❌ {e}')
     sys.exit(2)
 
 from sqlalchemy import select, delete  # noqa: E402
@@ -35,7 +42,13 @@ from crypto.database import session_scope  # noqa: E402
 from crypto.models import PlanPlan, PlanCard, PlanSlot, KVStore  # noqa: E402
 from flask import Flask  # noqa: E402
 
-print(f"[Smoke] 目标数据库: {os.environ['CRYPTO_DB_URL'].split('@')[-1]}")
+print(f"[Smoke] 目标数据库（隔离测试库）: {_TEST_DB_URL.split('@')[-1]}")
+
+# 隔离库表结构补齐：全新库（或本地 SQLite 文件）首次运行时表还不存在，
+# 下面的快照 SELECT 会直接失败。只建表，不动任何数据。
+_created = ensure_test_schema()
+if _created:
+    print(f'[Smoke] 隔离测试库补建 {len(_created)} 张缺失表')
 
 _INIT_KEY = 'task_plans_initialized'
 
@@ -225,8 +238,9 @@ try:
         'record': {'prediction': '涨', 'duration_minutes': 60, 'actual': '跌',
                    'market_analysis': '改判', 'action_advice': '', 'account_balance': ''}})
     d = r.get_json()
+    # update-slot 的响应载荷是 {'slot': {...}}（与 fill-slot 同构），record 在 slot 内
     check('更新成功且 hit 重算为 False',
-          d['code'] == 200 and d['data']['record'].get('hit') is False)
+          d['code'] == 200 and d['data']['slot']['record'].get('hit') is False)
     r = post('/plan/api/update-slot', {
         'plan_id': trade_plan['id'], 'card_id': active_trade['id'],
         'slot_index': 5, 'record': {}})

@@ -289,10 +289,12 @@ check('12e TradeExecutor._rl 存在且默认走限频', hasattr(te.TradeExecutor
 print('\n=== 13. 幂等打标仍然生效（与 #4 交叉回归）===')
 scenario(OKX_RL_ORDER_QUERY='50:50')
 cid = te.gen_cl_ord_id('ct', seed='BTC-USDT-SWAP|buy|1')
+# 口径＝OKX 实测（纯字母数字 1~32），不是照抄 Binance 的 [A-Za-z0-9_-]{1,64}；
+# 详见 _smoke_cl_ord_id.py 第 1 组与 _diag_cl_ord_id_charset.py（2026-09-11 51000 事故）
 check('13a 客户号仍满足 OKX 字符集/长度约束',
-      re.fullmatch(r'[A-Za-z0-9_-]{1,64}', cid) is not None, cid)
+      re.fullmatch(r'[A-Za-z0-9]{1,32}', cid) is not None, cid)
 check('13b 前缀与 seed 后缀结构未变',
-      cid.startswith('ct_') and re.fullmatch(r'ct_[0-9a-f]+_[0-9a-f]{6}', cid) is not None, cid)
+      cid.startswith('ct') and re.fullmatch(r'ct[0-9a-f]{19,}[0-9a-f]{6}', cid) is not None, cid)
 
 print(f"\n结果：PASS {len(PASS)} / FAIL {len(FAIL)}")
 if FAIL:

@@ -53,6 +53,27 @@ def load_config(session):
     return row.to_dict()
 
 
+def lock_config(session):
+    """写事务先锁配置行；累计值及食物编号共享这一串行化入口。
+
+    空库用幂等插入避免两个首次写请求竞争；不在普通 GET 建锁行。
+    """
+    dialect = session.get_bind().dialect.name
+    if dialect == 'mysql':
+        from sqlalchemy.dialects.mysql import insert
+        create = insert(CalorieConfig).values(id=1, **DEFAULT_CONFIG)
+        create = create.on_duplicate_key_update(id=1)
+    elif dialect == 'sqlite':
+        from sqlalchemy.dialects.sqlite import insert
+        create = insert(CalorieConfig).values(id=1, **DEFAULT_CONFIG).on_conflict_do_nothing()
+    else:
+        raise RuntimeError('热量写入锁仅支持 MySQL 和离线 SQLite 测试')
+    # 先插入/原值更新取排他锁，避免空库 SELECT FOR UPDATE 间隙锁升级死锁。
+    session.execute(create)
+    stmt = select(CalorieConfig).where(CalorieConfig.id == 1).with_for_update()
+    return session.execute(stmt.execution_options(populate_existing=True)).scalar_one().to_dict()
+
+
 def save_config(session, config):
     """整体写入配置（UPSERT 单行）"""
     row = session.get(CalorieConfig, 1)
@@ -69,17 +90,27 @@ def save_config(session, config):
 # 每日记录
 # =============================================================================
 
-def _record_to_dict(session, row):
-    """记录行 -> 与 JSON 版结构一致的 dict（含三餐食物明细数组）"""
-    items = session.execute(
-        select(CalorieMealItem)
-        .where(CalorieMealItem.record_id == row.id)
-        .order_by(CalorieMealItem.meal, CalorieMealItem.position)
-    ).scalars().all()
+def _record_to_dict(session, row, items=None):
+    """记录行序列化；列表调用显式提供明细，避免逐条回源。"""
+    if items is None:
+        items = session.execute(
+            select(CalorieMealItem)
+            .where(CalorieMealItem.record_id == row.id)
+            .order_by(CalorieMealItem.meal, CalorieMealItem.position)
+        ).scalars().all()
     meals = {m: [] for m in _MEALS}
     for it in items:
         if it.meal in meals:
-            meals[it.meal].append({'name': it.name, 'calories': it.calories})
+            # 明细结构扩展：calories 为单位热量，总摄入 = calories × quantity；
+            # 存量行 quantity 列默认 1，与原绝对热量语义兼容
+            qty = round(float(it.quantity or 1.0), 3)
+            meals[it.meal].append({
+                'name': it.name,
+                'calories': it.calories,
+                'quantity': qty,
+                'unit': it.unit or '',
+                'total_calories': round(float(it.calories or 0) * qty, 2),
+            })
     return {
         'id': row.id,
         'date': row.date,
@@ -109,7 +140,39 @@ def load_records(session, order_by_date_asc=True):
     """全部记录（默认按日期升序，对齐 JSON 版 _recalc_cumulative 的排序语义）"""
     order = CalorieRecord.date.asc() if order_by_date_asc else CalorieRecord.date.desc()
     rows = session.execute(select(CalorieRecord).order_by(order)).scalars().all()
-    return [_record_to_dict(session, r) for r in rows]
+    grouped = {}
+    for start in range(0, len(rows), 500):
+        ids = [r.id for r in rows[start:start + 500]]
+        items = session.execute(select(CalorieMealItem).where(
+            CalorieMealItem.record_id.in_(ids)
+        ).order_by(CalorieMealItem.record_id, CalorieMealItem.meal,
+                   CalorieMealItem.position)).scalars().all()
+        for item in items:
+            grouped.setdefault(item.record_id, []).append(item)
+    return [_record_to_dict(session, r, grouped.get(r.id, [])) for r in rows]
+
+
+def load_record_metrics(session):
+    """累计值、配置重算及看板专用：不读取正文或三餐明细。"""
+    cols = ('id', 'date', 'morning_weight', 'bmr', 'breakfast_calories',
+            'lunch_calories', 'dinner_calories', 'intake_deficit', 'daily_steps',
+            'exercise_calories', 'calorie_deficit', 'cumulative_deficit')
+    rows = session.execute(select(*(getattr(CalorieRecord, c) for c in cols))
+                           .order_by(CalorieRecord.date)).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def changed_metrics(before, after):
+    """仅返回实际变化的数值列；累计计算仍由原计算引擎完成。"""
+    old = {r['id']: r for r in before}
+    updates = []
+    fields = ('bmr', 'intake_deficit', 'exercise_calories',
+              'calorie_deficit', 'cumulative_deficit')
+    for row in after:
+        diff = {k: row[k] for k in fields if k in row and old[row['id']].get(k) != row[k]}
+        if diff:
+            updates.append(dict(diff, id=row['id']))
+    return updates
 
 
 def get_record(session, record_id):
@@ -144,26 +207,32 @@ def upsert_record(session, record):
     row.updated_at = _parse_ts(record.get('updated_at')) or datetime.datetime.now()
     session.flush()
 
-    # 重建三餐明细
+    # 重建三餐明细（calories=单位热量，quantity 缺省 1，unit 存单位快照）
     session.execute(delete(CalorieMealItem).where(CalorieMealItem.record_id == row.id))
     for meal in _MEALS:
         for pos, item in enumerate(record.get(f'{meal}_foods') or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                qty = float(item.get('quantity', 1) or 1)
+            except (ValueError, TypeError):
+                qty = 1.0
+            if qty <= 0:
+                qty = 1.0
             session.add(CalorieMealItem(
                 record_id=row.id, meal=meal, position=pos,
                 name=str(item.get('name', '') or '')[:64],
-                calories=float(item.get('calories', 0) or 0)))
+                calories=float(item.get('calories', 0) or 0),
+                quantity=round(qty, 3),
+                unit=str(item.get('unit', '') or '')[:32]))
     session.flush()
 
 
 def delete_record(session, record_id):
     """删除记录（明细由外键级联清理）；返回是否存在并删除"""
-    row = session.get(CalorieRecord, record_id)
-    if row is None:
-        return False
     session.execute(delete(CalorieMealItem).where(CalorieMealItem.record_id == record_id))
-    session.delete(row)
-    session.flush()
-    return True
+    result = session.execute(delete(CalorieRecord).where(CalorieRecord.id == record_id))
+    return result.rowcount > 0
 
 
 def update_record_fields(session, record_id, **fields):
@@ -187,32 +256,36 @@ def bulk_update_records(session, updates):
     """
     if not updates:
         return
-    ids = [u['id'] for u in updates]
-    cols = set()
-    for u in updates:
-        cols.update(k for k in u.keys() if k != 'id')
-    values = {}
-    for col in cols:
-        if not hasattr(CalorieRecord, col):
-            continue
-        values[col] = case(
-            *[(CalorieRecord.id == u['id'], u[col]) for u in updates if col in u])
-    if not values:
-        return
-    session.execute(
-        update(CalorieRecord)
-        .where(CalorieRecord.id.in_(ids))
-        .values(**values))
+    for start in range(0, len(updates), 500):
+        batch = updates[start:start + 500]
+        ids = [u['id'] for u in batch]
+        cols = {k for u in batch for k in u if k != 'id'}
+        values = {}
+        for col in sorted(cols):
+            if col not in CalorieRecord.__table__.columns:
+                continue
+            column = getattr(CalorieRecord, col)
+            # 稀疏差量中未提供此列的行必须保持原值，不能由 CASE 写成 NULL。
+            values[col] = case(
+                *[(CalorieRecord.id == u['id'], u[col]) for u in batch if col in u],
+                else_=column)
+        if values:
+            session.execute(update(CalorieRecord).where(CalorieRecord.id.in_(ids))
+                            .values(**values).execution_options(synchronize_session=False))
     session.flush()
+    session.expire_all()
 
 
 # =============================================================================
 # 食物热量库
 # =============================================================================
 
-def load_foods(session):
-    """全部食物（按库内插入顺序：id 升序，与 JSON 数组顺序一致）"""
-    rows = session.execute(select(CalorieFood).order_by(CalorieFood.id)).scalars().all()
+def load_foods(session, for_update=False):
+    """全部食物；首次初始化的二次确认使用当前读。"""
+    stmt = select(CalorieFood).order_by(CalorieFood.id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    rows = session.execute(stmt).scalars().all()
     return [f.to_dict() for f in rows]
 
 
@@ -227,6 +300,35 @@ def find_food_by_name(session, name):
         select(CalorieFood).where(CalorieFood.name == (name or '').strip())
     ).scalars().first()
     return row.to_dict() if row else None
+
+
+def add_missing_foods(session, names):
+    """批量检查名称，比较规则仍由数据库决定；调用方须先 lock_config。"""
+    from sqlalchemy import literal, union_all
+    names = list(dict.fromkeys(n.strip() for n in names if n and n.strip()))
+    existing = set()
+    for start in range(0, len(names), 100):
+        checks = [select(literal(name).label('name')).where(
+            select(CalorieFood.id).where(CalorieFood.name == name).exists()
+        ) for name in names[start:start + 100]]
+        existing.update(session.execute(union_all(*checks)).scalars())
+    added = []
+    next_num = None
+    for name in names:
+        if name in existing:
+            continue
+        # 同一批新名字也可能按数据库排序规则相等（不只是 Python lower）。
+        if added and find_food_by_name(session, name):
+            continue
+        if next_num is None:
+            next_num = int(next_food_id(session).split('_')[-1])
+        food = dict(id=f'food_{next_num:03d}', name=name, unit='100克',
+                    calories=0, category='其他',
+                    created_at=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        add_food(session, food)
+        next_num += 1
+        added.append(food)
+    return added
 
 
 def find_food_by_name_excluding(session, name, exclude_id):
@@ -251,7 +353,7 @@ def next_food_id(session):
     return f'food_{max_num + 1:03d}'
 
 
-def add_food(session, food):
+def add_food(session, food, flush=True):
     """新增食物（food 为含 id/name/unit/calories/category/created_at 的 dict）"""
     session.add(CalorieFood(
         id=food['id'],
@@ -260,7 +362,8 @@ def add_food(session, food):
         calories=float(food.get('calories', 0) or 0),
         category=food.get('category', '其他'),
         created_at=_parse_ts(food.get('created_at'))))
-    session.flush()
+    if flush:
+        session.flush()
 
 
 def update_food_fields(session, food_id, **fields):

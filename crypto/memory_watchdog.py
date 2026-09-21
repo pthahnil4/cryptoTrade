@@ -3,15 +3,23 @@
 """
 进程内存自监控（Memory Watchdog）
 ==================================
-后台守护线程每 5 分钟检查一次本进程物理内存（RSS，跨平台）：
+后台守护线程每 2 分钟检查一次本进程物理内存（RSS，跨平台）：
 
 1. 每次检查输出结构化日志，并追加一条记录到本地 JSON 日志文件
    ``logs/memory_history.jsonl`` —— 即使进程被系统 OOM 杀掉，
    趋势证据仍保留在磁盘上，供 /system-status 页面回溯泄漏曲线。
+   这份记录同时被 ``process_lifecycle`` 当作**心跳**使用：进程被外部强杀时
+   来不及留任何退出说明，「心跳停在什么时候」就是它死掉的时间。
 2. RSS 超过 warn_mb（默认 600MB）：发送告警邮件（30 分钟冷却防刷屏）。
-3. RSS 超过 kill_mb（默认 800MB）：记录日志 + 发送告警邮件，
-   然后 ``os._exit(1)`` 强制退出，由外部管理器（supervisord，
-   需配置 autorestart=true）自动拉起，完成内存重置。
+3. RSS 超过 kill_mb（默认 800MB）：记录日志 + 发送告警邮件，再由
+   ``process_lifecycle.hard_exit('mem_kill')`` 先落退出标记、然后
+   ``os._exit(1)`` 强制退出，由外部管理器（supervisord，需配置
+   autorestart=true）自动拉起，完成内存重置。
+
+为什么检查间隔是 2 分钟而不是 5 分钟：pandas/backtrader 一轮批量分析能让
+RSS 在一两分钟内跳 200~300MB，5 分钟粒度下「撞到 800 才发现」实际峰值往往
+已经 1.1G 以上，在 2G 机器上这就到了内核 OOM killer 的射程内 —— 被 ``kill -9``
+就轮不到我们体面地留下退出原因了。一次 ``/proc`` 读取的开销可以忽略。
 
 环境变量（可选覆盖）：
 - CRYPTO_MEM_WARN_MB    预警阈值（MB）
@@ -38,6 +46,16 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# 生命周期归因层：强退前必须把「我是被内存撞线杀掉的」这条因果落到磁盘上，
+# 否则新进程起来只能靠猜。取不到时退化为直接 os._exit（丢失归因，不丢功能）。
+try:
+    from . import process_lifecycle as _lifecycle
+except Exception:  # pragma: no cover - 包外裸模块身份时的兼容分支
+    try:
+        import process_lifecycle as _lifecycle
+    except Exception:
+        _lifecycle = None
+
 _CRYPTO_DIR = os.path.dirname(os.path.abspath(__file__))
 _TASK_DIR = os.path.join(_CRYPTO_DIR, 'task')
 # 历史日志目录约定：crypto/logs/（与 task_scheduler.log 同级）
@@ -46,10 +64,10 @@ HISTORY_FILENAME = 'memory_history.jsonl'
 
 DEFAULT_WARN_MB = 600
 DEFAULT_KILL_MB = 800
-DEFAULT_INTERVAL_SEC = 300      # 每 5 分钟检查一次
+DEFAULT_INTERVAL_SEC = 120      # 每 2 分钟检查一次（见文件头「为什么不是 5 分钟」）
 EMAIL_COOLDOWN_SEC = 30 * 60    # 同类邮件冷却 30 分钟
 
-# JSONL 体积控制：每 5 分钟 1 条，5 万条约可回溯 170 天
+# JSONL 体积控制：每 2 分钟 1 条（外加系统监控每 60s 一条），5 万条约可回溯数月
 HISTORY_MAX_LINES = 50000
 HISTORY_KEEP_LINES = 35000
 
@@ -370,9 +388,22 @@ def _monitor_loop():
                              f"当前RSS: {rss:.1f}MB（强退阈值 {_state['kill_mb']}MB）"
                              f"{extra}\n"
                              f"若频繁触发，请打开 /system-status 页面结合历史趋势排查内存泄漏。"))
-                for h in logging.getLogger().handlers:
+                if _lifecycle is not None:
+                    # 先落退出标记再退：重启后的归因全靠这一行
+                    # （hard_exit 内部已 flush 全部 handler 并 os._exit，正常不返回）
+                    _lifecycle.hard_exit(_lifecycle.REASON_MEM_KILL, {
+                        'rss_mb': round(rss, 1),
+                        'kill_mb': _state['kill_mb'],
+                        'warn_mb': _state['warn_mb'],
+                        'interval_sec': _state['interval_sec'],
+                    })
+                # 兜底：归因层不可用时仍按老路径退出（本次重启会被归因成异常死亡）
+                _handlers = list(logging.getLogger().handlers)
+                for _lg in list(logging.Logger.manager.loggerDict.values()):
+                    _handlers.extend(list(getattr(_lg, 'handlers', None) or []))
+                for _h in _handlers:
                     try:
-                        h.flush()
+                        _h.flush()
                     except Exception:
                         pass
                 os._exit(1)

@@ -61,7 +61,7 @@ CHECK_INTERVAL_SECONDS = 300
 ANALYSIS_PAGE_PATH = '/analysis'
 
 # Web 服务端口（app.py 里 app.run 用的那个）：自动探测站点地址时拼上去
-DEFAULT_WEB_PORT = 5000
+DEFAULT_WEB_PORT = 7777
 
 _LAST_RUN = {
     'finished_at': None,

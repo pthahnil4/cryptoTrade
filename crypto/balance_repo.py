@@ -36,12 +36,15 @@ def load_all(session):
     return {'accounts': accounts}
 
 
-def load_account_points(session, account_key):
-    """读取单账号快照点列表（ts 升序）"""
-    rows = session.execute(
-        select(BalanceHistory)
-        .where(BalanceHistory.account_key == account_key)
-        .order_by(BalanceHistory.ts)).scalars().all()
+def load_account_points(session, account_key, start_ms=None, end_ms=None):
+    """读取单账号快照，按 ts 升序；可选时间范围为 [start_ms, end_ms)。"""
+    stmt = select(BalanceHistory.ts, BalanceHistory.balance, BalanceHistory.source).where(
+        BalanceHistory.account_key == account_key)
+    if start_ms is not None:
+        stmt = stmt.where(BalanceHistory.ts >= start_ms)
+    if end_ms is not None:
+        stmt = stmt.where(BalanceHistory.ts < end_ms)
+    rows = session.execute(stmt.order_by(BalanceHistory.ts)).all()
     return [_row_to_dict(r) for r in rows]
 
 

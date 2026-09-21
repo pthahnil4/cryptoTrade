@@ -18,6 +18,9 @@ SQLAlchemy 表模型定义（与 db_schema.sql 保持同步）
   批次10：定时任务实盘分析记录（task_analysis_records）
   批次11：分析纪律（task_analysis_records 增 source/hour_slot，
                  plan_slots 增分析关联列，新表 analysis_reminder_log）
+  批次12：盘感模拟模块（instinct_corpus / instinct_wiki_rules /
+                 instinct_predictions / instinct_embeddings，
+                 详见 doc/RAG_LLM_Wiki模拟盘感落地方案.md）
 
 序列化约定：created_at / updated_at 在库中为 DATETIME，对外 API
 序列化时统一转回 'YYYY-MM-DD HH:MM:SS' 字符串，保持与 JSON 版契约一致。
@@ -30,6 +33,7 @@ from sqlalchemy import (
     String, Text, DateTime, Boolean, Float, Double, Integer, BigInteger,
     ForeignKey, UniqueConstraint, Index
 )
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -169,7 +173,11 @@ class CalorieRecord(Base):
 
 
 class CalorieMealItem(Base):
-    """三餐食物明细（原记录内 breakfast_foods/lunch_foods/dinner_foods 数组）"""
+    """三餐食物明细（原记录内 breakfast_foods/lunch_foods/dinner_foods 数组）
+
+    每条明细结构：{name, calories(单位热量), quantity(数量，支持小数), unit(单位快照)}
+    该行总摄入 = calories × quantity；存量行 quantity 缺省 1，语义与原绝对热量兼容
+    """
     __tablename__ = 'calorie_meal_items'
     __table_args__ = (UniqueConstraint('record_id', 'meal', 'position', name='uk_meal_item'),)
 
@@ -180,6 +188,8 @@ class CalorieMealItem(Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     calories: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    unit: Mapped[str] = mapped_column(String(32), nullable=False, default='')
 
 
 class CalorieConfig(Base):
@@ -249,6 +259,11 @@ class PlanCard(Base):
     end_time: Mapped[str] = mapped_column(String(19), nullable=False, default='')
     milestones: Mapped[str] = mapped_column(Text, nullable=False, default='[]')
     todos: Mapped[str] = mapped_column(Text, nullable=False, default='[]')
+    # 任务树（任务管理 v2）：JSON 整树 [{id,title,estimated_minutes,status,
+    # children:[...],completed_at,completed_by_slot,created_at}, ...]。
+    # NULL/'' = 旧数据未迁移（加载时由 _migrate_tasks 从 milestones+todos 生成）；
+    # '[]' = 已迁移的空树
+    tasks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default='[]')
     review: Mapped[str] = mapped_column(Text, nullable=False, default='')
     settlement: Mapped[str] = mapped_column(Text, nullable=True)
@@ -280,6 +295,9 @@ class PlanSlot(Base):
     analysis_ids: Mapped[str] = mapped_column(String(255), nullable=False, default='')
     analysis_hour: Mapped[str] = mapped_column(String(13), nullable=False, default='')
     bypass_analysis: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 任务树关联（任务管理 v2）：本次打卡关联的任务 [{task_id, state:doing|done}]
+    # JSON 数组；'' / NULL / [] = 待关联（可随时补选）
+    task_links: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 # =============================================================================
@@ -520,6 +538,7 @@ class CryptoCoin(Base):
     h1_atr: Mapped[str] = _vc(24)
     h1_sar: Mapped[str] = _vc(24)
     h1_sar_color: Mapped[str] = _vc(8)
+    h1_er: Mapped[str] = _vc(24)
     # 4H 周期
     h4_trend: Mapped[str] = _vc(8)
     h4_price: Mapped[str] = _vc(24)
@@ -532,6 +551,7 @@ class CryptoCoin(Base):
     h4_atr: Mapped[str] = _vc(24)
     h4_sar: Mapped[str] = _vc(24)
     h4_sar_color: Mapped[str] = _vc(8)
+    h4_er: Mapped[str] = _vc(24)
     # 1D 周期
     d1_trend: Mapped[str] = _vc(8)
     d1_price: Mapped[str] = _vc(24)
@@ -544,6 +564,7 @@ class CryptoCoin(Base):
     d1_atr: Mapped[str] = _vc(24)
     d1_sar: Mapped[str] = _vc(24)
     d1_sar_color: Mapped[str] = _vc(8)
+    d1_er: Mapped[str] = _vc(24)
     # 15m 周期（追加存储于末尾，展示顺序由前端控制为 15m→1H→4H→1D）
     m15_trend: Mapped[str] = _vc(8)
     m15_price: Mapped[str] = _vc(24)
@@ -556,6 +577,7 @@ class CryptoCoin(Base):
     m15_atr: Mapped[str] = _vc(24)
     m15_sar: Mapped[str] = _vc(24)
     m15_sar_color: Mapped[str] = _vc(8)
+    m15_er: Mapped[str] = _vc(24)
 
     # (属性名, CSV 列名) —— 与 crypto_coins.csv 表头逐列对应
     _FIELD_MAP = [
@@ -564,18 +586,22 @@ class CryptoCoin(Base):
         ('h1_profit', '1H_盈亏%'), ('h1_close', '1H_收盘价'),
         ('h1_macd', 'MACD_1H'), ('h1_dif', 'DIF_1H'), ('h1_adx', 'ADX_1H'),
         ('h1_atr', 'ATR_1H'), ('h1_sar', 'SAR_1H'), ('h1_sar_color', 'SAR颜色_1H'),
+        ('h1_er', 'ER_1H'),
         ('h4_trend', '4H_趋势'), ('h4_price', '4H_交易价格'), ('h4_time', '4H_交易时间'),
         ('h4_profit', '4H_盈亏%'), ('h4_close', '4H_收盘价'),
         ('h4_macd', 'MACD_4H'), ('h4_dif', 'DIF_4H'), ('h4_adx', 'ADX_4H'),
         ('h4_atr', 'ATR_4H'), ('h4_sar', 'SAR_4H'), ('h4_sar_color', 'SAR颜色_4H'),
+        ('h4_er', 'ER_4H'),
         ('d1_trend', '1D_趋势'), ('d1_price', '1D_交易价格'), ('d1_time', '1D_交易时间'),
         ('d1_profit', '1D_盈亏%'), ('d1_close', '1D_收盘价'),
         ('d1_macd', 'MACD_1D'), ('d1_dif', 'DIF_1D'), ('d1_adx', 'ADX_1D'),
         ('d1_atr', 'ATR_1D'), ('d1_sar', 'SAR_1D'), ('d1_sar_color', 'SAR颜色_1D'),
+        ('d1_er', 'ER_1D'),
         ('m15_trend', '15m_趋势'), ('m15_price', '15m_交易价格'), ('m15_time', '15m_交易时间'),
         ('m15_profit', '15m_盈亏%'), ('m15_close', '15m_收盘价'),
         ('m15_macd', 'MACD_15m'), ('m15_dif', 'DIF_15m'), ('m15_adx', 'ADX_15m'),
         ('m15_atr', 'ATR_15m'), ('m15_sar', 'SAR_15m'), ('m15_sar_color', 'SAR颜色_15m'),
+        ('m15_er', 'ER_15m'),
     ]
 
     def to_dict(self):
@@ -753,3 +779,155 @@ class AnalysisReminderLog(Base):
             'notified_at': self.notified_at or '',
             'resolved_at': self.resolved_at or '',
         }
+
+
+# =============================================================================
+# 批次12：盘感模拟模块（RAG + LLM Wiki）
+# -----------------------------------------------------------------------------
+# 防泄漏核心不变式：ctx_* 列 = 决策当时可见字段（允许进检索与 prompt）；
+# outcome_*/hit_*/chg_* 列 = 事后才知字段（只做统计计分，永不进 prompt）。
+# 详见 doc/RAG_LLM_Wiki模拟盘感落地方案.md §1.2
+# =============================================================================
+
+class InstinctCorpus(Base):
+    """盘感语料库（情景记忆）：三源统一压缩成一行一样本，幂等键 (source, source_ref)"""
+    __tablename__ = 'instinct_corpus'
+    __table_args__ = (
+        UniqueConstraint('source', 'source_ref', name='uk_ic_ref'),
+        Index('idx_ic_inst_ts', 'inst_id', 'ts'),
+        Index('idx_ic_labeled', 'labeled', 'ts'),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_ref: Mapped[str] = mapped_column(String(64), nullable=False)
+    ts: Mapped[str] = mapped_column(String(19), nullable=False)
+    inst_id: Mapped[str] = mapped_column(String(32), nullable=False, default='')
+    short_period: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    long_period: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    # ▼ 当时可见上下文（防泄漏边界：只有这些字段允许进入检索与 prompt）
+    ctx_short_dir: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    ctx_long_dir: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    ctx_long_dir_prev: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    ctx_atr_pct: Mapped[float] = mapped_column(Double, nullable=False, default=0.0)
+    ctx_atr_pctile: Mapped[float] = mapped_column(Double, nullable=False, default=-1.0)
+    ctx_dir_flipped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    ctx_price: Mapped[float] = mapped_column(Double, nullable=False, default=0.0)
+    ctx_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # ▼ 当时的决策
+    judgment: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    decision_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # ▼ 事后结果（永不进 prompt；仅统计与展示标签）
+    outcome_near: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    outcome_far: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    chg_near_pct: Mapped[float] = mapped_column(Double, nullable=False, default=0.0)
+    chg_far_pct: Mapped[float] = mapped_column(Double, nullable=False, default=0.0)
+    hit_near: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    hit_far: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    labeled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    _CTX_FIELDS = ('short_period', 'long_period', 'ctx_short_dir', 'ctx_long_dir',
+                   'ctx_long_dir_prev', 'ctx_atr_pct', 'ctx_atr_pctile',
+                   'ctx_dir_flipped', 'ctx_price', 'ctx_text', 'ts', 'inst_id', 'source')
+
+    def ctx_dict(self):
+        """当时可见字段（检索/prompt 渲染唯一入口，物理上取不到 outcome 列）"""
+        return {f: getattr(self, f) for f in self._CTX_FIELDS}
+
+    def to_dict(self):
+        d = self.ctx_dict()
+        d.update({'id': self.id, 'source_ref': self.source_ref,
+                  'judgment': self.judgment, 'decision_text': self.decision_text or '',
+                  'outcome_near': self.outcome_near, 'outcome_far': self.outcome_far,
+                  'chg_near_pct': self.chg_near_pct, 'chg_far_pct': self.chg_far_pct,
+                  'hit_near': self.hit_near, 'hit_far': self.hit_far,
+                  'labeled': bool(self.labeled)})
+        return d
+
+
+class InstinctWikiRule(Base):
+    """盘感 Wiki 规则卡（语义记忆）：candidate→active 状态机，rule_key 幂等合并"""
+    __tablename__ = 'instinct_wiki_rules'
+    __table_args__ = (
+        UniqueConstraint('rule_key', name='uk_wiki_key'),
+        Index('idx_wiki_status', 'status'),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    rule_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    statement: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default='scenario')
+    condition_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stat_basis: Mapped[str] = mapped_column(String(255), nullable=False, default='')
+    evidence_refs: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default='candidate')
+    created_by: Mapped[str] = mapped_column(String(16), nullable=False, default='distiller')
+    supersedes_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    valid_until: Mapped[Optional[str]] = mapped_column(String(19), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'rule_key': self.rule_key, 'statement': self.statement,
+            'kind': self.kind, 'condition_json': self.condition_json or '',
+            'stat_basis': self.stat_basis, 'evidence_refs': self.evidence_refs or '',
+            'status': self.status, 'created_by': self.created_by,
+            'supersedes_id': self.supersedes_id, 'valid_until': self.valid_until or '',
+        }
+
+
+class InstinctPrediction(Base):
+    """LLM 影子预测流水与结算（工作记忆）：结算口径 = analysis_record_repo.classify_move"""
+    __tablename__ = 'instinct_predictions'
+    __table_args__ = (
+        Index('idx_ip_inst_ts', 'inst_id', 'ts'),
+        Index('idx_ip_status', 'status', 'ts'),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[str] = mapped_column(String(19), nullable=False)
+    inst_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    ctx_snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    judgment: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    confidence: Mapped[float] = mapped_column(Double, nullable=False, default=0.0)
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cited_rule_ids: Mapped[str] = mapped_column(String(255), nullable=False, default='')
+    cited_corpus_ids: Mapped[str] = mapped_column(String(255), nullable=False, default='')
+    wiki_ids: Mapped[str] = mapped_column(String(255), nullable=False, default='')
+    retrieved_refs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    model: Mapped[str] = mapped_column(String(64), nullable=False, default='')
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    price_at_pred: Mapped[float] = mapped_column(Double, nullable=False, default=0.0)
+    # ▼ 结算列（由回填任务写）
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default='pending')
+    price_near: Mapped[Optional[float]] = mapped_column(Double, nullable=True)
+    price_far: Mapped[Optional[float]] = mapped_column(Double, nullable=True)
+    actual_near: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    actual_far: Mapped[str] = mapped_column(String(8), nullable=False, default='')
+    hit_near: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    hit_far: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    user_trusted: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    user_agree: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+
+class InstinctEmbedding(Base):
+    """语料文本向量（v2 启用）：向量 JSON 存 TEXT，换模型全量重刷（PK 含 model）"""
+    __tablename__ = 'instinct_embeddings'
+
+    corpus_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    model: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # MEDIUMTEXT：与 db_schema.sql 对齐（向量 JSON 可远超 TEXT 64KB 上限风险）
+    vec_json: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.now)

@@ -59,9 +59,13 @@ except ImportError:
     _db_session_scope = None
     _market_repo = None
 
-# 并发 worker 数：共享 httpx 客户端线程安全，小并发即可把总耗时从串行降到约 1/3，
-# 同时控制峰值并发请求数（约 3 QPS）避免触发 OKX 限流。
-_BATCH_WORKERS = 3
+# 预热阶段并发 worker 数：仅用于"锁外并发下载K线"，真实 QPS 由 market_candles
+# 令牌桶（~5/s）封顶，worker 只是掩盖单请求网络延迟，不冲速率。5~6 足够把 220
+# 个单页请求在 ~45s 内下完，同时把峰值并发压在 OKX IP 限流线以下很多。
+_BATCH_WORKERS = 5
+
+# 整表落库降频：每完成 N 个币种或任务收尾各写一次（原来每 5 个写一次，55 币→11 次）。
+_SAVE_EVERY = 20
 
 # 批量分析覆盖的周期（按时间尺度升序）：展示顺序与前端一致。
 # 新增周期只需在此追加，并在 CSV/DB 列与 run() 写入处同步补齐对应字段。
@@ -165,6 +169,7 @@ class _ProgressState:
     def finish(self, message: str = None):
         with self._lock:
             self.status = "completed"
+            self.current = self.total  # 保证进度条最终到 100%
             self.end_time = datetime.datetime.now()
             if message:
                 self.message = message
@@ -210,6 +215,51 @@ _progress = _ProgressState()
 def get_progress() -> Dict:
     """获取当前进度（供外部调用）"""
     return _progress.to_dict()
+
+
+# ====================================================================
+#  批量运行日志缓冲（供 SSE 实时推送前端）
+# ====================================================================
+_batch_log_lines: List[Dict] = []
+_batch_log_lock = threading.Lock()
+_batch_log_seq = 0
+
+
+def _batch_log(msg: str, level: str = 'info'):
+    """追加一行结构化日志，供前端 SSE 消费。"""
+    global _batch_log_seq
+    with _batch_log_lock:
+        _batch_log_seq += 1
+        _batch_log_lines.append({
+            'seq': _batch_log_seq,
+            'ts': datetime.datetime.now().strftime('%H:%M:%S'),
+            'level': level,
+            'msg': msg,
+        })
+        # 防止无限增长（220 组合约 300+ 行，留余量）
+        if len(_batch_log_lines) > 2000:
+            del _batch_log_lines[:500]
+
+
+def get_batch_logs_since(cursor: int):
+    """返回 cursor 之后的新日志行与新游标（供 SSE 增量消费）。"""
+    with _batch_log_lock:
+        if not _batch_log_lines or _batch_log_lines[-1]['seq'] <= cursor:
+            return [], cursor
+        # 找到第一条 seq > cursor 的行
+        idx = next((i for i, l in enumerate(_batch_log_lines) if l['seq'] > cursor),
+                   len(_batch_log_lines))
+        new_lines = list(_batch_log_lines[idx:])
+        latest = _batch_log_lines[-1]['seq']
+    return new_lines, latest
+
+
+def clear_batch_logs():
+    """新一轮开始前清空日志缓冲。"""
+    global _batch_log_seq
+    with _batch_log_lock:
+        _batch_log_lines.clear()
+        _batch_log_seq = 0
 
 
 # ====================================================================
@@ -305,6 +355,41 @@ def _extract_trend_info(coin_result: Dict) -> Dict:
 
 
 # ====================================================================
+#  Kaufman 效率系数（ER）计算
+# ====================================================================
+
+def _compute_er_from_klines(klines: List[List], window: int = 8) -> float:
+    """从 K 线收盘价计算 Kaufman 效率系数 ER = |净变动| / Σ|逐根变动|
+
+    口径与 market_scanner.kaufman_efficiency_ratio 一致：取最近 window 根
+    收盘价（含最新一根），返回 0~1，越接近 1 越单边（趋势强），越接近 0 越震荡。
+
+    Parameters
+    ----------
+    klines : list
+        OKX API 返回的K线数据（最新在前），每条为 [ts, o, h, l, c, vol, ...]
+    window : int
+        参与计算的收盘价根数（默认 8，即最近 7 段变动）
+    """
+    if not klines or len(klines) < 2:
+        return ''
+    try:
+        # OKX 返回最新在前 → 反转为旧→新，再取最近 window 根收盘价
+        closes = [float(k[4]) for k in reversed(klines) if float(k[4]) > 0]
+        closes = closes[-min(len(closes), window):]
+        if len(closes) < 2:
+            return ''
+        net = abs(closes[-1] - closes[0])
+        noise = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+        if noise == 0:
+            return ''
+        return round(net / noise, 4)
+    except Exception as e:
+        logger.warning("ER计算失败: %s", str(e))
+        return ''
+
+
+# ====================================================================
 #  SAR 抛物线指标计算
 # ====================================================================
 
@@ -395,6 +480,30 @@ def _compute_sar_from_klines(klines: List[List]) -> Dict:
         return {'sar': '', 'sar_trend': '--'}
 
 
+def _df_to_klines_newest_first(df) -> List[List]:
+    """把 _fetch_kline_data 返回的 df（时间升序，列 open/high/low/close）
+    转成 `_compute_*_from_klines` 期望的"最新在前"K线行格式 [ts, o, h, l, c]。
+    SAR/ER 只用 h/l/c，ts 位置填占位 0。"""
+    arr = df[['open', 'high', 'low', 'close']].to_numpy(dtype=float)
+    klines = [[0.0, arr[i][0], arr[i][1], arr[i][2], arr[i][3]] for i in range(len(arr))]
+    klines.reverse()  # 旧→新 转成 新→旧，匹配既有函数口径
+    return klines
+
+
+def _compute_sar_from_df(df) -> Dict:
+    """直接从趋势标记价K线（df）算 SAR，复用既有抛物线递推逻辑，0 额外请求。"""
+    if df is None or len(df) < 2:
+        return {'sar': '', 'sar_trend': '--'}
+    return _compute_sar_from_klines(_df_to_klines_newest_first(df))
+
+
+def _compute_er_from_df(df, window: int = 8):
+    """直接从趋势标记价K线（df）算 Kaufman 效率系数 ER，复用既有逻辑。"""
+    if df is None or len(df) < 2:
+        return ''
+    return _compute_er_from_klines(_df_to_klines_newest_first(df), window=window)
+
+
 def _fetch_klines_for_sar(inst_id: str, bar: str, limit: int = 100) -> List[List]:
     """获取K线数据用于SAR计算（共享连接 + 缓存 + 自动重试）
 
@@ -466,7 +575,8 @@ def _read_csv() -> List[Dict]:
                 'MACD_1D', 'DIF_1D', 'ADX_1D', 'ATR_1D', 'SAR_1D', 'SAR颜色_1D',
                 'MACD_1H', 'DIF_1H', 'ADX_1H', 'ATR_1H', 'SAR_1H', 'SAR颜色_1H',
                 '15m_趋势', '15m_交易价格', '15m_交易时间', '15m_盈亏%', '15m_收盘价',
-                'MACD_15m', 'DIF_15m', 'ADX_15m', 'ATR_15m', 'SAR_15m', 'SAR颜色_15m']
+                'MACD_15m', 'DIF_15m', 'ADX_15m', 'ATR_15m', 'SAR_15m', 'SAR颜色_15m',
+                'ER_15m', 'ER_1H', 'ER_4H', 'ER_1D']
     if rows:
         for col in new_cols:
             if col not in rows[0]:
@@ -515,6 +625,7 @@ def read_csv_for_display() -> List[Dict]:
             'ATR_15m': str(row.get('ATR_15m', '')),
             'SAR_15m': str(row.get('SAR_15m', '')),
             'SAR颜色_15m': str(row.get('SAR颜色_15m', '')),
+            'ER_15m': str(row.get('ER_15m', '')),
             # 1H 周期
             '1H_趋势': str(row.get('1H_趋势', '')),
             '1H_交易价格': str(row.get('1H_交易价格', '')),
@@ -526,6 +637,7 @@ def read_csv_for_display() -> List[Dict]:
             'ATR_1H': str(row.get('ATR_1H', '')),
             'SAR_1H': str(row.get('SAR_1H', '')),
             'SAR颜色_1H': str(row.get('SAR颜色_1H', '')),
+            'ER_1H': str(row.get('ER_1H', '')),
             # 4H 周期
             '4H_趋势': str(row.get('4H_趋势', '')),
             '4H_交易价格': str(row.get('4H_交易价格', '')),
@@ -537,6 +649,7 @@ def read_csv_for_display() -> List[Dict]:
             'ATR_4H': str(row.get('ATR_4H', '')),
             'SAR_4H': str(row.get('SAR_4H', '')),
             'SAR颜色_4H': str(row.get('SAR颜色_4H', '')),
+            'ER_4H': str(row.get('ER_4H', '')),
             # 1D 周期
             '1D_趋势': str(row.get('1D_趋势', '')),
             '1D_交易价格': str(row.get('1D_交易价格', '')),
@@ -548,6 +661,7 @@ def read_csv_for_display() -> List[Dict]:
             'ATR_1D': str(row.get('ATR_1D', '')),
             'SAR_1D': str(row.get('SAR_1D', '')),
             'SAR颜色_1D': str(row.get('SAR颜色_1D', '')),
+            'ER_1D': str(row.get('ER_1D', '')),
         })
     return records
 
@@ -568,6 +682,35 @@ def get_filtered_records() -> List[Dict]:
 # ====================================================================
 #  批量趋势分析器
 # ====================================================================
+
+def _warm_kline(inst_id: str, bar: str) -> bool:
+    """锁外并发预热：经 market_candles 令牌桶限频，把 (inst_id, bar) 的标记价K线
+    下满并写入 pro3 的 run 级预热缓存，供随后锁内计算 0 网络直接命中。
+
+    - 仅批量路径在此接限频；实盘主链路 pro3._request_candles 不经此函数，保持直连，
+      不给调度主链路新增任何可能卡住取数的环节（符合 okx_ratelimit 顶部的边界约定）。
+    - _KLINE_TARGET_COUNT 已=300（单次 limit 上限），正常一页即取满、免翻页；
+      个别新上市/历史不足的币一页 <300 时按 after 向前补足。
+    """
+    import real_strategy_adapter  # noqa: F401  确保 strategy/ 目录已进 sys.path
+    import pro3_singletimeframe as _pro3
+
+    # retry_on_error=False：_request_candles 自带重试，这里只取节流与 50011 退避，不叠加网络重试
+    data = _rl('market_candles', _pro3._request_candles, inst_id, bar,
+               after=None, max_retries=2, retry_on_error=False)
+    if not data:
+        raise RuntimeError(f"预热返回空数据: {inst_id} {bar}")
+    afterts = data[-1][0]
+    while len(data) < _pro3._KLINE_TARGET_COUNT:
+        page = _rl('market_candles', _pro3._request_candles, inst_id, bar,
+                   after=str(afterts), max_retries=2, retry_on_error=False)
+        if not page:
+            break
+        data.extend(page)
+        afterts = page[-1][0]
+    _pro3.store_batch_kline(inst_id, bar, data)
+    return True
+
 
 class BatchTrendAnalyzer:
     """批量多周期趋势分析器
@@ -601,20 +744,17 @@ class BatchTrendAnalyzer:
             {'15m': {...}, '1H': {...}, '4H': {...}, '1D': {...}}（失败时额外带 'error' 键）
         """
         from real_strategy_adapter import calculate_single_coin_data
+        import pro3_singletimeframe as _pro3
 
         try:
             infos = {}
             for bar in _BATCH_BARS:
                 result = calculate_single_coin_data(inst_id, bar=bar, max_retries=2)
-                infos[bar] = _extract_trend_info(result)
-                if on_step:
-                    on_step(bar)
-
-            # 计算 SAR（各周期独立）：SAR < 收盘价 → 绿色（看涨），SAR > 收盘价 → 红色（看跌）
-            for bar in _BATCH_BARS:
-                info = infos[bar]
-                klines = _fetch_klines_for_sar(inst_id, bar, limit=100)
-                sar_result = _compute_sar_from_klines(klines)
+                info = _extract_trend_info(result)
+                # SAR/ER 直接复用趋势标记价K线（calculate_single_coin_data 已预热，0 额外请求）；
+                # 与趋势列、实盘交易基准同为标记价口径，全表自洽，省去单独的指数K线取数。
+                df = _pro3._fetch_kline_data(inst_id, bar)
+                sar_result = _compute_sar_from_df(df)
                 info['sar'] = sar_result['sar']
                 close_p = info.get('close_price', 0)
                 try:
@@ -626,6 +766,11 @@ class BatchTrendAnalyzer:
                         info['sar_color'] = ''
                 except (ValueError, TypeError):
                     info['sar_color'] = ''
+                # ER 效率系数：与 SAR 同一批 K 线本地算，与 ADX/ATR 配合筛选"趋势强且波动大"的币种
+                info['er'] = _compute_er_from_df(df)
+                infos[bar] = info
+                if on_step:
+                    on_step(bar)
 
             return {bar: infos[bar] for bar in _BATCH_BARS}
         except Exception as e:
@@ -635,17 +780,23 @@ class BatchTrendAnalyzer:
                 'trade_price': '', 'trade_time': '', 'profit_pct': '',
                 'close_price': '',
                 'macd_hist': '', 'dif': '', 'adx': '', 'atr_pct': '',
-                'sar': '', 'sar_color': '',
+                'sar': '', 'sar_color': '', 'er': '',
             }
             failed = {bar: dict(empty_info) for bar in _BATCH_BARS}
             failed['error'] = str(e)
             return failed
 
     def run(self, callback=None) -> Dict:
-        """同步运行批量分析（并发处理）
+        """同步运行批量分析（两段式流水线）
 
-        使用共享 K 线客户端 + 最多 _BATCH_WORKERS 个并发 worker 处理币种，
-        总耗时约为串行的 1/3；进度状态线程安全，可按币种/周期粒度更新。
+        阶段1 预热：_BATCH_WORKERS 个线程【在锁外】并发下载各 (inst_id, bar) 的
+                 标记价K线，经 market_candles 令牌桶限频（~5/s）。D1 取满一页 300 根
+                 后，55 币 × 4 周期 = 220 组合仅 220 次请求，约 45s 下完。
+        阶段2 计算：【在锁内】串行逐币调 calculate_single_coin_data；此时行情已预热，
+                 _fetch_kline_data 命中 run 级缓存 0 网络，PRO3_LOCK 只锁住纯计算，
+                 A 币下载不再阻塞 B 币计算（旧实现在锁内含网络等待，多线程形同串行）。
+
+        进度状态线程安全；run 结束在 finally 清空预热缓存，避免残留数据泄漏给实盘/后续轮次。
 
         Parameters
         ----------
@@ -657,52 +808,70 @@ class BatchTrendAnalyzer:
         dict
             {'total': int, 'success': int, 'error': int}
         """
+        import real_strategy_adapter  # noqa: F401  确保 strategy/ 目录进 sys.path
+        import pro3_singletimeframe as _pro3
+
         rows = _read_csv()
         total = len(rows)
+        combos = [(row.get('inst_id', ''), bar)
+                  for row in rows for bar in _BATCH_BARS if row.get('inst_id', '')]
+        n_combo = len(combos)
 
-        self.progress.start(total)
+        # 进度总单位 = 预热请求数 + 币种计算数（保证 0→100% 线性推进）
+        self.progress.start(n_combo + total)
+        clear_batch_logs()
+        _batch_log("批量更新启动：%d 币种 × %d 周期 = %d 组合" % (total, len(_BATCH_BARS), n_combo))
+
+        # ---------------- 阶段1：锁外并发预热（受令牌桶限频） ----------------
+        _batch_log("预热行情（并发 %d 线程，限频 5/s）..." % _BATCH_WORKERS)
+        warm_done = 0
+        warm_failed = 0
+        with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as pool:
+            fut_map = {pool.submit(_warm_kline, inst_id, bar): (inst_id, bar)
+                       for inst_id, bar in combos}
+            for fut in as_completed(fut_map):
+                inst_id, bar = fut_map[fut]
+                warm_done += 1
+                try:
+                    fut.result()
+                except Exception as e:
+                    warm_failed += 1
+                    logger.warning("预热失败 [%s %s]（计算阶段回退直连重试）: %s", inst_id, bar, e)
+                    _batch_log("预热失败 %s %s: %s" % (inst_id, bar, str(e)[:80]), 'warn')
+                self.progress.update(
+                    current=warm_done,
+                    message="预热行情 %d/%d（失败 %d）" % (warm_done, n_combo, warm_failed))
+        _batch_log("预热完成 %d/%d，失败 %d" % (warm_done, n_combo, warm_failed))
+
+        # ---------------- 阶段2：锁内串行计算（命中预热缓存，0 网络） ----------------
+        _batch_log("计算阶段（锁内串行，命中预热缓存）...")
         success_count = 0
         error_count = 0
         completed = 0
+        try:
+            for idx, row in enumerate(rows):
+                inst_id = row.get('inst_id', '')
+                symbol = row.get('symbol', inst_id)
+                if not inst_id:
+                    continue
 
-        def _on_step(bar, cur_symbol):
-            """每完成一个周期更新一次进度消息，避免长时间无反馈"""
-            self.progress.update(
-                current=completed,
-                symbol=cur_symbol,
-                message="处理中: %d/%d — %s [%s]" % (completed, total, cur_symbol, bar),
-            )
-
-        def _process_one(idx_row):
-            """单个币种处理（在 worker 线程执行）"""
-            idx, row = idx_row
-            inst_id = row.get('inst_id', '')
-            symbol = row.get('symbol', inst_id)
-            self.progress.update(
-                current=completed,
-                symbol=symbol,
-                message="处理中: %d/%d — %s" % (completed, total, symbol),
-            )
-            info = self._process_single_symbol(
-                inst_id, on_step=lambda bar: _on_step(bar, symbol)
-            )
-            return idx, symbol, info
-
-        with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as pool:
-            future_to_idx = {
-                pool.submit(_process_one, (idx, row)): idx
-                for idx, row in enumerate(rows)
-            }
-            for future in as_completed(future_to_idx):
-                idx, symbol, info = future.result()
+                cur_base = n_combo + completed  # 本币计算开始时的进度基数
+                self.progress.update(
+                    current=cur_base, symbol=symbol,
+                    message="计算中: %d/%d — %s" % (completed, total, symbol))
+                info = self._process_single_symbol(inst_id)
                 completed += 1
 
                 if info and 'error' not in info:
-                    row = rows[idx]
-                    # 各周期字段写入（列名规范：趋势/价格/时间/盈亏/收盘 用 '{bar}_字段'，
-                    # 技术指标 MACD/DIF/ADX/ATR/SAR/SAR颜色 用 '字段_{bar}'）
                     for bar in _BATCH_BARS:
                         info_bar = info[bar]
+                        # 日志输出：模拟终端行格式，让用户看到每币每周期结果
+                        cp = info_bar.get('close_price', '')
+                        tp = info_bar.get('trade_price', '')
+                        pp = info_bar.get('profit_pct', '')
+                        _batch_log("%-16s %-4s | 现价: %-10s | 交易价: %-10s | 盈亏: %s%%"
+                                   % (inst_id, bar, cp, tp,
+                                      ('%+.2f' % float(pp)) if pp != '' and pp is not None else '--'))
                         row['%s_趋势' % bar] = info_bar['trend']
                         row['%s_交易价格' % bar] = str(info_bar['trade_price']) if info_bar['trade_price'] != '' else ''
                         row['%s_交易时间' % bar] = info_bar['trade_time']
@@ -714,24 +883,34 @@ class BatchTrendAnalyzer:
                         row['ATR_%s' % bar] = str(info_bar['atr_pct']) if info_bar['atr_pct'] != '' else ''
                         row['SAR_%s' % bar] = str(info_bar.get('sar', '')) if info_bar.get('sar', '') != '' else ''
                         row['SAR颜色_%s' % bar] = str(info_bar.get('sar_color', '')) if info_bar.get('sar_color', '') else ''
+                        row['ER_%s' % bar] = str(info_bar.get('er', '')) if info_bar.get('er', '') != '' else ''
                     success_count += 1
                 else:
                     error_count += 1
-                    logger.error("[%s] 处理失败", symbol)
+                    err_msg = info.get('error', '未知') if info else '未知'
+                    logger.error("[%s] 处理失败: %s", symbol, err_msg)
+                    _batch_log("[%s] 处理失败: %s" % (symbol, err_msg), 'error')
 
                 self.progress.update(
-                    current=completed,
+                    current=n_combo + completed,
                     success=success_count,
                     error=error_count,
                 )
 
-                # 每处理 5 个或最后一个时保存 CSV
-                if completed % 5 == 0 or completed == total:
+                # 整表落库降频：每 _SAVE_EVERY 个写一次，收尾再兜底写一次
+                if completed % _SAVE_EVERY == 0:
                     _write_csv(rows)
 
                 if callback:
                     callback(self.progress.to_dict())
 
+            _write_csv(rows)  # 收尾兜底保存（含 skipped 行导致 completed<total 的情况）
+        finally:
+            _pro3.clear_batch_cache()
+
+        elapsed = (datetime.datetime.now() - _progress.start_time).total_seconds() if _progress.start_time else 0
+        _batch_log("批量更新完成 | 成功 %d / 失败 %d / 总 %d | 耗时 %.1f 秒"
+                   % (success_count, error_count, total, elapsed))
         self.progress.finish()
 
         return {

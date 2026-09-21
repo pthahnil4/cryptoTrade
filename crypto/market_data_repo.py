@@ -47,8 +47,11 @@ def save_coin_rows(session, rows: list):
 
 def coin_inst_ids(session) -> list:
     """仅取 inst_id 列表（过滤空值，rank 序与 load_coin_rows 一致）——get_csv_coins 切库用"""
-    return [r['inst_id'].strip() for r in load_coin_rows(session)
-            if r.get('inst_id', '').strip()]
+    rows = session.execute(select(
+        CryptoCoin.id, CryptoCoin.rank_no, CryptoCoin.inst_id
+    ).order_by(CryptoCoin.id)).all()
+    rows.sort(key=lambda r: (int(r.rank_no) if r.rank_no.isdigit() else 10 ** 9, r.id))
+    return [r.inst_id.strip() for r in rows if r.inst_id.strip()]
 
 
 def count_coin_rows(session) -> int:

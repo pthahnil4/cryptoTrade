@@ -43,6 +43,7 @@ var TaskPlan = (function() {
 
     var TABS = [
         { key: 'overview', label: '📋 概览' },
+        { key: 'tasks', label: '🌳 任务' },
         { key: 'slots', label: '🕐 打卡' },
         { key: 'checkin', label: '📊 打卡详情' },
         { key: 'notes', label: '📝 小记' },
@@ -80,6 +81,38 @@ var TaskPlan = (function() {
     /* ---------- 工具 ---------- */
     function $(sel, root) { return (root || document).querySelector(sel); }
     function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+    /* 重表单弹窗（打卡/格子详情/新增任务/新建卡片）统一走这里。
+       .m-dialog 是全站共享组件（max-width:440px、body max-height:45vh），不能直接改样式表；
+       只在 show() 返回后就地给这个弹窗挂 .plan-form-dialog 类，宽度与内容区高度由
+       task_plan.html 里的作用域样式接管。size='sm' 用窄一档的表单弹窗。 */
+    function showFormDialog(opts, size) {
+        var overlay = MDialog.show(opts);
+        var dlg = overlay ? overlay.querySelector('.m-dialog') : null;
+        if (dlg) dlg.className += ' plan-form-dialog' + (size === 'sm' ? ' plan-dlg-sm' : '');
+        return overlay;
+    }
+
+    /* 整卡文本容量软提示：plan_cards 的 goal/tasks/notes/review 各自是一个 TEXT 列
+       （65535 字节），写满会在后端截断/报错。这里只做前端读数提醒，不改表结构、
+       不改写入口径——真正的判定永远在后端。 */
+    var TEXT_BUDGET = 65535;
+    function utf8Bytes(s) {
+        try { return new Blob([s == null ? '' : String(s)]).size; }
+        catch (e) { return String(s == null ? '' : s).length * 3; }
+    }
+    function cardTextUsed(card, key) {
+        var v = card ? card[key] : null;
+        if (v == null) return 0;
+        return utf8Bytes(typeof v === 'string' ? v : JSON.stringify(v));
+    }
+    function textCapText(used) {
+        var kb = used / 1024, total = TEXT_BUDGET / 1024;
+        return '已用 ' + kb.toFixed(1) + 'KB / ' + total.toFixed(0) + 'KB';
+    }
+    function textCapCls(used) {
+        return used > TEXT_BUDGET * 0.8 ? ' hi' : '';
+    }
 
     function esc(s) {
         if (s === null || s === undefined) return '';
@@ -149,6 +182,20 @@ var TaskPlan = (function() {
             renderCheckinStatsChart();
             renderPlanDetail();
             loadToday();
+            // 「10 天倒计时」到期惰性结算：GET 读接口不写库，发现到期卡时发一次
+            // POST /plan/api/settle-expired 落库（走后端加锁写路径），有变更则重拉刷新。
+            if (!state._cdSweeping) {
+                var hasExpired = state.allCards.some(function(c) {
+                    return c.reward_info && c.reward_info.countdown_expired;
+                });
+                if (hasExpired) {
+                    state._cdSweeping = true;
+                    apiPost('/plan/api/settle-expired', {}).then(function(sr) {
+                        var n = (sr && sr.code === 200 && sr.data && sr.data.settled) ? sr.data.settled.length : 0;
+                        if (n > 0) { return loadAll(); }   // 已结算，重拉（防抖标志确保只多跑一轮）
+                    }).catch(function() {}).then(function() { state._cdSweeping = false; });
+                }
+            }
         }).catch(function(err) {
             MDialog.alert('请求失败: ' + err.message);
         });
@@ -466,7 +513,6 @@ var TaskPlan = (function() {
 
     function renderCardItem(card) {
         var isPending = card.status === 'pending';
-        var pct = Math.min(100, Math.round(card.filled_count));
         var cls = 'task-card st-' + card.status + (card.locked ? ' locked' : '') + (isPending ? ' collapsed' : '');
         var ri = card.reward_info || {};
         var isTrade = card.type === 'trade';
@@ -484,17 +530,26 @@ var TaskPlan = (function() {
         // 正文（待开始卡折叠时隐藏）
         html += '<div class="tc-body">';
         html += '<div class="tc-round">第 ' + card.round + ' 张 · ' + (isTrade ? '翻倍挑战' : '100 小时学习') + '</div>';
-        html += '<div class="tc-progress"><div class="tc-bar"><div class="tc-bar-fill" style="width:' + pct + '%"></div></div></div>';
-        // 长期主义信息：在场天数 + 预计奖励（无罚款）
-        html += '<div class="tc-meta"><span>' + card.filled_count + '/100h</span><span class="tc-reward">💰 预计奖励 ' + fmtNum(ri.final_reward) + ' 元</span></div>';
+        html += taskProgressHtml(card);
+        // 长期主义信息：在场天数 + 预计奖励（启用旧版三档罚款时同步显示扣减）
+        html += '<div class="tc-meta"><span>' + card.filled_count + '/100h</span><span class="tc-reward">💰 预计奖励 ' + fmtNum(ri.final_reward) + ' 元</span>' +
+            (ri.penalty_enabled && ri.total_penalty > 0 ? '<span class="tc-penalty">（罚款 -' + fmtNum(ri.total_penalty) + '）</span>' : '') + '</div>';
         html += '<div class="tc-meta tc-meta-2">' +
             '<span class="tc-presence">🌱 在场 ' + (ri.presence_days || 0) + ' 天</span>' +
             '<span class="tc-hit">' + (isTrade ? '🎯 命中 ' + calcHitRate(card) + '%' : '💵 基础 ' + fmtNum(ri.base_reward) + ' 元') + '</span>' +
             '</div>';
+        // 「10 天倒计时」（第三个结束条件）：仅未结算进行中卡显示，到期由后端惰性结算
+        if (ri.countdown_active) {
+            html += '<div class="tc-meta tc-meta-2"><span class="tc-countdown' +
+                (ri.countdown_expired ? ' tc-countdown-out' : '') + '">' +
+                (ri.countdown_expired ? '⏳ 已满 ' + ri.countdown_days + ' 天，结算中…'
+                    : '⏳ 剩余 ' + ri.days_remaining + ' 天') +
+                '（第 ' + ri.days_elapsed + '/' + ri.countdown_days + ' 天）</span><span></span></div>';
+        }
         if (isTrade) {
             html += '<div class="tc-meta tc-meta-2"><span class="tc-hit">⏱ 提前奖 ' + fmtNum(ri.early_bonus) + ' 元</span><span></span></div>';
         } else if (ri.early_eligible) {
-            html += '<div class="tc-meta tc-meta-2"><span class="tc-hit">🎯 子目标已全部完成，可提前通关！⏱ 提前奖 ' + fmtNum(ri.early_bonus) + ' 元</span><span></span></div>';
+            html += '<div class="tc-meta tc-meta-2"><span class="tc-hit">🎯 任务树已全部完成，可提前通关！⏱ 提前奖 ' + fmtNum(ri.early_bonus) + ' 元</span><span></span></div>';
         }
         html += '</div>';
 
@@ -518,7 +573,7 @@ var TaskPlan = (function() {
         $('#cm-title').textContent = summary.title;
         $('#card-modal').style.display = 'flex';
         $('#cm-body').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);">加载中…</div>';
-        // 列表只存摘要，完整 slots/notes/milestones 按需从 card-detail 取
+        // 列表只存摘要，完整 slots/notes/tasks 按需从 card-detail 取
         apiGet('/plan/api/card-detail?plan_id=' + encodeURIComponent(summary.plan_id) + '&card_id=' + encodeURIComponent(cardId)).then(function(res) {
             if (res.code !== 200 || !res.data) {
                 MDialog.alert(res.message || '加载卡片详情失败');
@@ -544,10 +599,9 @@ var TaskPlan = (function() {
         var tabsEl = $('#cm-tabs');
         tabsEl.innerHTML = '';
         var card = state.currentCard;
-        // 判断是否需要给结算 Tab 加提示徽章：子目标全完成 + 卡仍在进行中 + 尚未结算
+        // 判断是否需要给结算 Tab 加提示徽章：任务树全完成 + 卡仍在进行中 + 尚未结算
         var showSettleBadge = card && card.type === 'learn' && card.status === 'in_progress' && !card.settlement &&
-            card.milestones && card.milestones.length > 0 &&
-            card.milestones.every(function(m) { return m.done; });
+            card.tasks_all_done;
         TABS.forEach(function(t) {
             var b = document.createElement('button');
             b.className = 'cm-tab' + (t.key === state.activeTab ? ' active' : '');
@@ -578,32 +632,454 @@ var TaskPlan = (function() {
         });
         var body = $('#cm-body');
         if (key === 'overview') renderOverviewTab(card);
+        else if (key === 'tasks') renderTasksTab(card);
         else if (key === 'slots') renderSlotsTab(card);
         else if (key === 'checkin') renderCheckinTab(card);
         else if (key === 'notes') renderNotesTab(card);
         else if (key === 'settle') renderSettleTab(card);
     }
 
-    /* ---- 概览 Tab ---- */
+    /* ================================================================
+       任务树（任务管理 v2）
+       ----------------------------------------------------------------
+       结构：card.tasks = 节点数组（children 递归，层级不限）
+       节点：{id, title, estimated_minutes, status: todo|doing|done,
+              children[], actual_minutes, link_count, sub_*}
+       - 进度 = 后端 task_progress（只算叶子加权）
+       - 完成只能由打卡标记（树上无勾选）；done 叶子可「取消完成」回退
+       - 节点增删改走 /plan/api/task-add | task-update | task-delete | task-cancel-done
+       - 卡片进行中可编辑；已结束的卡任务树只读
+       ================================================================ */
+
+    function isTaskContainer(node) { return !!(node.children && node.children.length); }
+
+    function findTaskNode(tasks, id) {
+        for (var i = 0; i < (tasks || []).length; i++) {
+            if (tasks[i].id === id) return tasks[i];
+            var hit = findTaskNode(tasks[i].children || [], id);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    function taskStatusText(st) {
+        return st === 'done' ? '已完成' : st === 'doing' ? '进行中' : '待开始';
+    }
+
+    /* 分钟 → 小时文本（0.5h 粒度展示） */
+    function fmtHours(minutes) {
+        var h = (Number(minutes) || 0) / 60;
+        return (Math.round(h * 10) / 10) + 'h';
+    }
+
+    /* 折叠状态：按 卡片:节点 记忆，跨重渲染保持（默认展开） */
+    var ttCollapsed = {};
+    function ttToggleCollapse(cardId, nodeId) {
+        var key = cardId + ':' + nodeId;
+        ttCollapsed[key] = !ttCollapsed[key];
+    }
+    function ttIsCollapsed(cardId, nodeId) { return !!ttCollapsed[cardId + ':' + nodeId]; }
+
+    /* 任务树变更统一提交：成功后用 refresh 载荷就地刷新（弹窗+列表+统计） */
+    function taskApi(url, payload, card) {
+        apiPost(url, payload).then(function(res) {
+            if (res && res.code === 200 && res.data) {
+                if (res.data.refresh) applyRefreshPayload(res.data.refresh);
+                else switchTab(state.activeTab);
+            } else {
+                MDialog.alert((res && res.message) || '操作失败');
+            }
+        }).catch(function(err) {
+            MDialog.alert('请求失败：' + err.message);
+        });
+    }
+
+    /* 双进度条：任务进度（叶子加权，为主）+ 工时进度（格数/100，为辅）
+       无任务树（或全待补预估）时退化为只显示工时进度 */
+    function taskProgressHtml(card) {
+        var tp = card.task_progress || null;
+        var hourPct = Math.min(100, Math.round(card.filled_count || 0));
+        var html = '<div class="tc-progress-2">';
+        if (tp && (tp.total_count > 0 || tp.pending_estimate > 0)) {
+            html += '<div class="tc-bar-row">' +
+                '<span class="tc-bar-label">任务进度</span>' +
+                '<div class="tc-bar"><div class="tc-bar-fill task" style="width:' + Math.min(100, tp.pct || 0) + '%"></div></div>' +
+                '<span class="tc-bar-num">' + (tp.pct || 0) + '% · ' + fmtHours(tp.done_minutes) + '/' + fmtHours(tp.total_minutes) + '</span>' +
+                '</div>';
+        }
+        html += '<div class="tc-bar-row">' +
+            '<span class="tc-bar-label">工时进度</span>' +
+            '<div class="tc-bar"><div class="tc-bar-fill hour" style="width:' + hourPct + '%"></div></div>' +
+            '<span class="tc-bar-num">' + (card.filled_count || 0) + '/100h</span>' +
+            '</div>';
+        html += '</div>';
+        return html;
+    }
+
+    /* 渲染单个任务节点（递归）。
+       editable=false 用于概览内嵌只读树（节点操作按钮隐藏，折叠仍可用） */
+    function renderTaskNode(card, node, editable) {
+        var hasChildren = isTaskContainer(node);
+        var collapsed = ttIsCollapsed(card.id, node.id);
+        var est = Number(node.estimated_minutes) || 0;
+        var html = '<div class="tt-node ' + esc(node.status) + '" data-task-id="' + esc(node.id) + '">';
+        html += '<div class="tt-row">';
+        if (hasChildren) {
+            html += '<button class="tt-caret" data-act="toggle" data-tid="' + esc(node.id) + '">' +
+                (collapsed ? '▸' : '▾') + '</button>';
+        } else {
+            html += '<span class="tt-caret ghost">•</span>';
+        }
+        /* 完成依据：done 叶子标出「是哪一格打卡把它做完的」，点一下跳回打卡 Tab 定位 */
+        var doneBy = '';
+        if (!hasChildren && node.status === 'done' && node.completed_by_slot !== null && node.completed_by_slot !== undefined) {
+            var bidx = Number(node.completed_by_slot);
+            doneBy = '<span class="tt-doneby" data-slot="' + bidx + '" title="由第 ' + (bidx + 1) +
+                ' 格打卡标记完成，点击跳到那一格">⬒ 第' + (bidx + 1) + '格</span>';
+        }
+        html += '<span class="tt-title">' + esc(node.title) + doneBy + '</span>';
+        html += '<span class="tt-status ' + esc(node.status) + '">' + taskStatusText(node.status) + '</span>';
+        if (hasChildren) {
+            html += '<span class="tt-est">Σ ' + fmtHours(node.sub_total_minutes) + '</span>';
+        } else if (est <= 0) {
+            html += '<span class="tt-est warn">⚠️ 待补预估</span>';
+        } else {
+            html += '<span class="tt-est">预估 ' + fmtHours(est) + ' · 实际 ' + fmtHours(node.actual_minutes) + '</span>';
+        }
+        if (editable) {
+            html += '<span class="tt-actions">' +
+                '<button class="tt-act" data-act="add-child" data-tid="' + esc(node.id) + '" title="添加子任务">＋</button>' +
+                '<button class="tt-act" data-act="edit" data-tid="' + esc(node.id) + '" title="编辑名称/预估">✏️</button>' +
+                '<button class="tt-act" data-act="up" data-tid="' + esc(node.id) + '" title="上移">↑</button>' +
+                '<button class="tt-act" data-act="down" data-tid="' + esc(node.id) + '" title="下移">↓</button>' +
+                (node.status === 'done' && !hasChildren
+                    ? '<button class="tt-act" data-act="cancel-done" data-tid="' + esc(node.id) + '" title="取消完成（回退为进行中）">↩️</button>' : '') +
+                '<button class="tt-act tt-del" data-act="del" data-tid="' + esc(node.id) + '" title="删除（级联子树）">🗑</button>' +
+                '</span>';
+        }
+        html += '</div>';
+        if (hasChildren) {
+            html += '<div class="tt-children"' + (collapsed ? ' style="display:none;"' : '') + '>';
+            node.children.forEach(function(ch) { html += renderTaskNode(card, ch, editable); });
+            html += '</div>';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    /* 任务树汇总条（进度 + 明细 + 待补预估提醒） */
+    function taskSummaryHtml(card) {
+        var tp = card.task_progress || {};
+        var html = '<div class="tt-summary">' +
+            '<span>🌳 任务进度 <b>' + (tp.pct || 0) + '%</b></span>' +
+            '<div class="tts-bar"><div class="tts-fill" style="width:' + Math.min(100, tp.pct || 0) + '%"></div></div>' +
+            '<span class="tts-text">已完成 ' + fmtHours(tp.done_minutes) + ' / ' + fmtHours(tp.total_minutes) +
+            ' · ' + (tp.done_count || 0) + '/' + (tp.total_count || 0) + ' 个任务</span>' +
+            '</div>';
+        if (tp.pending_estimate > 0) {
+            html += '<p class="tt-warn">⚠️ 有 ' + tp.pending_estimate +
+                ' 个任务待补预估（不计入进度、不可关联打卡），点 ✏️ 补全</p>';
+        }
+        return html;
+    }
+
+    /* 一键展开/收起整棵树（折叠状态按 卡片:节点 存于 ttCollapsed，置位后重渲染） */
+    function ttSetAllCollapsed(cardId, nodes, collapsed) {
+        (nodes || []).forEach(function(n) {
+            if (!isTaskContainer(n)) return;
+            ttCollapsed[cardId + ':' + n.id] = collapsed;
+            ttSetAllCollapsed(cardId, n.children, collapsed);
+        });
+    }
+
+    /* 统计节点数（工具条上给一句「多少节点/几个叶子」的实话） */
+    function ttCountNodes(nodes) {
+        var out = { all: 0, leaf: 0 };
+        (function walk(list) {
+            (list || []).forEach(function(n) {
+                out.all++;
+                if (isTaskContainer(n)) walk(n.children);
+                else out.leaf++;
+            });
+        })(nodes || []);
+        return out;
+    }
+
+    /* ---- 「🌳 任务」Tab：完整可编辑任务树 ---- */
+    function renderTasksTab(card) {
+        var editable = card.status === 'in_progress';
+        var tasks = card.tasks || [];
+        var cnt = ttCountNodes(tasks);
+        var html = '<div class="tt-wrap">';
+        if (tasks.length) {
+            html += taskSummaryHtml(card);
+            /* 工具条：树一长（几十节点）就得一路滚着找，先给一键展开/收起 */
+            html += '<div class="tt-tools">' +
+                '<button type="button" class="m-btn m-btn-sm" id="tt-expand-all">▾ 全部展开</button>' +
+                '<button type="button" class="m-btn m-btn-sm" id="tt-collapse-all">▸ 全部收起</button>' +
+                (editable ? '<button type="button" class="m-btn m-btn-sm m-btn-primary" id="tt-add-root">＋ 新增顶层任务</button>' : '') +
+                '<span class="ttt-stat">' + cnt.all + ' 个节点 · ' + cnt.leaf + ' 个叶子可关联打卡</span>' +
+                '</div>';
+            html += '<div class="tt-tree">' + tasks.map(function(n) {
+                return renderTaskNode(card, n, editable);
+            }).join('') + '</div>';
+        } else {
+            html += '<div class="tt-tree"><div class="tt-empty">🌱 还没有任务树。<br>' +
+                '把目标拆成可执行的小任务（如：个人博客网站 → 部署上线 → 域名注册），<br>' +
+                '每次打卡都能对应到具体推进了哪个子任务。</div></div>';
+        }
+        if (editable) {
+            html += '<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;">' +
+                '<button class="m-btn m-btn-sm m-btn-primary" id="tt-add-root-2">＋ 新增顶层任务</button>' +
+                '<span style="font-size:.76rem;color:var(--text-muted);">叶子任务可被打卡关联；完成只能由打卡标记（树上无勾选）</span>' +
+                '</div>';
+        } else {
+            html += '<p class="tt-readonly">🔒 任务树只读（卡片已结束）。任务树随卡保留，可随时查看。</p>';
+        }
+        html += '</div>';
+        $('#cm-body').innerHTML = html;
+        bindTaskTree(card, editable);
+        var btnExp = $('#tt-expand-all'), btnCol = $('#tt-collapse-all');
+        if (btnExp) btnExp.addEventListener('click', function() { ttSetAllCollapsed(card.id, tasks, false); switchTab('tasks'); });
+        if (btnCol) btnCol.addEventListener('click', function() { ttSetAllCollapsed(card.id, tasks, true); switchTab('tasks'); });
+        var addRoot2 = $('#tt-add-root-2');
+        if (addRoot2) addRoot2.addEventListener('click', function() { openTaskAddDialog(card, '', ''); });
+    }
+
+    /* 任务树事件绑定（渲染后调用；元素随 innerHTML 重建，逐元素绑定不会累积） */
+    function bindTaskTree(card, editable) {
+        $all('#cm-body .tt-caret[data-act="toggle"]').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                ttToggleCollapse(card.id, btn.dataset.tid);
+                switchTab(state.activeTab);
+            });
+        });
+        var addRoot = $('#tt-add-root');
+        if (addRoot) addRoot.addEventListener('click', function() { openTaskAddDialog(card, '', ''); });
+        // 「⬒ 第N格」→ 跳到打卡 Tab 并定位高亮该格（只读树也可用）
+        $all('#cm-body .tt-doneby').forEach(function(chip) {
+            chip.addEventListener('click', function() {
+                var idx = parseInt(chip.dataset.slot, 10);
+                if (isNaN(idx)) return;
+                state.activeTab = 'slots';
+                switchTab('slots');
+                var cell = document.querySelector('.slot-cell[data-index="' + idx + '"]');
+                if (cell) {
+                    cell.classList.add('cur');
+                    cell.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                }
+            });
+        });
+        if (!editable) return;
+        $all('#cm-body .tt-act').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var act = btn.dataset.act;
+                var tid = btn.dataset.tid;
+                var node = findTaskNode(card.tasks || [], tid);
+                if (!node) return;
+                if (act === 'add-child') openTaskAddDialog(card, tid, node.title || '');
+                else if (act === 'edit') startInlineTaskEdit(card, tid, node);
+                else if (act === 'up' || act === 'down') {
+                    taskApi('/plan/api/task-update', {
+                        plan_id: card.plan_id, card_id: card.id, task_id: tid, move: act
+                    }, card);
+                } else if (act === 'del') deleteTaskNode(card, tid, node);
+                else if (act === 'cancel-done') cancelTaskDone(card, tid, node);
+            });
+        });
+    }
+
+    /* 新增任务弹窗（顶层 parentId='' / 子任务挂 parentId 下） */
+    function openTaskAddDialog(card, parentId, parentTitle) {
+        var quick = [0.5, 1, 2, 4, 8].map(function(h) {
+            return '<button type="button" class="m-btn m-btn-sm nt-quick" data-h="' + h + '">' + h + 'h</button>';
+        }).join('');
+        var html = '<div class="plan-form">' +
+            '<div class="form-row"><label>' +
+            (parentId ? '在「' + esc(parentTitle) + '」下新增子任务' : '新增顶层任务') +
+            '</label><input type="text" id="nt-title" placeholder="任务名称，如：域名注册"></div>' +
+            '<div class="form-row"><label>预估工作量（小时，0.5h 粒度）</label>' +
+            '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + quick + '</div>' +
+            '<input type="number" id="nt-est" step="0.5" min="0.5" placeholder="自定义，如 3.5" style="margin-top:6px;"></div>' +
+            '<p id="nt-err" style="display:none;font-size:.78rem;color:#dc3545;margin:6px 0 0;"></p>' +
+            '<p style="font-size:.78rem;color:var(--text-muted);margin:6px 0 0;">叶子任务的预估必填；' +
+            '给叶子添加子任务后，它变为容器（预估自动=Σ子任务）</p>' +
+            '</div>';
+        // 校验错误内联提示：不弹 MDialog（show 会关闭当前弹窗，销毁已填内容）
+        var overlay = showFormDialog({
+            title: '＋ ' + (parentId ? '子任务' : '顶层任务'),
+            message: html,
+            okText: '创建',
+            onOk: function() {
+                var errEl = $('#nt-err');
+                function ntErr(msg) { errEl.textContent = msg; errEl.style.display = ''; }
+                var title = $('#nt-title').value.trim();
+                var est = Math.round((parseFloat($('#nt-est').value) || 0) * 60);
+                if (!title) { ntErr('任务名称不能为空'); return false; }
+                if (est <= 0) { ntErr('请填写预估工作量（小时 > 0）'); return false; }
+                taskApi('/plan/api/task-add', {
+                    plan_id: card.plan_id, card_id: card.id,
+                    title: title, estimated_minutes: est, parent_id: parentId || ''
+                }, card);
+            }
+        });
+        $all('.nt-quick', overlay).forEach(function(b) {
+            b.addEventListener('click', function() { $('#nt-est').value = b.dataset.h; });
+        });
+    }
+
+    /* 行内编辑任务名称 / 叶子预估（Enter 提交、Esc 取消；
+       焦点离开编辑区后才提交，避免名称→预估切换时提前提交） */
+    function startInlineTaskEdit(card, tid, node) {
+        var row = document.querySelector('#cm-body .tt-node[data-task-id="' + tid + '"] > .tt-row');
+        if (!row) return;
+        var titleSpan = row.querySelector('.tt-title');
+        if (!titleSpan) return;
+        var oldTitle = node.title || '';
+        var est = Number(node.estimated_minutes) || 0;
+        var isLeaf = !isTaskContainer(node);
+
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'tt-title-input';
+        input.value = oldTitle;
+        titleSpan.replaceWith(input);
+
+        var estInput = null;
+        if (isLeaf) {
+            estInput = document.createElement('input');
+            estInput.type = 'number';
+            estInput.className = 'tt-est-input';
+            estInput.step = '0.5';
+            estInput.min = '0';
+            estInput.placeholder = '预估h';
+            estInput.value = est > 0 ? String(Math.round(est / 60 * 10) / 10) : '';
+            var estSpan = row.querySelector('.tt-est');
+            if (estSpan) estSpan.replaceWith(estInput);
+            else {
+                var acts = row.querySelector('.tt-actions');
+                if (acts) row.insertBefore(estInput, acts);
+                else row.appendChild(estInput);
+            }
+        }
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+
+        var committed = false;
+        function commit() {
+            if (committed) return;
+            committed = true;
+            var newTitle = input.value.trim();
+            if (!newTitle) { MDialog.alert('任务名称不能为空'); switchTab(state.activeTab); return; }
+            var payload = { plan_id: card.plan_id, card_id: card.id, task_id: tid };
+            var changed = false;
+            if (newTitle !== oldTitle) { payload.title = newTitle; changed = true; }
+            if (estInput) {
+                var newEst = Math.round((parseFloat(estInput.value) || 0) * 60);
+                if (newEst !== est) { payload.estimated_minutes = newEst; changed = true; }
+            }
+            if (!changed) { switchTab(state.activeTab); return; }
+            taskApi('/plan/api/task-update', payload, card);
+        }
+        function maybeCommit() {
+            setTimeout(function() {
+                if (document.activeElement === input || document.activeElement === estInput) return;
+                commit();
+            }, 120);
+        }
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); commit(); }
+            else if (e.key === 'Escape') { committed = true; switchTab(state.activeTab); }
+        });
+        if (estInput) estInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') { e.preventDefault(); commit(); }
+            else if (e.key === 'Escape') { committed = true; switchTab(state.activeTab); }
+        });
+        input.addEventListener('blur', maybeCommit);
+        if (estInput) estInput.addEventListener('blur', maybeCommit);
+    }
+
+    function deleteTaskNode(card, tid, node) {
+        var subCount = isTaskContainer(node) ? (node.sub_total_count || 0) : 0;
+        var msg = '确定删除任务「' + (node.title || '') + '」吗？' +
+            (subCount ? '\n其下 ' + subCount + ' 个子任务将一并删除。' : '') +
+            '\n关联的打卡记录会保留（显示为「已删除任务」）。';
+        MDialog.danger(msg, function() {
+            taskApi('/plan/api/task-delete', {
+                plan_id: card.plan_id, card_id: card.id, task_id: tid
+            }, card);
+        });
+    }
+
+    function cancelTaskDone(card, tid, node) {
+        MDialog.confirm('取消「' + (node.title || '') + '」的完成状态？\n' +
+            '完成依据的打卡会被改回「进行中」，已上卷完成的父任务同步回退。', function() {
+            taskApi('/plan/api/task-cancel-done', {
+                plan_id: card.plan_id, card_id: card.id, task_id: tid
+            }, card);
+        });
+    }
+
+    /* ---- 概览 Tab（宽弹窗下左「内容」右「参数」两栏） ---- */
     function renderOverviewTab(card) {
         var html = '<div class="cm-overview">';
 
-        /* 提前通关引导横幅：子目标全完成 + 卡仍在进行中 */
-        var msAllDone = card.milestones && card.milestones.length > 0 &&
-            card.milestones.every(function(m) { return m.done; });
-        if (msAllDone && card.status === 'in_progress' && card.type === 'learn') {
+        /* 提前通关引导横幅：任务树全完成 + 卡仍在进行中 */
+        if (card.tasks_all_done && card.status === 'in_progress' && card.type === 'learn') {
             html += '<div class="ov-early-banner">' +
-                '🎉 <b>子目标已全部完成！</b> 你可以立即结算并解锁下一张任务卡 ' +
+                '🎉 <b>任务树已全部完成！</b> 你可以立即结算并解锁下一张任务卡 ' +
                 '<button class="m-btn m-btn-primary m-btn-sm" id="btn-early-settle" style="margin-left:12px;">去结算 💰</button>' +
                 '</div>';
         }
 
-        html += '<div class="ov-row"><span class="label">任务目标</span><textarea id="ov-goal">' + esc(card.goal || '') + '</textarea></div>';
+        html += '<div class="ov-cols">';
 
-        if (card.type === 'learn') {
-            html += '<div class="ov-row"><span class="label">完成奖励</span><input type="number" id="ov-reward" value="' + esc(card.reward) + '"><span style="flex-shrink:0;margin-left:6px;">元（时薪 ' + fmtNum((card.reward || 2000) / 100) + ' 元）</span></div>';
+        /* ---- 左栏：目标 / 复盘 / 任务树（都是长文本，吃宽度） ---- */
+        html += '<div class="ov-col">';
+        html += '<div class="ov-row"><span class="label">任务目标</span>' +
+            '<textarea id="ov-goal" class="ov-tall" placeholder="这张卡要做出什么？写具体一点，方便复盘时对照">' + esc(card.goal || '') + '</textarea></div>';
+        /* 复盘：后端 plan_cards.review 列与 update-card 白名单早就有，前端一直没有入口，
+           等于结算后这段自我总结没地方写。这里补上，只走既有接口，不动数据结构。 */
+        html += '<div class="ov-row"><span class="label">卡片复盘</span>' +
+            '<textarea id="ov-review" class="ov-tall" placeholder="通关/失败后复盘：做对了什么、哪里可以更好、下一张卡怎么改…">' +
+            esc(card.review || '') + '</textarea></div>';
+        /* 容量提示：plan_cards 的 goal/review/notes/tasks 是四个独立的 TEXT 列，各自 64KB。
+           告警色按"最满的那一列"判定，只盯小记会漏报；小记不可删除（后端无删除接口），
+           所以口径写"新建卡片承接"，不写"清理旧小记"这种做不到的建议。 */
+        var caps = {
+            goal: cardTextUsed(card, 'goal'), review: cardTextUsed(card, 'review'),
+            notes: cardTextUsed(card, 'notes'), tasks: cardTextUsed(card, 'tasks')
+        };
+        var capMax = Math.max(caps.goal, caps.review, caps.notes, caps.tasks);
+        html += '<div class="ov-cap' + textCapCls(capMax) + '" title="每个 TEXT 列各自 64KB 上限；小记只能追加不能删除，接近上限时请新建卡片承接">' +
+            '📦 文本占用 —— 目标 ' + (caps.goal / 1024).toFixed(1) + 'KB · 复盘 ' + (caps.review / 1024).toFixed(1) +
+            'KB · 小记 ' + (caps.notes / 1024).toFixed(1) + 'KB · 任务树 ' + (caps.tasks / 1024).toFixed(1) + 'KB</div>';
+
+        /* 任务树内嵌（只读视图；折叠展开可用，管理与编辑在「🌳 任务」Tab） */
+        var tasks = card.tasks || [];
+        var tp = card.task_progress || {};
+        html += '<div style="font-size:.9rem;font-weight:600;margin:12px 0 8px;">🌳 任务树' +
+            (tasks.length ? '（进度 ' + (tp.pct || 0) + '% · ' + (tp.done_count || 0) + '/' + (tp.total_count || 0) + ' 个任务）' : '') + '</div>';
+        if (tasks.length) {
+            html += '<div class="tt-tree cm-embed">' +
+                tasks.map(function(n) { return renderTaskNode(card, n, false); }).join('') + '</div>';
         } else {
-            html += '<div class="ov-row"><span class="label">基础奖金</span><input type="number" id="ov-reward" value="' + esc(card.base_reward) + '"><span style="flex-shrink:0;margin-left:6px;">元（时薪 ' + fmtNum(card.hourly_rate || 20) + ' 元）</span></div>';
+            html += '<p style="font-size:.85rem;color:var(--text-muted);">还没有任务树——把目标拆成子任务（如：个人博客网站 → 部署上线 → 域名注册），打卡时即可关联推进。</p>';
+        }
+        if (card.status === 'in_progress') {
+            html += '<button class="m-btn m-btn-sm tt-jump" id="btn-goto-tasks">🛠 前往「🌳 任务」Tab 管理任务树</button>';
+        }
+        html += '</div>';
+
+        /* ---- 右栏：进度 / 奖励 / 时间 / 危险操作（都是短控件） ---- */
+        html += '<div class="ov-col">';
+        html += taskProgressHtml(card);
+        if (card.type === 'learn') {
+            html += '<div class="ov-row"><span class="label">完成奖励</span><input type="number" id="ov-reward" value="' + esc(card.reward) + '">' +
+                '<span class="ov-unit">元（时薪 ' + fmtNum((card.reward || 2000) / 100) + ' 元）</span></div>';
+        } else {
+            html += '<div class="ov-row"><span class="label">基础奖金</span><input type="number" id="ov-reward" value="' + esc(card.base_reward) + '">' +
+                '<span class="ov-unit">元（时薪 ' + fmtNum(card.hourly_rate || 20) + ' 元）</span></div>';
         }
 
         // 开始/结束时间：可视化时间选择器，默认当前时间（已有值则显示原值）
@@ -612,50 +1088,13 @@ var TaskPlan = (function() {
         html += '<div class="ov-row"><span class="label">开始时间</span><input type="datetime-local" id="ov-start" data-default="' + startVal + '" value="' + startVal + '"></div>';
         html += '<div class="ov-row"><span class="label">结束时间</span><input type="datetime-local" id="ov-end" data-default="' + endVal + '" value="' + endVal + '"></div>';
 
-        var pct = Math.min(100, Math.round(card.filled_count));
-        html += '<div class="cm-big-progress"><div class="cm-big-bar"><div class="cm-big-fill" style="width:' + pct + '%"></div></div>' +
-            '<div style="font-size:.85rem;color:var(--text-muted);margin-top:4px;">已完成 ' + card.filled_count + ' / 100 小时（' + pct + '%）</div></div>';
-
-        var ms = card.milestones || [];
-        var msDone = ms.filter(function(m) { return m.done; }).length;
-        html += '<div style="font-size:.9rem;font-weight:600;margin:14px 0 8px;">🎯 目标拆解（' + msDone + ' / ' + ms.length + '）</div>';
-        if (!ms.length) html += '<p style="font-size:.85rem;color:var(--text-muted);">还没有子目标，添加一个吧</p>';
-        ms.forEach(function(m, i) {
-            html += '<div class="milestone-item' + (m.done ? ' done' : '') + '">' +
-                '<input type="checkbox" data-ms-index="' + i + '"' + (m.done ? ' checked' : '') + '>' +
-                '<span class="ms-content">' + esc(m.content) + '</span>' +
-                '<button class="ms-action ms-edit" data-ms-index="' + i + '" title="编辑">✏️</button>' +
-                '<button class="ms-action ms-del" data-ms-index="' + i + '" title="删除">🗑</button>' +
-                '</div>';
-        });
-        html += '<div class="milestone-add"><input id="ms-input" placeholder="新增子目标，回车或点添加"><button class="m-btn m-btn-sm" id="ms-add">添加</button></div>';
-
-        /* 模块6：TodoList 待办清单（添加/编辑/删除/打钩，实时持久化到后端） */
-        var todos = card.todos || [];
-        var todoDone = todos.filter(function(t) { return t.done; }).length;
-        html += '<div style="font-size:.9rem;font-weight:600;margin:14px 0 8px;">✅ 待办清单 TodoList（' + todoDone + ' / ' + todos.length + '）</div>';
-        if (!todos.length) {
-            html += '<p style="font-size:.85rem;color:var(--text-muted);">还没有待办事项，在下方添加一个吧</p>';
-        } else {
-            html += '<div id="todo-list">';
-            todos.forEach(function(t, i) {
-                html += '<div class="todo-item' + (t.done ? ' done' : '') + '">' +
-                    '<input type="checkbox" data-todo-index="' + i + '"' + (t.done ? ' checked' : '') + '>' +
-                    '<span class="todo-content">' + esc(t.content) + '</span>' +
-                    '<button class="todo-action todo-edit" data-todo-index="' + i + '" title="编辑">✏️</button>' +
-                    '<button class="todo-action todo-del" data-todo-index="' + i + '" title="删除">🗑</button>' +
-                    '</div>';
-            });
-            html += '</div>';
-        }
-        html += '<div class="milestone-add"><input id="todo-input" placeholder="新增待办事项，回车或点添加"><button class="m-btn m-btn-sm" id="todo-add">添加</button></div>';
-
-        html += '<div style="margin-top:18px;display:flex;gap:8px;flex-wrap:wrap;">';
+        html += '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">';
         html += '<button class="m-btn m-btn-primary" id="btn-save-overview">💾 保存修改</button>';
         if (card.status === 'in_progress') html += '<button class="m-btn" id="btn-abandon">放弃任务</button>';
         if (card.status !== 'completed' && card.status !== 'failed') html += '<button class="m-btn" id="btn-delete" style="color:#dc3545;">删除任务卡</button>';
         html += '<button class="m-btn" id="btn-reset" style="color:#e07b00;">🔄 重置卡片</button>';
-        html += '</div></div>';
+        html += '</div>';
+        html += '</div></div></div>';
 
         $('#cm-body').innerHTML = html;
 
@@ -667,35 +1106,13 @@ var TaskPlan = (function() {
             switchTab('settle');
         });
 
-        var msAdd = $('#ms-add');
-        if (msAdd) {
-            msAdd.addEventListener('click', function() { addMilestone(card); });
-            $('#ms-input').addEventListener('keydown', function(e) { if (e.key === 'Enter') addMilestone(card); });
-        }
-        $all('.milestone-item input[type="checkbox"]').forEach(function(cb) {
-            cb.addEventListener('change', function() { toggleMilestone(card, parseInt(cb.dataset.msIndex)); });
+        var btnGotoTasks = $('#btn-goto-tasks');
+        if (btnGotoTasks) btnGotoTasks.addEventListener('click', function() {
+            state.activeTab = 'tasks';
+            switchTab('tasks');
         });
-        $all('.milestone-item .ms-edit').forEach(function(btn) {
-            btn.addEventListener('click', function() { startEditMilestone(card, parseInt(btn.dataset.msIndex)); });
-        });
-        $all('.milestone-item .ms-del').forEach(function(btn) {
-            btn.addEventListener('click', function() { deleteMilestone(card, parseInt(btn.dataset.msIndex)); });
-        });
-        /* TodoList 事件绑定 */
-        var todoAdd = $('#todo-add');
-        if (todoAdd) {
-            todoAdd.addEventListener('click', function() { addTodo(card); });
-            $('#todo-input').addEventListener('keydown', function(e) { if (e.key === 'Enter') addTodo(card); });
-        }
-        $all('#todo-list input[type="checkbox"]').forEach(function(cb) {
-            cb.addEventListener('change', function() { toggleTodo(card, parseInt(cb.dataset.todoIndex)); });
-        });
-        $all('.todo-edit').forEach(function(btn) {
-            btn.addEventListener('click', function() { startEditTodo(card, parseInt(btn.dataset.todoIndex)); });
-        });
-        $all('.todo-del').forEach(function(btn) {
-            btn.addEventListener('click', function() { deleteTodo(card, parseInt(btn.dataset.todoIndex)); });
-        });
+        // 内嵌只读树：折叠展开仍可用（节点操作按钮不渲染）
+        bindTaskTree(card, false);
         var btnAbandon = $('#btn-abandon');
         if (btnAbandon) btnAbandon.addEventListener('click', function() { abandonCard(card); });
         var btnDelete = $('#btn-delete');
@@ -704,10 +1121,115 @@ var TaskPlan = (function() {
         if (btnReset) btnReset.addEventListener('click', function() { resetCard(card.id); });
     }
 
-    /* ---- 打卡 Tab（100 格） ---- */
+    /* ---- 打卡 Tab（100 格 + 记录流水，左右分栏） ---- */
+    var SLOT_REC_PAGE = 30;
+
+    /* 单条打卡记录行 → { html, text（供关键字过滤）, pending（尚未关联任务） } */
+    function slotRecordRow(card, r) {
+        var slot = r.slot;
+        var rec = slot.record || {};
+        var summary = rec.content || rec.prediction || '（无内容）';
+        if (card.type === 'trade') {
+            summary += ' · 预测' + (rec.prediction || '?');
+            if (rec.actual) summary += ' → 实际' + rec.actual + (rec.hit ? ' ✅' : ' ❌');
+            if (rec.account_balance) summary += ' · 💰' + rec.account_balance + 'U';
+        }
+        // 任务关联标签：已完成=绿 / 进行中=蓝 / 已删除任务=灰；未关联则提醒补选
+        var links = rec.task_links || [];
+        // 只有进行中的卡才谈得上"该补关联"；已结算/失败的卡不再催办
+        var pending = !links.length && card.status === 'in_progress';
+        var linkChips = '';
+        var titles = [];
+        if (links.length) {
+            linkChips = '<span class="srl-links">' + links.map(function(l) {
+                var node = findTaskNode(card.tasks || [], l.task_id);
+                var title = node ? node.title : '已删除任务';
+                titles.push(title);
+                var chipCls = node ? (l.state === 'done' ? ' done' : '') : ' gone';
+                return '<span class="srl-link-chip' + chipCls + '" title="' +
+                    (node ? (l.state === 'done' ? '本次完成' : '本次推进（进行中）') : '该任务已被删除，记录保留') + '">' +
+                    (l.state === 'done' ? '✔ ' : '') + esc(title) + '</span>';
+            }).join('') + '</span>';
+        } else if (card.status === 'in_progress') {
+            linkChips = '<span class="srl-pending-link" data-link-index="' + r.index + '" title="这条打卡还没有关联任务，点击补选">⚠️ 未关联任务</span>';
+        }
+        var full = slot.filled_at || '';
+        var brief = full.length > 16 ? full.slice(5, 16) : full;   // 列宽只放得下 MM-DD HH:MM
+        var durTxt = (rec.duration_minutes || 60) + ' 分钟';
+        // 未关联的记录加 is-pending：左侧淡色标记，配合「只看未关联」一眼看出该补哪几条
+        var html = '<div class="slot-record-item' + (pending ? ' is-pending' : '') + '">' +
+            '<span class="srl-index">第 ' + (r.index + 1) + ' 格</span>' +
+            '<span class="srl-mid"><span class="srl-content" title="' + esc(summary) + '">' + esc(summary) +
+            ' · ' + durTxt + '</span>' + linkChips + '</span>' +
+            '<span class="srl-time" title="' + esc(full) + '">' + esc(brief) + '</span>' +
+            '<button class="srl-del" data-del-index="' + r.index + '" title="删除这条打卡">🗑</button>' +
+            '</div>';
+        return { html: html, text: (summary + ' ' + full + ' ' + titles.join(' ')).toLowerCase(), pending: pending };
+    }
+
+    /* 记录流水的「关键字过滤 + 分段加载」：八十多条一次全渲会把右栏拉成几千像素，
+       每屏 30 条 + 就地过滤，重画只动列表、不动左边的格子 */
+    function bindSlotRecordFeed(card, rows) {
+        var bodyEl = $('#srl-body'), moreBtn = $('#srl-more'), cntEl = $('#srl-shown');
+        var searchEl = $('#srl-search'), pendEl = $('#srl-only-pending');
+        if (!bodyEl) return;
+        var keep = [], shown = 0;
+
+        function bindNew() {
+            $all('.srl-del:not([data-bound])', bodyEl).forEach(function(btn) {
+                btn.dataset.bound = '1';
+                btn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    unfillSlot(card, parseInt(btn.dataset.delIndex));
+                });
+            });
+            $all('.srl-pending-link:not([data-bound])', bodyEl).forEach(function(btn) {
+                btn.dataset.bound = '1';
+                btn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    var idx = parseInt(btn.dataset.linkIndex);
+                    openSlotDetail(card, card.slots[idx], idx);
+                });
+            });
+        }
+        function appendBatch() {
+            var next = keep.slice(shown, shown + SLOT_REC_PAGE);
+            if (next.length) {
+                bodyEl.insertAdjacentHTML('beforeend', next.map(function(i) { return rows[i].html; }).join(''));
+            }
+            shown += next.length;
+            if (cntEl) cntEl.textContent = String(shown);
+            var left = keep.length - shown;
+            if (moreBtn) {
+                moreBtn.style.display = left > 0 ? '' : 'none';
+                if (left > 0) moreBtn.textContent = '⬇ 继续显示（还有 ' + left + ' 条）';
+            }
+            bindNew();
+        }
+        function repaint() {
+            var kw = ((searchEl && searchEl.value) || '').trim().toLowerCase();
+            var onlyPend = !!(pendEl && pendEl.checked);
+            keep = [];
+            rows.forEach(function(row, i) {
+                if (kw && row.text.indexOf(kw) < 0) return;
+                if (onlyPend && !row.pending) return;
+                keep.push(i);
+            });
+            shown = 0;
+            bodyEl.innerHTML = keep.length ? '' :
+                '<div class="srl-empty">' + (kw ? '没有包含「' + esc(kw) + '」的记录' : '没有未关联任务的记录 🎉') + '</div>';
+            appendBatch();
+        }
+        if (searchEl) searchEl.addEventListener('input', repaint);
+        if (pendEl) pendEl.addEventListener('change', repaint);
+        if (moreBtn) moreBtn.addEventListener('click', appendBatch);
+        repaint();
+    }
+
     function renderSlotsTab(card) {
         var canFill = card.status === 'in_progress' && !card.locked;
-        var html = '<div class="slot-grid">';
+
+        var main = '<div class="slot-grid">';
         card.slots.forEach(function(slot, i) {
             var cls = 'slot-cell';
             if (slot.filled) cls += ' filled';
@@ -720,58 +1242,46 @@ var TaskPlan = (function() {
             } else {
                 tip += '：未勾选';
             }
-            html += '<div class="' + cls + '" data-index="' + i + '" title="' + esc(tip) + '">' +
-                '<span class="slot-title">' + (i + 1) + '</span>' + (slot.filled ? '✔' : '') + '</div>';
+            // ✔ 由 .slot-cell.filled::after 画在角上：格子只有 26px 高，数字和勾不能并排占位
+            main += '<div class="' + cls + '" data-index="' + i + '" title="' + esc(tip) + '">' +
+                '<span class="slot-title">' + (i + 1) + '</span></div>';
         });
-        html += '</div>';
-        html += '<div class="slot-grid-legend">' +
+        main += '</div>';
+        main += '<div class="slot-grid-legend">' +
             '<span>✔ 绿色 = 已勾选</span><span>□ 灰色 = 未勾选</span>' +
             (canFill ? '<span>👆 点击格子，随时开始，几分钟也算在场</span>' : '<span>🔒 当前卡片不可勾选</span>') +
             '</div>';
         if (canFill) {
-            html += '<div class="slot-encourage">🌱 今天做多少都可以——只要来了，就是胜利</div>';
+            main += '<div class="slot-encourage">🌱 今天做多少都可以——只要来了，就是胜利</div>';
         }
 
-        // 打卡记录列表（按时间倒序，含具体时间与内容摘要）
+        // 打卡记录（按时间倒序，含具体时间与内容摘要）
         var records = [];
         card.slots.forEach(function(slot, i) {
-            if (slot.filled && slot.record) {
-                records.push({ index: i, slot: slot });
-            }
+            if (slot.filled && slot.record) records.push({ index: i, slot: slot });
         });
         records.sort(function(a, b) { return (b.slot.filled_at || '').localeCompare(a.slot.filled_at || ''); });
-        if (records.length) {
-            html += '<div class="slot-record-list">' +
-                '<div class="srl-title">📋 打卡记录（' + records.length + ' 条 · 按时间倒序）</div>';
-            records.forEach(function(r) {
-                var slot = r.slot;
-                var rec = slot.record || {};
-                var summary = rec.content || rec.prediction || '（无内容）';
-                if (card.type === 'trade') {
-                    summary += ' · 预测' + (rec.prediction || '?');
-                    if (rec.actual) summary += ' → 实际' + rec.actual + (rec.hit ? ' ✅' : ' ❌');
-                    if (rec.account_balance) summary += ' · 💰' + rec.account_balance + 'U';
-                }
-                html += '<div class="slot-record-item">' +
-                    '<span class="srl-index">第 ' + (r.index + 1) + ' 格</span>' +
-                    '<span class="srl-content">' + esc(summary) + ' · ' + (rec.duration_minutes || 60) + ' 分钟</span>' +
-                    '<span class="srl-time">' + esc(slot.filled_at || '') + '</span>' +
-                    '<button class="srl-del" data-del-index="' + r.index + '" title="删除这条打卡">🗑</button>' +
-                    '</div>';
-            });
-            html += '</div>';
+        var rows = records.map(function(r) { return slotRecordRow(card, r); });
+
+        var side = '';
+        if (rows.length) {
+            var canLink = card.status === 'in_progress';
+            side = '<aside class="slots-side"><div class="slot-record-list">' +
+                '<div class="srl-title">📋 打卡记录 <span class="srl-count">（共 ' + records.length +
+                ' 条 · 已显示 <b id="srl-shown">0</b> 条 · 时间倒序）</span></div>' +
+                '<div class="srl-tools"><input type="search" id="srl-search" placeholder="搜内容 / 任务 / 日期…">' +
+                (canLink ? '<label class="srl-filter"><input type="checkbox" id="srl-only-pending"> 只看未关联</label>' : '') +
+                '</div>' +
+                '<div class="srl-body" id="srl-body"></div>' +
+                '<button type="button" class="m-btn m-btn-sm srl-more" id="srl-more">显示更多</button>' +
+                '</div></aside>';
         }
 
-        $('#cm-body').innerHTML = html;
+        $('#cm-body').innerHTML = '<div class="slots-layout"><div class="slots-main">' + main + '</div>' + side + '</div>';
         $all('.slot-cell').forEach(function(node) {
             node.addEventListener('click', function() { onSlotClick(card, node); });
         });
-        $all('.srl-del').forEach(function(node) {
-            node.addEventListener('click', function(e) {
-                e.stopPropagation();
-                unfillSlot(card, parseInt(node.dataset.delIndex));
-            });
-        });
+        if (rows.length) bindSlotRecordFeed(card, rows);
     }
 
     function onSlotClick(card, node) {
@@ -797,7 +1307,7 @@ var TaskPlan = (function() {
     function buildBackfillBlock(card) {
         var isTrade = !!(card && card.type === 'trade');
         var inputStyle = 'padding:6px 10px;border:1px solid var(--border-color);border-radius:6px;box-sizing:border-box;';
-        return '<div style="margin-top:10px;border-top:1px dashed var(--border-color);padding-top:8px;">' +
+        return '<div class="sf-span" style="margin-top:10px;border-top:1px dashed var(--border-color);padding-top:8px;">' +
             '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
             '<button type="button" class="m-btn m-btn-sm m-btn-primary" id="sf-mode-today">📅 今日打卡</button>' +
             '<button type="button" class="m-btn m-btn-sm" id="sf-mode-backfill" title="选择过去的时间点进行补录">🕘 历史补录</button>' +
@@ -819,10 +1329,10 @@ var TaskPlan = (function() {
             '<input type="time" id="sf-bf-time" value="20:00" title="每日补录的打卡时刻" style="width:110px;' + inputStyle + '">' +
             '</div>' +
             (isTrade ? '<button type="button" class="m-btn m-btn-sm" id="sf-bf-fetch" style="margin-top:6px;" title="重新拉取范围内每日余额">🔍 拉取余额数据</button>' : '') +
-            '<div id="sf-bf-preview" style="margin-top:6px;font-size:.78rem;color:var(--text-muted);max-height:180px;overflow:auto;">' +
+            '<div id="sf-bf-preview" class="bf-preview">' +
             (isTrade ? '选择日期范围后自动拉取每日账户余额数据（来自本地余额快照）' : '选择日期范围后生成待补录日期清单') + '</div>' +
             '<p id="sf-bf-range-hint" style="font-size:.75rem;color:var(--text-muted);margin:4px 0 0;">按日期范围每天补录一条打卡记录，按顺序填入空格子；' +
-            (isTrade ? '每日余额自动带入，可在格子里继续回填实际涨跌' : '内容与时长取上方表单当前值') + '</p>' +
+            (isTrade ? '每日余额自动带入，可在格子里继续回填实际涨跌' : '内容默认取上方表单值，也可以在每一行单独写当天的内容（后端 entries 支持逐条不同）') + '</p>' +
             '</div>' +
             '</div></div>';
     }
@@ -896,23 +1406,50 @@ var TaskPlan = (function() {
             return map;
         }
 
-        // 渲染预览清单：每天一行，带复选框；交易卡额外展示当日余额
+        // 渲染预览清单：每天一行（勾 + 日期 + 当日内容/当日余额）
+        // 学习卡逐行给输入框：后端 backfill-batch 的 entries[] 本就支持每条独立 record
         function renderPreview(days) {
             if (!preview) return;
             var exist = checkedDates();
             if (!days.length) { preview.innerHTML = '<span style="color:#e67e22">所选范围无效</span>'; return; }
-            var html = '';
+            var dupCount = days.filter(function(d) { return !!exist[d.date]; }).length;
+            var html = '<div class="bf-tools">' +
+                '<button type="button" class="bf-quick" data-act="all">全选</button>' +
+                '<button type="button" class="bf-quick" data-act="none">全不选</button>' +
+                '<button type="button" class="bf-quick" data-act="fresh" title="只勾选该日还没有打卡记录的行">只勾没打过的</button>' +
+                '<span style="margin-left:auto;">共 ' + days.length + ' 天' +
+                (dupCount ? '，其中 <b style="color:#e67e22">' + dupCount + '</b> 天已有记录' : '') + '</span>' +
+                '</div>';
             days.forEach(function(d) {
                 var hasBal = (d.balance !== null && d.balance !== undefined && d.balance !== '');
-                var warn = exist[d.date] ? ' <span style="color:#e67e22" title="该日已有 ' + exist[d.date] + ' 条打卡">⚠️已有' + exist[d.date] + '条</span>' : '';
-                html += '<label style="display:flex;align-items:center;gap:6px;padding:3px 6px;border:1px solid var(--border-color);border-radius:5px;margin-bottom:4px;background:#fff;cursor:pointer;">' +
-                    '<input type="checkbox" class="sf-bf-day" data-date="' + d.date + '" data-balance="' + (hasBal ? d.balance : '') + '" checked>' +
-                    '<span>' + d.date + warn + '</span>' +
-                    (isTrade ? '<span style="margin-left:auto;' + (hasBal ? 'color:#155724' : 'color:#aaa') + '">' +
-                        (hasBal ? '💰 ' + Number(d.balance).toFixed(2) + 'U' : '无余额数据') + '</span>' : '') +
-                    '</label>';
+                var dup = exist[d.date];
+                var warn = dup ? ' <span style="color:#e67e22" title="该日已有 ' + dup + ' 条打卡">⚠️' + dup + '条</span>' : '';
+                html += '<div class="bf-row' + (dup ? ' has-dup' : '') + '">' +
+                    '<label class="bf-date" title="勾选补录这一天">' +
+                    '<input type="checkbox" class="sf-bf-day" data-date="' + d.date +
+                    '" data-balance="' + (hasBal ? d.balance : '') + '" checked>' + d.date + warn + '</label>' +
+                    (isTrade
+                        ? '<span class="bf-bal" style="' + (hasBal ? 'color:#155724' : 'color:#aaa') + '">' +
+                          (hasBal ? '💰 ' + Number(d.balance).toFixed(2) + 'U' : '无余额数据') + '</span>'
+                        : '<input type="text" class="bf-text sf-bf-text" placeholder="当日学了什么？留空则取上方「学习内容」">') +
+                    '</div>';
             });
             preview.innerHTML = html;
+        }
+
+        // 清单头部快捷操作（全选/全不选/只勾没打过的）：事件委托，重画预览后依然有效
+        if (preview) {
+            preview.addEventListener('click', function(e) {
+                var btn = e.target.closest ? e.target.closest('.bf-quick') : null;
+                if (!btn) return;
+                var exist = checkedDates();
+                var act = btn.dataset.act;
+                $all('.sf-bf-day', preview).forEach(function(box) {
+                    if (act === 'all') box.checked = true;
+                    else if (act === 'none') box.checked = false;
+                    else if (act === 'fresh') box.checked = !exist[box.dataset.date];
+                });
+            });
         }
 
         function rangeMsg(text, color) {
@@ -1205,43 +1742,333 @@ var TaskPlan = (function() {
         });
     }
 
+    /* ================================================================
+       打卡弹窗 · 任务关联选择器（任务管理 v2）
+       ----------------------------------------------------------------
+       树形多选：勾选 = 本条打卡关联该任务；每个已勾选任务独立标记
+       「进行中（doing）/ 已完成（done）」（Q14，完成只能由此标记）
+       - 容器不可选；待补预估的叶子不可选（先补预估）；已完成不可选（Q5）
+       - 修改本条打卡时，允许保持"由本条完成"的既有勾选
+       - 无可选任务时提供「快速新建任务」内联引导（不关打卡弹窗）
+       ================================================================ */
+    function buildLinkPicker(card, currentLinks, slotIndex) {
+        var linkMap = {};
+        (currentLinks || []).forEach(function(l) { linkMap[l.task_id] = l.state || 'doing'; });
+        var tasks = card.tasks || [];
+        var rows = [];
+        var selectable = 0;
+        var checkedCount = 0;
+        function walk(nodes, depth) {
+            nodes.forEach(function(n) {
+                var hasChildren = isTaskContainer(n);
+                var est = Number(n.estimated_minutes) || 0;
+                var checked = !!linkMap[n.id];
+                var state = linkMap[n.id] || 'doing';
+                var isOwnDone = n.status === 'done' && n.completed_by_slot === slotIndex;
+                var blocked = '';
+                if (hasChildren) blocked = '父任务（容器）';
+                else if (est <= 0) blocked = '待补预估';
+                else if (n.status === 'done' && !isOwnDone) blocked = '已完成';
+                var dis = !!blocked && !checked;
+                if (!dis) selectable++;
+                if (checked) checkedCount++;
+                rows.push(
+                    '<label class="lp-row' + (checked ? ' checked' : '') + (dis ? ' disabled' : '') +
+                    '" data-tid="' + esc(n.id) + '">' +
+                    '<span class="lp-pad" style="width:' + (depth * 16) + 'px;"></span>' +
+                    '<input type="checkbox"' + (checked ? ' checked' : '') + (dis ? ' disabled' : '') + '>' +
+                    '<span class="lp-title">' + esc(n.title) + '</span>' +
+                    (blocked
+                        ? '<span class="lp-sub warn">' + esc(blocked) + '</span>'
+                        : '<span class="lp-sub">' + (hasChildren ? 'Σ ' + fmtHours(n.sub_total_minutes) : '预估 ' + fmtHours(est)) + '</span>') +
+                    '<span class="lp-state">' +
+                    '<button type="button" data-state="doing" class="' + (state === 'doing' ? 'on' : '') + '">进行中</button>' +
+                    '<button type="button" data-state="done" class="' + (state === 'done' ? 'on on-done' : '') + '">已完成</button>' +
+                    '</span>' +
+                    '</label>');
+                if (hasChildren) walk(n.children, depth + 1);
+            });
+        }
+        walk(tasks, 0);
+
+        var html = '<div class="link-picker" id="sf-link-picker">';
+        if (rows.length) {
+            /* 任务一多，能勾的混在「已完成 / 待补预估」之间很难翻；给一条吸顶过滤条。
+               「只看可关联」只隐藏没勾选又勾不动的行，已选中的始终保留，否则看不见自己的选择。 */
+            html += '<div class="lp-tools">';
+            if (rows.length > selectable) {
+                html += '<label><input type="checkbox" id="lp-only-avail"> 只看可关联</label>';
+            }
+            html += '<span class="lp-stat">可关联 ' + selectable + ' / 共 ' + rows.length + ' 项' +
+                (checkedCount ? ' · 已选 ' + checkedCount : '') + '</span></div>';
+            html += rows.join('');
+        }
+        if (!selectable) {
+            // 空树 / 全部不可选：内联快速新建（不弹新对话框，避免销毁打卡表单）
+            html += '<div class="lp-empty">' +
+                (rows.length ? '没有可关联的任务（全部已完成或待补预估）。' : '该卡还没有任务树。') +
+                '可快速新建一个任务：</div>' +
+                '<div style="display:flex;gap:6px;margin-bottom:8px;">' +
+                '<input type="text" id="sf-quick-task-title" placeholder="任务名称，如：域名注册" ' +
+                'style="flex:1;min-width:100px;padding:6px 10px;border:1px solid var(--border-color);border-radius:6px;font-size:.85rem;">' +
+                '<input type="number" id="sf-quick-task-est" step="0.5" min="0.5" placeholder="预估h" ' +
+                'style="width:70px;padding:6px 10px;border:1px solid var(--border-color);border-radius:6px;font-size:.85rem;">' +
+                '<button type="button" class="m-btn m-btn-sm m-btn-primary" id="sf-quick-task-add">创建</button>' +
+                '</div>';
+        }
+        if (rows.length && selectable) {
+            html += '<p class="lp-hint">勾选本次打卡推进的任务；每个任务独立标记「进行中 / 已完成」。' +
+                '刚开始不确定也可以先不选，结束时再回来关联。</p>';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    /* 收集选择器结果 → [{task_id, state}] */
+    function collectLinkPicker(overlay) {
+        var picker = overlay ? overlay.querySelector('#sf-link-picker') : null;
+        if (!picker) return [];
+        var links = [];
+        $all('.lp-row', picker).forEach(function(row) {
+            var cb = row.querySelector('input[type="checkbox"]');
+            if (!cb || !cb.checked || cb.disabled) return;
+            var doneBtn = row.querySelector('.lp-state button.on-done');
+            links.push({ task_id: row.dataset.tid, state: doneBtn ? 'done' : 'doing' });
+        });
+        return links;
+    }
+
+    /* 选择器交互：勾选显示状态按钮；状态二选一；快速新建（重建选择器保留已勾选） */
+    function bindLinkPicker(overlay, card, slotIndex) {
+        var picker = overlay ? overlay.querySelector('#sf-link-picker') : null;
+        if (!picker) return;
+        // 只看可关联：纯显示层过滤，不影响 collectLinkPicker（隐藏行若已勾选仍会被收集）
+        var onlyAvail = picker.querySelector('#lp-only-avail');
+        if (onlyAvail) {
+            onlyAvail.addEventListener('change', function() {
+                picker.classList.toggle('only-leaf', onlyAvail.checked);
+            });
+        }
+        // label 内的 checkbox change → 切换行样式
+        picker.addEventListener('change', function(e) {
+            var cb = e.target;
+            if (!cb || cb.type !== 'checkbox') return;
+            var row = cb.closest('.lp-row');
+            if (row && !cb.disabled) row.classList.toggle('checked', cb.checked);
+        });
+        // 状态按钮：进行中 / 已完成 二选一（阻止 label 默认行为，避免误触勾选）
+        picker.addEventListener('click', function(e) {
+            var btn = e.target.closest ? e.target.closest('.lp-state button') : null;
+            if (!btn) return;
+            e.preventDefault();
+            e.stopPropagation();
+            var row = btn.closest('.lp-row');
+            $all('.lp-state button', row).forEach(function(b) { b.classList.remove('on', 'on-done'); });
+            if (btn.dataset.state === 'done') btn.classList.add('on', 'on-done');
+            else btn.classList.add('on');
+        });
+
+        /* 选择器内联提示：不弹 MDialog（show 会关闭当前弹窗，销毁打卡表单） */
+        function pickerNote(msg, isErr) {
+            var note = picker.querySelector('.lp-note');
+            if (!note) {
+                note = document.createElement('p');
+                note.className = 'lp-note';
+                picker.appendChild(note);
+            }
+            note.textContent = (isErr === false ? '✅ ' : '❌ ') + String(msg || '');
+            note.style.color = isErr === false ? '#2b8a3e' : '#c92a2a';
+        }
+
+        var quickAdd = picker.querySelector('#sf-quick-task-add');
+        if (quickAdd) {
+            quickAdd.addEventListener('click', function() {
+                var titleEl = picker.querySelector('#sf-quick-task-title');
+                var estEl = picker.querySelector('#sf-quick-task-est');
+                var title = (titleEl.value || '').trim();
+                var est = Math.round((parseFloat(estEl.value) || 0) * 60);
+                if (!title) { pickerNote('请填写任务名称', true); return; }
+                if (est <= 0) { pickerNote('预估工作量必填（小时 > 0）', true); return; }
+                quickAdd.disabled = true;
+                apiPost('/plan/api/task-add', {
+                    plan_id: card.plan_id, card_id: card.id,
+                    title: title, estimated_minutes: est
+                }).then(function(res) {
+                    quickAdd.disabled = false;
+                    if (!res || res.code !== 200 || !res.data) {
+                        pickerNote((res && res.message) || '创建失败', true);
+                        return;
+                    }
+                    // 保留已勾选 → 重建选择器（打卡表单其他字段不受影响）
+                    var kept = collectLinkPicker(overlay);
+                    card.tasks = res.data.tasks || card.tasks;
+                    if (res.data.task_progress) card.task_progress = res.data.task_progress;
+                    var holder = picker.parentNode;
+                    var tmp = document.createElement('div');
+                    tmp.innerHTML = buildLinkPicker(card, kept, slotIndex);
+                    var freshPicker = tmp.firstChild;
+                    holder.replaceChild(freshPicker, picker);
+                    bindLinkPicker(overlay, card, slotIndex);
+                    // 成功提示写进重建后的新选择器
+                    var okNote = document.createElement('p');
+                    okNote.className = 'lp-note';
+                    okNote.textContent = '✅ 已创建任务「' + title + '」，勾选并标记状态';
+                    okNote.style.color = '#2b8a3e';
+                    freshPicker.appendChild(okNote);
+                    // 背景卡片弹窗/列表同步（不影响当前打卡表单）
+                    if (res.data.refresh) applyRefreshPayload(res.data.refresh);
+                }).catch(function(err) {
+                    quickAdd.disabled = false;
+                    pickerNote('请求失败：' + err.message, true);
+                });
+            });
+        }
+    }
+
+    /* ================================================================
+       快捷录入（复制上一条 / 插入常用段落）
+       ----------------------------------------------------------------
+       需求场景：同一张卡每天的打卡内容高度雷同，原来只能重新打字。
+       硬约束：这两个操作一律内联展开，绝不再开一个 MDialog ——
+       MDialog.show() 开头 close(activeDialog)，二次弹窗会把用户填了一半的表单销毁。
+       ================================================================ */
+
+    /* 除当前格外最近的一条已勾选记录（复制来源） */
+    function lastFilledRecord(card, exceptIndex) {
+        var best = null;
+        (card.slots || []).forEach(function(s, i) {
+            if (i === exceptIndex || !s.filled || !s.record) return;
+            if (!best || String(s.filled_at || '') > String(best.filled_at || '')) best = s;
+        });
+        return best ? best.record : null;
+    }
+
+    /* 「常用段落」候选：过程小记 + 最近若干条打卡内容（去重，最新的排前面） */
+    function cardSnippets(card, limit) {
+        var out = [], seen = {};
+        (card.notes || []).slice(-limit).reverse().forEach(function(n) {
+            var t = String(n.content || '').trim();
+            if (!t || seen[t]) return;
+            seen[t] = 1;
+            out.push({ src: '小记 ' + String(n.time || '').slice(5, 10), text: t });
+        });
+        (card.slots || []).map(function(s, i) { return { s: s, i: i }; })
+            .filter(function(o) { return o.s.filled && o.s.record && o.s.record.content; })
+            .sort(function(a, b) { return String(b.s.filled_at || '').localeCompare(String(a.s.filled_at || '')); })
+            .slice(0, limit)
+            .forEach(function(o) {
+                var t = String(o.s.record.content).trim();
+                if (!t || seen[t]) return;
+                seen[t] = 1;
+                out.push({ src: '第' + (o.i + 1) + '格', text: t });
+            });
+        return out;
+    }
+
+    function bindQuickFill(overlay, card, index) {
+        var ta = overlay.querySelector('#sf-content');
+        var noteEl = overlay.querySelector('#sf-quick-note');
+        if (!ta) return;
+        function note(msg, isErr) {
+            if (!noteEl) return;
+            noteEl.textContent = msg || '';
+            noteEl.className = 'sf-note ' + (msg ? (isErr ? 'err' : 'ok') : '');
+        }
+
+        var copyBtn = overlay.querySelector('#sf-copy-last');
+        if (copyBtn) copyBtn.addEventListener('click', function() {
+            var last = lastFilledRecord(card, index);
+            if (!last) { note('这张卡还没有可复制的历史打卡', true); return; }
+            var lines = String(last.content || '').split('\n');
+            ta.value = lines.length > 2 ? lines.slice(-2).join('\n') : (last.content || '');
+            var du = overlay.querySelector('#sf-duration');
+            if (du && last.duration_minutes != null) du.value = String(last.duration_minutes);
+            note('⤵ 已带入上一条' + (lines.length > 2 ? '的末尾 2 行' : '全文') + '，改几个字即可提交');
+            ta.focus();
+        });
+
+        var snipBtn = overlay.querySelector('#sf-snips-toggle');
+        var snipBox = overlay.querySelector('#sf-snips');
+        if (!snipBtn || !snipBox) return;
+        var items = cardSnippets(card, 12);
+        if (!items.length) { snipBtn.style.display = 'none'; return; }
+        snipBox.innerHTML = '<div class="sn-head">点一条就追加到「学习内容」里（可连点多条）：</div>' +
+            items.map(function(o, i) {
+                var flat = o.text.split('\n').join(' ');
+                return '<button type="button" class="sf-snip" data-i="' + i + '" title="' + esc(o.text) + '">' +
+                    '<span class="sn-src">' + esc(o.src) + '</span>' +
+                    esc(flat.length > 46 ? flat.slice(0, 46) + '…' : flat) + '</button>';
+            }).join('');
+        snipBtn.addEventListener('click', function() {
+            var open = snipBox.style.display !== 'none';
+            snipBox.style.display = open ? 'none' : '';
+            snipBtn.classList.toggle('m-btn-primary', !open);
+        });
+        snipBox.addEventListener('click', function(e) {
+            var btn = e.target.closest ? e.target.closest('.sf-snip') : null;
+            if (!btn) return;
+            var o = items[parseInt(btn.dataset.i, 10)];
+            if (!o) return;
+            var cur = ta.value.trim();
+            ta.value = cur ? (cur + '\n' + o.text) : o.text;
+            note('📎 已插入「' + o.src + '」');
+            ta.focus();
+        });
+    }
+
     /* 未勾选格子：填写记录（长期主义版：低门槛，几分钟也算在场） */
     function openSlotFill(card, index) {
         var isLearn = card.type === 'learn';
         var html;
         if (isLearn) {
-            html = '<div class="slot-form">' +
-                '<label>学习内容（这个小时学了什么？）</label><textarea id="sf-content" placeholder="如：研读 MACD 背离章节、写回测代码…"></textarea>' +
-                '<label>学习时长（分钟）</label><input type="number" id="sf-duration" value="60" min="0" max="480">' +
-                '<p style="font-size:.78rem;color:var(--text-muted);margin:6px 0 0;">🌱 设为 0 表示刚开始，结束时再更新实际时长</p>' +
+            /* 两栏表单：左「内容」右「时长」。原来一个只填 60 的输入框也要占满整行，
+               表单纵向拖到 700px 以上，45vh 的弹窗里只能滚着填 */
+            html = '<div class="slot-form"><div class="sf-cols">' +
+                '<div class="sf-field"><label>学习内容（这个小时学了什么？）</label>' +
+                '<textarea id="sf-content" placeholder="如：研读 MACD 背离章节、写回测代码…"></textarea>' +
+                '<div class="sf-acts">' +
+                '<button type="button" class="m-btn m-btn-sm" id="sf-copy-last" title="把最近一次打卡的内容与时长带进来，改几个字就能交">⤵ 复制上一条</button>' +
+                '<button type="button" class="m-btn m-btn-sm" id="sf-snips-toggle" title="从过程小记 / 最近打卡内容里挑一段插进来">📎 插入常用段落</button>' +
+                '</div>' +
+                '<div class="sf-snips" id="sf-snips" style="display:none;"></div>' +
+                '<p class="sf-note" id="sf-quick-note"></p>' +
+                '</div>' +
+                '<div class="sf-field"><label>学习时长（分钟）</label>' +
+                '<input type="number" id="sf-duration" value="60" min="0" max="480">' +
+                '<p class="sf-tip">🌱 设为 0 表示刚开始，结束时再更新实际时长</p>' +
+                '<p class="sf-tip">⏱ 工时按格计（一格 = 1h），这里的分钟数只用于时长统计</p>' +
+                '</div>' +
+                '<div class="sf-span"><label>关联任务（本次推进 / 完成了哪些任务？可多选）</label>' +
+                buildLinkPicker(card, [], index) + '</div>' +
                 buildBackfillBlock(card) +
-                '</div>';
+                '</div></div>';
         } else {
             html = '<div class="slot-form">' +
                 '<div id="sf-gate" class="sf-gate hide"></div>' +
-                '<label>预测方向</label><select id="sf-prediction">' +
-                '<option value="涨">📈 涨</option><option value="跌">📉 跌</option><option value="横盘">➖ 横盘</option></select>' +
-                '<label>交易时长（分钟）</label><input type="number" id="sf-duration" value="60" min="0" max="480">' +
-                '<label>实际涨跌（可稍后在格子里回填）</label><select id="sf-actual">' +
-                '<option value="">— 未回填 —</option><option value="涨">📈 涨</option><option value="跌">📉 跌</option><option value="横盘">➖ 横盘</option></select>' +
-                '<p style="font-size:.78rem;color:var(--text-muted);margin:6px 0 0;">🌱 设为 0 表示刚开始，结束时再更新实际时长</p>' +
-                // 💰 账户金额置顶突出：自动同步主账号余额，可手动修改/刷新
-                '<div style="margin-top:12px;padding:10px;border:1px solid var(--border-color);border-radius:8px;background:rgba(47,128,237,.05);">' +
-                '<label style="margin:0 0 4px;font-weight:600;">💰 账户金额（USDT）</label>' +
+                '<div class="sf-cols">' +
+                '<div class="sf-field"><label>预测方向</label><select id="sf-prediction">' +
+                '<option value="涨">📈 涨</option><option value="跌">📉 跌</option><option value="横盘">➖ 横盘</option></select></div>' +
+                '<div class="sf-field"><label>交易时长（分钟）</label>' +
+                '<input type="number" id="sf-duration" value="60" min="0" max="480">' +
+                '<p class="sf-tip">🌱 设为 0 表示刚开始，结束时再更新实际时长</p></div>' +
+                '<div class="sf-field"><label>实际涨跌（可稍后在格子里回填）</label><select id="sf-actual">' +
+                '<option value="">— 未回填 —</option><option value="涨">📈 涨</option><option value="跌">📉 跌</option><option value="横盘">➖ 横盘</option></select></div>' +
+                // 💰 账户金额：自动同步主账号余额，可手动修改/刷新
+                '<div class="sf-field"><label>💰 账户金额（USDT）</label>' +
                 '<div style="display:flex;gap:8px;align-items:center;">' +
-                '<input type="text" id="sf-balance" placeholder="自动获取中…" style="flex:1;padding:6px 10px;border:1px solid var(--border-color);border-radius:6px;font-size:.9rem;">' +
+                '<input type="text" id="sf-balance" placeholder="自动获取中…" style="flex:1;min-width:0;">' +
                 '<button type="button" class="m-btn m-btn-sm" id="sf-balance-refresh" title="强制重新拉取最新余额" style="flex-shrink:0;">🔄 刷新</button>' +
                 '</div>' +
                 '<p id="sf-balance-status" style="font-size:.72rem;color:var(--text-muted);margin:4px 0 0;">⏳ 正在自动获取主账号余额…</p>' +
                 '</div>' +
-                '<div style="margin-top:12px;border-top:1px dashed var(--border-color);padding-top:10px;">' +
-                '<label>📊 行情分析（市场状态/趋势判断/关键信息）</label>' +
-                '<textarea id="sf-market-analysis" placeholder="如：BTC 4H 突破关键阻力位，MACD金叉，资金费率转多，整体偏强震荡…" style="min-height:60px;"></textarea>' +
-                '<label>🎯 操作建议（具体操作计划）</label>' +
-                '<textarea id="sf-action-advice" placeholder="如：回踩确认不破支撑后轻仓试多，止损设在前低下方，目标看前高…" style="min-height:60px;"></textarea>' +
-                '</div>' +
+                '<div class="sf-field"><label>📊 行情分析（市场状态 / 趋势判断 / 关键信息）</label>' +
+                '<textarea id="sf-market-analysis" class="sf-short" placeholder="如：BTC 4H 突破关键阻力位，MACD金叉，资金费率转多，整体偏强震荡…"></textarea></div>' +
+                '<div class="sf-field"><label>🎯 操作建议（具体操作计划）</label>' +
+                '<textarea id="sf-action-advice" class="sf-short" placeholder="如：回踩确认不破支撑后轻仓试多，止损设在前低下方，目标看前高…"></textarea></div>' +
+                '<div class="sf-span"><label>🌳 关联任务（本次推进 / 完成了哪些任务？可多选）</label>' +
+                buildLinkPicker(card, [], index) + '</div>' +
                 buildBackfillBlock(card) +
-                '</div>';
+                '</div></div>';
         }
         // 【修复】原代码用 document.querySelector('.mdialog-overlay') 取弹窗容器，
         // 类名拼写错误（实际为 m-dialog-overlay）导致 overlay 恒为 null，
@@ -1249,15 +2076,20 @@ var TaskPlan = (function() {
         var overlay = null;
 
         // 范围补录批量提交：收集勾选日期 → entries → /plan/api/backfill-batch
+        // 学习卡逐行取「当日内容」输入框（留空回退到上方表单值）：
+        // 后端 entries[] 本来就支持每条独立 record，别再把所有日期写成同一份内容
         function submitRangeBackfill(baseRecord) {
             var timeEl = $('#sf-bf-time');
             var timeVal = (timeEl && timeEl.value) || '20:00';
             var entries = [];
-            $all('.sf-bf-day').forEach(function(box) {
-                if (!box.checked) return;
+            $all('.bf-row', overlay).forEach(function(row) {
+                var box = row.querySelector('.sf-bf-day');
+                if (!box || !box.checked) return;
                 var rec;
                 if (isLearn) {
-                    rec = { content: baseRecord.content || '历史补录学习记录', duration_minutes: baseRecord.duration_minutes };
+                    var txtEl = row.querySelector('.sf-bf-text');
+                    var txt = ((txtEl && txtEl.value) || '').trim();
+                    rec = { content: txt || baseRecord.content || '历史补录学习记录', duration_minutes: baseRecord.duration_minutes };
                 } else {
                     rec = {
                         prediction: baseRecord.prediction,
@@ -1278,7 +2110,9 @@ var TaskPlan = (function() {
             apiPost('/plan/api/backfill-batch', {
                 plan_id: card.plan_id,
                 card_id: card.id,
-                entries: entries
+                entries: entries,
+                // 整批统一关联同一组任务（服务端强制状态为 doing，事后可单条改完成）
+                task_links: collectLinkPicker(overlay)
             }).then(function(res) {
                 var d = (res && res.data) || {};
                 var blockedSlots = d.blocked_slots || [];
@@ -1311,14 +2145,15 @@ var TaskPlan = (function() {
             return false; // 异步提交：先保持弹窗打开，成功后再关闭
         }
 
-        overlay = MDialog.show({
+        overlay = showFormDialog({
             title: '第 ' + (index + 1) + ' 格 · ' + (isLearn ? '学习记录' : '交易记录'),
             message: html,
             okText: '✔ 勾选',
             onOk: function() {
                 var record;
+                var links = collectLinkPicker(overlay);
                 if (isLearn) {
-                    record = { content: $('#sf-content').value.trim(), duration_minutes: parseInt($('#sf-duration').value) || 0 };
+                    record = { content: $('#sf-content').value.trim(), duration_minutes: parseInt($('#sf-duration').value) || 0, task_links: links };
                 } else {
                     var prediction = $('#sf-prediction').value;
                     record = {
@@ -1327,7 +2162,8 @@ var TaskPlan = (function() {
                         actual: $('#sf-actual').value,
                         market_analysis: ($('#sf-market-analysis') || {}).value ? ($('#sf-market-analysis').value || '').trim() : '',
                         action_advice: ($('#sf-action-advice') || {}).value ? ($('#sf-action-advice').value || '').trim() : '',
-                        account_balance: ($('#sf-balance') || {}).value ? ($('#sf-balance').value || '').trim() : ''
+                        account_balance: ($('#sf-balance') || {}).value ? ($('#sf-balance').value || '').trim() : '',
+                        task_links: links
                     };
                 }
                 var payload = {
@@ -1376,6 +2212,10 @@ var TaskPlan = (function() {
         if (overlay) bindBackfillMode(overlay, card);
         // 分析纪律闸门状态条（仅交易卡；学习卡不受纪律约束）
         if (overlay) bindSlotGate(overlay, card);
+        // 任务关联选择器（多选 + 每任务状态标记 + 快速新建任务）
+        if (overlay) bindLinkPicker(overlay, card, index);
+        // 快捷录入：复制上一条 / 插入常用段落（学习卡；全部内联展开，不再开新弹窗）
+        if (overlay && isLearn) bindQuickFill(overlay, card, index);
         // 交易打卡：自动获取账户余额（含同步状态提示）
         if (!isLearn && overlay) {
             var balanceInput = overlay.querySelector('#sf-balance');
@@ -1426,50 +2266,70 @@ var TaskPlan = (function() {
     function openSlotDetail(card, slot, index) {
         var r = slot.record || {};
         var isLearn = card.type === 'learn';
+        var canEdit = card.status === 'in_progress';   // 已结束的卡只读（防误改历史）
+        var curLinks = r.task_links || [];
         var html = '<div class="slot-form">' +
             '<p style="font-size:.85rem;color:var(--text-muted);margin:0 0 4px;">勾选时间：' + esc(slot.filled_at || '') + '</p>';
+        if (canEdit && !curLinks.length) {
+            // 待关联提醒（含历史打卡）：结束打卡时引导补选，可随时回来关联
+            html += '<p style="font-size:.8rem;color:#e67e22;background:#fff7e6;border:1px dashed #e67e22;border-radius:8px;padding:7px 10px;margin:0 0 10px;">' +
+                '⚠️ 这条打卡还没有关联任务 —— 结束时请选择本次推进 / 完成的任务（不影响时长统计）</p>';
+        }
         if (isLearn) {
-            html += '<label>学习内容</label><textarea id="sd-content">' + esc(r.content || '') + '</textarea>' +
-                '<label>学习时长（分钟）</label><input type="number" id="sd-duration" value="' + (r.duration_minutes != null ? r.duration_minutes : 60) + '" min="0">';
+            html += '<div class="sf-cols">' +
+                '<div class="sf-field"><label>学习内容</label><textarea id="sd-content">' + esc(r.content || '') + '</textarea></div>' +
+                '<div class="sf-field"><label>学习时长（分钟）</label>' +
+                '<input type="number" id="sd-duration" value="' + (r.duration_minutes != null ? r.duration_minutes : 60) + '" min="0">' +
+                '<p class="sf-tip">⏱ 工时按格计（一格 = 1h），分钟数只用于时长统计</p></div>' +
+                (canEdit
+                    ? '<div class="sf-span"><label>🌳 关联任务（本次推进 / 完成了哪些任务？可多选）</label>' + buildLinkPicker(card, curLinks, index) + '</div>'
+                    : '<div class="sf-span"><p class="sf-tip">🔒 卡片已结束，任务关联只读</p></div>') +
+                '</div>';
         } else {
-            html += '<label>预测方向</label><select id="sd-prediction">' +
+            html += '<div class="sf-cols">' +
+                '<div class="sf-field"><label>预测方向</label><select id="sd-prediction">' +
                 '<option value="涨"' + (r.prediction === '涨' ? ' selected' : '') + '>📈 涨</option>' +
                 '<option value="跌"' + (r.prediction === '跌' ? ' selected' : '') + '>📉 跌</option>' +
-                '<option value="横盘"' + (r.prediction === '横盘' ? ' selected' : '') + '>➖ 横盘</option></select>' +
-                '<label>交易时长（分钟）</label><input type="number" id="sd-duration" value="' + (r.duration_minutes != null ? r.duration_minutes : 60) + '" min="0">' +
-                '<label>实际涨跌（回填后自动计算命中）</label><select id="sd-actual">' +
+                '<option value="横盘"' + (r.prediction === '横盘' ? ' selected' : '') + '>➖ 横盘</option></select></div>' +
+                '<div class="sf-field"><label>交易时长（分钟）</label>' +
+                '<input type="number" id="sd-duration" value="' + (r.duration_minutes != null ? r.duration_minutes : 60) + '" min="0"></div>' +
+                '<div class="sf-field"><label>实际涨跌（回填后自动计算命中）</label><select id="sd-actual">' +
                 '<option value=""' + (!r.actual ? ' selected' : '') + '>— 未回填 —</option>' +
                 '<option value="涨"' + (r.actual === '涨' ? ' selected' : '') + '>📈 涨</option>' +
                 '<option value="跌"' + (r.actual === '跌' ? ' selected' : '') + '>📉 跌</option>' +
-                '<option value="横盘"' + (r.actual === '横盘' ? ' selected' : '') + '>➖ 横盘</option></select>';
-            if (r.actual) {
-                html += '<p style="font-size:.85rem;' + (r.hit ? 'color:#28a745;' : 'color:#dc3545;') + '">' +
-                    (r.hit ? '✅ 预测命中！' : '❌ 预测未命中') + '</p>';
-            }
-            // 新增字段：行情分析 / 操作建议 / 账户金额
-            html += '<div style="margin-top:12px;border-top:1px dashed var(--border-color);padding-top:10px;">' +
-                '<label>📊 行情分析</label>' +
-                '<textarea id="sd-market-analysis" style="min-height:60px;">' + esc(r.market_analysis || '') + '</textarea>' +
-                '<label>🎯 操作建议</label>' +
-                '<textarea id="sd-action-advice" style="min-height:60px;">' + esc(r.action_advice || '') + '</textarea>' +
-                '<label>💰 账户金额（USDT）</label>' +
-                '<input type="text" id="sd-balance" value="' + esc(r.account_balance || '') + '" placeholder="可手动输入或留空">' +
+                '<option value="横盘"' + (r.actual === '横盘' ? ' selected' : '') + '>➖ 横盘</option></select></div>' +
+                '<div class="sf-field"><label>命中结果</label>' +
+                (r.actual
+                    ? '<p style="font-size:.86rem;margin:0;color:' + (r.hit ? '#28a745' : '#dc3545') + ';">' +
+                      (r.hit ? '✅ 预测命中！' : '❌ 预测未命中') + '</p>'
+                    : '<p class="sf-tip">回填「实际涨跌」后自动判定</p>') + '</div>' +
+                '<div class="sf-field"><label>📊 行情分析</label>' +
+                '<textarea id="sd-market-analysis" class="sf-short">' + esc(r.market_analysis || '') + '</textarea></div>' +
+                '<div class="sf-field"><label>🎯 操作建议</label>' +
+                '<textarea id="sd-action-advice" class="sf-short">' + esc(r.action_advice || '') + '</textarea></div>' +
+                '<div class="sf-field"><label>💰 账户金额（USDT）</label>' +
+                '<input type="text" id="sd-balance" value="' + esc(r.account_balance || '') + '" placeholder="可手动输入或留空"></div>' +
+                (canEdit
+                    ? '<div class="sf-span"><label>🌳 关联任务（本次推进 / 完成了哪些任务？可多选）</label>' + buildLinkPicker(card, curLinks, index) + '</div>'
+                    : '<div class="sf-span"><p class="sf-tip">🔒 卡片已结束，任务关联只读</p></div>') +
                 '</div>';
         }
         html += '</div>';
         // 删除打卡按钮
-        html += '<div style="margin-top:14px;border-top:1px dashed var(--border-color);padding-top:10px;">' +
+        html += '<div style="margin-top:12px;border-top:1px dashed var(--border-color);padding-top:10px;">' +
             '<button class="m-btn m-btn-sm" id="sd-delete" style="color:#dc3545;border:1px solid #dc3545;background:#fff;">🗑 删除这条打卡</button>' +
             '</div>';
 
-        var overlay = MDialog.show({
+        var overlay = showFormDialog({
             title: '第 ' + (index + 1) + ' 格 · ' + (isLearn ? '学习记录' : '交易记录'),
             message: html,
             okText: '保存修改',
             onOk: function() {
                 var record;
+                // 只读卡保留既有 task_links 原样回传，避免误清历史关联
+                var links = canEdit ? collectLinkPicker(overlay) : curLinks;
                 if (isLearn) {
-                    record = { content: $('#sd-content').value.trim(), duration_minutes: parseInt($('#sd-duration').value) || 0 };
+                    record = { content: $('#sd-content').value.trim(), duration_minutes: parseInt($('#sd-duration').value) || 0, task_links: links };
                 } else {
                     record = {
                         prediction: $('#sd-prediction').value,
@@ -1477,7 +2337,8 @@ var TaskPlan = (function() {
                         actual: $('#sd-actual').value,
                         market_analysis: ($('#sd-market-analysis') || {}).value ? ($('#sd-market-analysis').value || '').trim() : '',
                         action_advice: ($('#sd-action-advice') || {}).value ? ($('#sd-action-advice').value || '').trim() : '',
-                        account_balance: ($('#sd-balance') || {}).value ? ($('#sd-balance').value || '').trim() : ''
+                        account_balance: ($('#sd-balance') || {}).value ? ($('#sd-balance').value || '').trim() : '',
+                        task_links: links
                     };
                 }
                 apiPost('/plan/api/update-slot', {
@@ -1491,6 +2352,8 @@ var TaskPlan = (function() {
                 });
             }
         });
+        // 任务关联选择器（进行中的卡才可编辑；多选 + 每任务状态标记 + 快速新建任务）
+        if (canEdit && overlay) bindLinkPicker(overlay, card, index);
         // 删除打卡按钮（弹窗渲染后绑定）
         var delBtn = overlay.querySelector('#sd-delete');
         if (delBtn) delBtn.addEventListener('click', function() {
@@ -1570,7 +2433,7 @@ var TaskPlan = (function() {
             '<div class="cs-item"><div class="cs-num">' + fmtNum(totalHours) + 'h</div><div class="cs-label">累计时长</div></div>' +
             '<div class="cs-item"><div class="cs-num">' + avgMinutes + ' 分钟</div><div class="cs-label">平均每次时长</div></div>' +
             '</div>';
-        html += '<div class="checkin-chart-box"><div id="checkin-chart-daily" style="width:100%;height:320px;"></div></div>';
+        html += '<div class="checkin-chart-box"><div id="checkin-chart-daily" class="ccb-canvas"></div></div>';
 
         $('#cm-body').innerHTML = html;
 
@@ -1647,21 +2510,34 @@ var TaskPlan = (function() {
     /* ---- 小记 Tab ---- */
     function renderNotesTab(card) {
         var notes = card.notes || [];
-        /* 输入框固定上端（sticky），避免记录过多被挤到底部不可见 */
+        /* 输入框固定上端（sticky），列表用 .notes-list 两栏铺满宽弹窗：
+           原来一条小记独占整行，几十条要点很多次滚动才看完 */
+        var cap = cardTextUsed(card, 'notes');
         var html = '<div class="note-input-wrap">';
-        html += '<div style="font-size:.9rem;font-weight:600;margin-bottom:8px;">📝 过程小记（' + notes.length + ' 条）</div>';
-        html += '<div class="milestone-add"><input id="note-input" placeholder="写下此刻的想法…"><button class="m-btn m-btn-sm" id="note-add">添加</button></div>';
+        html += '<div class="ni-head">' +
+            '<span class="ni-title">📝 过程小记（' + notes.length + ' 条）</span>' +
+            '<span class="ni-cap' + textCapCls(cap) + '" title="plan_cards.notes 单列上限 64KB，写满会被后端拒绝">小记列 · ' + textCapText(cap) + '</span>' +
+            '</div>';
+        html += '<div class="note-add-box">' +
+            '<textarea id="note-input" placeholder="写下此刻的想法、卡住的点、下一步…（Enter 添加，Shift+Enter 换行）"></textarea>' +
+            '<button class="m-btn m-btn-sm ni-btn" id="note-add">添加</button>' +
+            '</div>';
+        html += '<p class="ni-hint">💡 小记只能追加、不支持删除；写进小记的固定句式，之后可在打卡表单里用「插入常用段落」直接复用。</p>';
         html += '</div>';
         if (!notes.length) html += '<p style="font-size:.85rem;color:var(--text-muted);">暂无小记，随手记录你的思考与感悟</p>';
         /* 倒序展示：最新的小记排在最上面（存储仍按追加顺序，仅渲染翻转） */
+        html += '<div class="notes-list">';
         notes.slice().reverse().forEach(function(n) {
             html += '<div class="note-item"><div class="note-time">' + esc(n.time) + '</div><div class="note-content">' + esc(n.content) + '</div></div>';
         });
+        html += '</div>';
 
         $('#cm-body').innerHTML = html;
 
         $('#note-add').addEventListener('click', function() { addNote(card); });
-        $('#note-input').addEventListener('keydown', function(e) { if (e.key === 'Enter') addNote(card); });
+        $('#note-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); addNote(card); }
+        });
     }
 
     function addNote(card) {
@@ -1676,14 +2552,19 @@ var TaskPlan = (function() {
     /* ---- 结算 Tab（长期主义版：无罚款，只有奖励与在场记录） ---- */
     function renderSettleTab(card) {
         var ri = card.reward_info || {};
-        var msDone = (card.milestones || []).filter(function(m) { return m.done; }).length;
-        var msTotal = (card.milestones || []).length;
+        var tp = card.task_progress || {};
+        var taskDone = tp.done_count || 0;
+        var taskTotal = tp.total_count || 0;
         var html = '<div class="settle-info">';
         html += '<div class="si-row"><span>基础奖励</span><span>' + fmtNum(ri.base_reward) + ' 元</span></div>';
         html += '<div class="si-row"><span>已勾选小时</span><span>' + ri.filled_count + ' / 100 h</span></div>';
         html += '<div class="si-row"><span>🌱 在场天数</span><span>' + (ri.presence_days || 0) + ' 天</span></div>';
         if (ri.early_eligible) {
             html += '<div class="si-row"><span>提前奖励</span><span>' + fmtNum(ri.early_bonus) + ' 元（提前 ' + (ri.early_hours || 0) + 'h）</span></div>';
+        }
+        if (ri.penalty_enabled) {
+            html += '<div class="si-row" style="color:#dc3545;"><span>⚠️ 三档罚款</span><span>-' + fmtNum(ri.total_penalty) +
+                ' 元（缺勤 ' + (ri.penalty_idle_days || 0) + ' 天 / 未达标 ' + ((ri.penalty_normal_days || 0) + (ri.penalty_severe_days || 0)) + ' 天）</span></div>';
         }
         html += '<div class="si-row total"><span>预计奖励</span><span>' + fmtNum(ri.final_reward) + ' 元</span></div>';
         html += '</div>';
@@ -1696,6 +2577,8 @@ var TaskPlan = (function() {
             html += '<div class="si-row"><span>实际用时</span><span>' + s.total_hours_used + ' h</span></div>';
             if (s.early_hours !== undefined) html += '<div class="si-row"><span>提前完成</span><span>' + s.early_hours + ' h</span></div>';
             if (s.early_bonus !== undefined) html += '<div class="si-row"><span>提前奖励</span><span>' + fmtNum(s.early_bonus) + ' 元</span></div>';
+            if (s.penalty_total !== undefined) html += '<div class="si-row" style="color:#dc3545;"><span>⚠️ 三档罚款</span><span>-' + fmtNum(s.penalty_total) +
+                ' 元（缺勤 ' + (s.penalty_idle_days || 0) + ' 天）</span></div>';
             html += '<div class="si-row total"><span>最终奖励</span><span>' + fmtNum(s.final_reward) + ' 元</span></div>';
             html += '<div class="si-row"><span>结算时间</span><span>' + esc(s.settled_at) + '</span></div>';
             html += '</div>';
@@ -1705,25 +2588,73 @@ var TaskPlan = (function() {
                 html += '<button class="m-btn m-btn-primary" id="btn-settle">💰 结算本轮</button>';
             } else if (card.filled_count >= 100 || ri.early_eligible) {
                 if (ri.early_eligible && card.filled_count < 100) {
-                    html += '<p style="font-size:.85rem;color:#28a745;">🎉 子目标已全部完成（' + msDone + '/' + msTotal + '）——任务完成即通关，无需硬耗 100 小时！</p>';
+                    html += '<p style="font-size:.85rem;color:#28a745;">🎉 任务树已全部完成（' + taskDone + '/' + taskTotal + ' 个任务）——任务完成即通关，无需硬耗 100 小时！</p>';
                 } else {
                     html += '<p style="font-size:.85rem;color:var(--text-muted);">100 小时已填满，可手动结算（满格时通常已自动结算）。</p>';
                 }
                 html += '<button class="m-btn m-btn-primary" id="btn-settle">💰 结算任务</button>';
             } else {
                 html += '<p style="font-size:.85rem;color:var(--text-muted);">完成 100 小时后自动结算（当前 ' + card.filled_count + 'h）。</p>';
-                if (msTotal > 0) {
-                    html += '<p style="font-size:.85rem;color:var(--text-muted);">或完成全部子目标（' + msDone + '/' + msTotal + '）即可提前通关，无需等满 100 小时 🌱</p>';
+                if (taskTotal > 0) {
+                    html += '<p style="font-size:.85rem;color:var(--text-muted);">或完成整个任务树（' + taskDone + '/' + taskTotal + ' 个任务）即可提前通关，无需等满 100 小时 🌱</p>';
                 } else {
-                    html += '<p style="font-size:.85rem;color:var(--text-muted);">💡 在「概览」中添加子目标并全部完成后，可提前通关拿奖励</p>';
+                    html += '<p style="font-size:.85rem;color:var(--text-muted);">💡 在「🌳 任务」Tab 搭建任务树并全部完成后，可提前通关拿奖励</p>';
                 }
             }
         }
+
+        /* 结算页右栏挂复盘编辑：update-card 白名单里本来就有 review，
+           以前前端零入口，只能去「概览」写；结算前正是最想写复盘的时刻，就近放。 */
+        var capR = cardTextUsed(card, 'review');
+        html = '<div class="settle-cols">' +
+            '<div>' + html + '</div>' +
+            '<div class="settle-review">' +
+            '<div class="sr-title">🪞 卡片复盘 <span class="sf-tip' + textCapCls(capR) + '" id="sr-review-cap" title="plan_cards.review 列上限 64KB">复盘列 · ' + textCapText(capR) + '</span></div>' +
+            '<textarea id="sr-review" placeholder="这轮哪里执行得好、哪里失控、被什么打断、下一轮准备怎么改…">' + esc(card.review || '') + '</textarea>' +
+            '<div class="sf-acts">' +
+            '<button class="m-btn m-btn-sm m-btn-primary" id="sr-review-save">💾 保存复盘</button>' +
+            '<span class="sf-note" id="sr-review-note"></span>' +
+            '</div></div></div>';
 
         $('#cm-body').innerHTML = html;
 
         var btnSettle = $('#btn-settle');
         if (btnSettle) btnSettle.addEventListener('click', function() { settleCard(card); });
+
+        var saveReview = $('#sr-review-save');
+        var reviewBox = $('#sr-review');
+        var reviewCap = $('#sr-review-cap');
+        /* 复盘列容量就地重绘。这里刻意不 refreshModal()：整块重渲染会连用户
+           刚写的其它字段和当前 Tab 一起丢掉，所以只改角标这一处文本。 */
+        function paintReviewCap(used) {
+            if (!reviewCap) return;
+            reviewCap.textContent = '复盘列 · ' + textCapText(used);
+            reviewCap.classList.toggle('hi', used > TEXT_BUDGET * 0.8);
+        }
+        if (reviewBox && reviewCap) {
+            reviewBox.addEventListener('input', function() { paintReviewCap(utf8Bytes(reviewBox.value)); });
+        }
+        if (saveReview) saveReview.addEventListener('click', function() {
+            var val = (reviewBox.value || '').trim();
+            var note = $('#sr-review-note');
+            saveReview.disabled = true;
+            apiPost('/plan/api/update-card', {
+                plan_id: card.plan_id, card_id: card.id, fields: { review: val }
+            }).then(function(res) {
+                saveReview.disabled = false;
+                if (res && res.code === 200) {
+                    card.review = val;   // 同步内存，切回「概览」也能看到最新值
+                    if (note) { note.textContent = '✅ 复盘已保存'; note.style.color = '#2b8a3e'; }
+                    paintReviewCap(cardTextUsed(card, 'review'));
+                } else if (note) {
+                    note.textContent = '❌ ' + ((res && res.message) || '保存失败');
+                    note.style.color = '#c92a2a';
+                }
+            }).catch(function(err) {
+                saveReview.disabled = false;
+                if (note) { note.textContent = '❌ 请求失败：' + err.message; note.style.color = '#c92a2a'; }
+            });
+        });
     }
 
     /* ================================================================
@@ -1742,6 +2673,9 @@ var TaskPlan = (function() {
             start_time: fromDatetimeLocal(startVal),
             end_time: fromDatetimeLocal(endVal)
         };
+        // 复盘走 update-card 既有白名单字段（review），后端无需改动
+        var reviewEl = $('#ov-review');
+        if (reviewEl) fields.review = reviewEl.value.trim();
         var rewardEl = $('#ov-reward');
         if (rewardEl) fields.reward = parseInt(rewardEl.value) || 0;
         if (!fields.goal) { MDialog.alert('任务目标不能为空'); return; }
@@ -1756,168 +2690,9 @@ var TaskPlan = (function() {
         });
     }
 
-    function addMilestone(card) {
-        var input = $('#ms-input');
-        var content = input.value.trim();
-        if (!content) return;
-        saveMilestones(card, (card.milestones || []).concat([{ content: content, done: false }]));
-    }
-
-    function toggleMilestone(card, index) {
-        apiPost('/plan/api/toggle-milestone', {
-            plan_id: card.plan_id,
-            card_id: card.id,
-            milestone_index: index
-        }).then(function(res) {
-            if (res.code === 200) {
-                var d = res.data;
-                // 兼容新接口（返回对象含 milestones/all_done/early_eligible）
-                var milestones = d.milestones || d;
-                // 检测刚刚勾选了最后一个子目标 → 弹出提前通关引导
-                if (d.all_done && d.early_eligible && d.card_status === 'in_progress') {
-                    refreshModal();
-                    var msTotal = (milestones || []).length;
-                    var filledH = d.filled_count || 0;
-                    var remainH = Math.max(0, 100 - filledH);
-                    MDialog.show({
-                        title: '🎉 子目标全部完成！',
-                        message: '你已完成全部 ' + msTotal + ' 个子目标——任务完成即通关，无需硬耗 100 小时！' +
-                            '<br><br>当前已打卡 <b>' + filledH + '</b> 小时，剩余 <b>' + remainH + '</b> 小时可获提前奖励。' +
-                            '<br><br>立即结算可解锁下一张任务卡 🚀',
-                        type: 'success',
-                        buttons: [
-                            { text: '稍后再说', type: 'cancel' },
-                            { text: '去结算 💰', type: 'primary', onClick: function() {
-                                state.activeTab = 'settle';
-                                switchTab('settle');
-                            }}
-                        ]
-                    });
-                } else {
-                    refreshModal();
-                }
-            } else {
-                MDialog.alert(res.message || '操作失败');
-            }
-        });
-    }
-
-    /* 整体提交 milestones 数组（与 TodoList 模式一致，增删改均走 update-card） */
-    function saveMilestones(card, milestones) {
-        apiPost('/plan/api/update-card', {
-            plan_id: card.plan_id,
-            card_id: card.id,
-            fields: { milestones: milestones }
-        }).then(function(res) {
-            if (res.code === 200) refreshModal();
-            else MDialog.alert(res.message || '操作失败');
-        });
-    }
-
-    function deleteMilestone(card, index) {
-        var m = (card.milestones || [])[index];
-        MDialog.danger('确定删除子目标「' + ((m && m.content) || '') + '」吗？', function() {
-            var milestones = (card.milestones || []).filter(function(t, i) { return i !== index; });
-            saveMilestones(card, milestones);
-        });
-    }
-
-    /* 行内编辑子目标：点击 ✏️ 替换为 input，Enter/失焦提交，Esc 还原 */
-    function startEditMilestone(card, index) {
-        var item = $all('.milestone-item')[index];
-        if (!item) return;
-        var contentSpan = item.querySelector('.ms-content');
-        var oldContent = (card.milestones || [])[index] ? card.milestones[index].content : '';
-        var input = document.createElement('input');
-        input.type = 'text';
-        input.className = 'ms-edit-input';
-        input.value = oldContent;
-        contentSpan.replaceWith(input);
-        input.focus();
-        input.setSelectionRange(input.value.length, input.value.length);
-
-        var committed = false;
-        function commit() {
-            if (committed) return;
-            committed = true;
-            var newContent = input.value.trim();
-            if (!newContent || newContent === oldContent) { refreshModal(); return; }
-            var milestones = (card.milestones || []).map(function(m, i) {
-                return i === index ? { content: newContent, done: m.done } : m;
-            });
-            saveMilestones(card, milestones);
-        }
-        input.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') { e.preventDefault(); commit(); }
-            else if (e.key === 'Escape') { committed = true; refreshModal(); }
-        });
-        input.addEventListener('blur', commit);
-    }
-
-    /* ---- TodoList 操作（模块6：整体数组提交 update-card，与 milestone 模式一致） ---- */
-    function saveTodos(card, todos) {
-        apiPost('/plan/api/update-card', {
-            plan_id: card.plan_id,
-            card_id: card.id,
-            fields: { todos: todos }
-        }).then(function(res) {
-            if (res.code === 200) refreshModal();
-            else MDialog.alert(res.message || '操作失败');
-        });
-    }
-
-    function addTodo(card) {
-        var input = $('#todo-input');
-        var content = input.value.trim();
-        if (!content) return;
-        saveTodos(card, (card.todos || []).concat([{ content: content, done: false }]));
-    }
-
-    function toggleTodo(card, index) {
-        var todos = (card.todos || []).map(function(t, i) {
-            return i === index ? { content: t.content, done: !t.done } : t;
-        });
-        saveTodos(card, todos);
-    }
-
-    function deleteTodo(card, index) {
-        MDialog.danger('确定删除这条待办吗？', function() {
-            var todos = (card.todos || []).filter(function(t, i) { return i !== index; });
-            saveTodos(card, todos);
-        });
-    }
-
-    /* 行内编辑：点击 ✏️ 替换为 input，Enter/失焦提交，Esc 还原 */
-    function startEditTodo(card, index) {
-        var item = $all('.todo-item')[index];
-        if (!item) return;
-        var contentSpan = item.querySelector('.todo-content');
-        var oldContent = (card.todos || [])[index] ? card.todos[index].content : '';
-        var input = document.createElement('input');
-        input.type = 'text';
-        input.className = 'todo-edit-input';
-        input.value = oldContent;
-        contentSpan.replaceWith(input);
-        input.focus();
-        input.setSelectionRange(input.value.length, input.value.length);
-
-        var committed = false;
-        function commit() {
-            if (committed) return;
-            committed = true;
-            var newContent = input.value.trim();
-            if (!newContent || newContent === oldContent) { refreshModal(); return; }
-            var todos = (card.todos || []).map(function(t, i) {
-                return i === index ? { content: newContent, done: t.done } : t;
-            });
-            saveTodos(card, todos);
-        }
-        input.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') { e.preventDefault(); commit(); }
-            else if (e.key === 'Escape') { committed = true; refreshModal(); }
-        });
-        input.addEventListener('blur', commit);
-    }
+    /* （旧）milestones / todos 前端操作已随任务树 v2 移除：
+       旧数据经后端惰性迁移进任务树，旧列仅作归档，增删改与状态全部走任务树接口
+       （task-add / task-update / task-delete / task-cancel-done） */
 
     function abandonCard(card) {
         MDialog.confirm('确定放弃「' + card.title + '」吗？\n放弃后该轮奖励为 0，并将解锁下一张任务卡。', function() {
@@ -2052,7 +2827,7 @@ var TaskPlan = (function() {
             '<div class="form-row"><label>开始时间（可改，默认现在）</label><input type="datetime-local" id="nc-start" value="' + formatLocalDateTime(new Date()) + '"></div>' +
             '</div>';
 
-        MDialog.show({
+        showFormDialog({
             title: isLearn ? '＋ 新学习任务' : '＋ 新交易任务',
             message: html,
             okText: '创建',
@@ -2075,7 +2850,7 @@ var TaskPlan = (function() {
                     }
                 });
             }
-        });
+        }, 'sm');
     }
 
     /* 打卡变更后的局部刷新：用接口返回的 refresh 载荷就地更新总览/趋势图/计划详情/今日面板/卡片弹窗，

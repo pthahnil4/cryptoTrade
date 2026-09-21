@@ -103,6 +103,16 @@ class DualPositionOrderManager:
         self.state = self._load_state()
         self._run_id = ''
         self._verbose = True
+        # 本轮"下单出口失败"暂存（供调度轮排空后升级为告警邮件）：
+        # 仅记录 execute_trade/execute_reduce_only_order 真正被交易所拒/异常，
+        # 风控主动拦截、量为0的正常跳过不计入，避免把"本就不该下单"误报成故障。
+        # need_verify=True 表示"结果未知、该单可能已落地"，需单独升级人工核实邮件。
+        self._round_place_failures = []
+        # 本轮"账本与真实持仓大幅背离"暂存（供调度轮排空后升级为告警邮件）：
+        # reconcile 缩减/吸收分支每次命中都记一条原始事实（不做阈值判断，阈值在交易
+        # 侧配置热加载），仅记账不改变对账行为。缩减≈强平/爆仓/手动平仓（危险），
+        # 吸收≈人工同向加仓（提示）。
+        self._round_divergences = []
         # 杠杆回核时间戳（内存态）：{inst_id:mode -> 上次回交易所核对的秒级时间}。
         # lev_set 缓存只能证明“本进程设过”，人工在 App 改杠杆、交易所侧重置
         # 或账户杠杆模式变更都会使缓存失真，盲信缓存会一直沿用错误杠杆
@@ -237,6 +247,34 @@ class DualPositionOrderManager:
         """设置本轮日志上下文（调度轮次ID + 生命周期日志详细开关）"""
         self._run_id = run_id or ''
         self._verbose = bool(verbose)
+        # 每轮开始清空上一轮遗留的下单失败记录，避免跨轮重复计入
+        self._round_place_failures = []
+        # 同上：账本背离事件也按币、按轮清一次（本轮仅在动作前那次 reconcile 排空告警，
+        # 平仓动作后 _refresh_positions 的再对账属程序自身行为，不计入背离告警）
+        self._round_divergences = []
+
+    def _note_place_failure(self, inst_id: str, bucket: str, slot: str,
+                            amount: float, price: float, error,
+                            need_verify: bool = False):
+        """暂存一次下单出口失败（bucket/slot 定位是哪个篮子哪种单）。"""
+        self._round_place_failures.append({
+            'inst_id': inst_id, 'bucket': bucket, 'slot': slot,
+            'amount': float(amount or 0), 'price': float(price or 0),
+            'error': str(error or '无返回'), 'need_verify': bool(need_verify)})
+
+    def drain_place_failures(self):
+        """取出并清空本轮累计的下单失败记录（调度轮在挂单阶段结束后调用）。"""
+        with self._lock:
+            out = self._round_place_failures
+            self._round_place_failures = []
+            return out
+
+    def drain_divergences(self):
+        """取出并清空本轮累计的账本背离事件（调度轮在动作前对账之后调用）。"""
+        with self._lock:
+            out = self._round_divergences
+            self._round_divergences = []
+            return out
 
     def _rid(self) -> str:
         """轮次ID前缀（场景日志统一格式）"""
@@ -274,6 +312,14 @@ class DualPositionOrderManager:
             bk = self._inst(inst_id)[bucket]
             return (round(float(bk['held'].get(direction, 0) or 0), 4),
                     float(bk['avg_px'].get(direction, 0) or 0))
+
+    def algo_in_place(self, inst_id: str, bucket: str, direction: str) -> bool:
+        """交易所侧兜底委托是否确实在位（有 algo_id）。
+        供"兜底委托不在位"告警判定：sync 后仍为 False 且本轮确有持仓+有效触发价，
+        即说明这层"宕机保险"没挂上（下单失败/被撤后重挂又失败）。"""
+        with self._lock:
+            rec = self._inst(inst_id)[bucket]['algo'].get(direction)
+            return bool(rec and rec.get('algo_id'))
 
     def pending_snapshot(self, inst_id: str, bucket: str) -> Dict:
         """槽位状态快照（供日志展示）"""
@@ -386,6 +432,11 @@ class DualPositionOrderManager:
                     f"[双仓位] {inst_id} 账本对账 | {d} 方向真实持仓{real[d]:.1f}张 < "
                     f"账本合计{total}张（系统外平仓/强平），按比例{scale:.3f}缩减：" +
                     ' '.join(detail))
+                # 记一条原始背离事实（缩减）：真实远低于账本，通常=强平/爆仓/账户被人工平仓
+                self._round_divergences.append({
+                    'inst_id': inst_id, 'kind': 'shrink', 'direction': d,
+                    'scale': round(scale, 4), 'total': total, 'real': real[d],
+                    'detail': ' '.join(detail)})
             # 账本外真实超额（人工同向加仓/入账遗漏）：吸收进账本继续管理，
             # 使后续开平仓调度照常运作（补到目标量/信号平仓都覆盖人工部分）
             for d in ('long', 'short'):
@@ -423,6 +474,13 @@ class DualPositionOrderManager:
                     f"[双仓位] {inst_id} 账本吸收 | {d} 方向真实持仓{real[d]:.1f}张 > "
                     f"账本合计{total}张（人工加仓/入账），吸收{excess:.1f}张入册：" +
                     ' '.join(detail))
+                # 记一条原始背离事实（吸收）：真实远高于账本，通常=人工同向加仓/入账遗漏。
+                # total>0 才有"相对倍数"意义（从零吸收多见于重启/接管人工仓，不误报）。
+                self._round_divergences.append({
+                    'inst_id': inst_id, 'kind': 'absorb', 'direction': d,
+                    'ratio': round(excess / total, 4) if total > 0 else 0.0,
+                    'excess': excess, 'total': total, 'real': real[d],
+                    'detail': ' '.join(detail)})
             self._save(inst_id)
 
     # =================================================================
@@ -842,6 +900,8 @@ class DualPositionOrderManager:
                 f"{amount}张 @限价{price:.6g} | 原因：{reason or '-'}", key=True)
             return True
         err = res.get('error') if res else '无返回'
+        self._note_place_failure(inst_id, bucket, SLOT_ENTRY, amount, price, err,
+                                 need_verify=bool((res or {}).get('need_verify')))
         task_log.warning(f"[双仓位] {inst_id} {self._tag(bucket, SLOT_ENTRY)} 挂单失败: {err}")
         return False
 
@@ -873,6 +933,8 @@ class DualPositionOrderManager:
                 f"{amount}张 @限价{price:.6g} | 原因：{reason or '-'}", key=True)
             return True
         err = res.get('error') if res else '无返回'
+        self._note_place_failure(inst_id, bucket, SLOT_EXIT, amount, price, err,
+                                 need_verify=bool((res or {}).get('need_verify')))
         task_log.warning(f"[双仓位] {inst_id} {self._tag(bucket, SLOT_EXIT)} 挂单失败: {err}")
         return False
 

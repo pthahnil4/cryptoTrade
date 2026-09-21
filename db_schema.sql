@@ -24,6 +24,12 @@
 --                        task_analysis_records 增 hour_slot/source；
 --                        plan_slots 增 analysis_ids/analysis_hour/bypass_analysis；
 --                        配置整份存 kv_store key='analysis_discipline_config'）
+--   批次12（2026-09-17）: 盘感模拟模块（instinct_corpus/instinct_wiki_rules/
+--                        instinct_predictions/instinct_embeddings，
+--                        详见 doc/RAG_LLM_Wiki模拟盘感落地方案.md）
+--   增量（2026-09-17）:  热量明细结构扩展 calorie_meal_items 增 quantity/unit
+--                        （数量 × 单位热量 = 总热量；存量库由 init_db 自动补列，
+--                        手工迁移见 doc/热量明细数量字段迁移.sql）
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -137,7 +143,9 @@ CREATE TABLE IF NOT EXISTS `calorie_records` (
   COMMENT='每日热量记录';
 
 -- ---------------------------------------------------------------------
--- 三餐食物明细（原记录内 *_foods 数组的关系化拆分）
+-- 三餐食物明细（原记录内 *_foods JSON 数组的关系化拆分）
+-- 明细结构 {name, calories(单位热量), quantity(数量), unit(单位快照)}，
+-- 该行总摄入 = calories × quantity；存量数据 quantity=1 与原绝对热量兼容
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `calorie_meal_items` (
   `id` INT NOT NULL AUTO_INCREMENT,
@@ -145,7 +153,9 @@ CREATE TABLE IF NOT EXISTS `calorie_meal_items` (
   `meal` VARCHAR(10) NOT NULL COMMENT 'breakfast/lunch/dinner',
   `position` INT NOT NULL DEFAULT 0 COMMENT '餐内顺序',
   `name` VARCHAR(64) NOT NULL COMMENT '食物名',
-  `calories` FLOAT NOT NULL DEFAULT 0 COMMENT '热量',
+  `calories` FLOAT NOT NULL DEFAULT 0 COMMENT '单位热量(kcal/单位)',
+  `quantity` FLOAT NOT NULL DEFAULT 1 COMMENT '数量（支持小数，如 0.8/3）',
+  `unit` VARCHAR(32) NOT NULL DEFAULT '' COMMENT '单位快照（如 100克/1个）',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_meal_item` (`record_id`, `meal`, `position`),
   KEY `idx_meal_items_record` (`record_id`),
@@ -205,6 +215,7 @@ CREATE TABLE IF NOT EXISTS `plan_cards` (
   `end_time` VARCHAR(19) NOT NULL DEFAULT '' COMMENT '结束时间',
   `milestones` TEXT NOT NULL COMMENT '子目标 JSON 数组',
   `todos` TEXT NOT NULL COMMENT 'TodoList JSON 数组',
+  `tasks` TEXT NULL COMMENT '任务树 JSON（任务管理 v2；NULL=旧数据未迁移）',
   `notes` TEXT NOT NULL COMMENT '过程小记 JSON 数组',
   `review` TEXT NOT NULL COMMENT '复盘文字',
   `settlement` TEXT NULL COMMENT '结算结果 JSON',
@@ -234,6 +245,7 @@ CREATE TABLE IF NOT EXISTS `plan_slots` (
   `analysis_ids` VARCHAR(255) NOT NULL DEFAULT '' COMMENT '本次打卡依据的分析记录ID（逗号分隔，批次11）',
   `analysis_hour` VARCHAR(13) NOT NULL DEFAULT '' COMMENT '打卡对应的小时槽 YYYY-MM-DD HH（批次11）',
   `bypass_analysis` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否无分析支撑放行（soft 模式留痕，批次11）',
+  `task_links` TEXT NULL COMMENT '任务树关联 [{task_id,state}]（任务管理 v2；NULL/[]=待关联）',
   PRIMARY KEY (`card_id`, `slot_index`),
   CONSTRAINT `fk_plan_slots_card` FOREIGN KEY (`card_id`)
     REFERENCES `plan_cards` (`id`) ON DELETE CASCADE
@@ -416,6 +428,7 @@ CREATE TABLE IF NOT EXISTS `crypto_coins` (
   `h1_atr` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ATR_1H',
   `h1_sar` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'SAR_1H',
   `h1_sar_color` VARCHAR(8) NOT NULL DEFAULT '' COMMENT 'SAR颜色_1H',
+  `h1_er` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ER_1H（Kaufman效率系数）',
   `h4_trend` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '4H_趋势',
   `h4_price` VARCHAR(24) NOT NULL DEFAULT '' COMMENT '4H_交易价格',
   `h4_time` VARCHAR(24) NOT NULL DEFAULT '' COMMENT '4H_交易时间',
@@ -427,6 +440,7 @@ CREATE TABLE IF NOT EXISTS `crypto_coins` (
   `h4_atr` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ATR_4H',
   `h4_sar` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'SAR_4H',
   `h4_sar_color` VARCHAR(8) NOT NULL DEFAULT '' COMMENT 'SAR颜色_4H',
+  `h4_er` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ER_4H（Kaufman效率系数）',
   `d1_trend` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '1D_趋势',
   `d1_price` VARCHAR(24) NOT NULL DEFAULT '' COMMENT '1D_交易价格',
   `d1_time` VARCHAR(24) NOT NULL DEFAULT '' COMMENT '1D_交易时间',
@@ -438,6 +452,7 @@ CREATE TABLE IF NOT EXISTS `crypto_coins` (
   `d1_atr` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ATR_1D',
   `d1_sar` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'SAR_1D',
   `d1_sar_color` VARCHAR(8) NOT NULL DEFAULT '' COMMENT 'SAR颜色_1D',
+  `d1_er` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ER_1D（Kaufman效率系数）',
   `m15_trend` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '15m_趋势',
   `m15_price` VARCHAR(24) NOT NULL DEFAULT '' COMMENT '15m_交易价格',
   `m15_time` VARCHAR(24) NOT NULL DEFAULT '' COMMENT '15m_交易时间',
@@ -449,6 +464,7 @@ CREATE TABLE IF NOT EXISTS `crypto_coins` (
   `m15_atr` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ATR_15m',
   `m15_sar` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'SAR_15m',
   `m15_sar_color` VARCHAR(8) NOT NULL DEFAULT '' COMMENT 'SAR颜色_15m',
+  `m15_er` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'ER_15m（Kaufman效率系数）',
   PRIMARY KEY (`id`),
   KEY `idx_crypto_coins_inst` (`inst_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
@@ -554,6 +570,108 @@ CREATE TABLE IF NOT EXISTS `analysis_reminder_log` (
   KEY `idx_arl_date` (`stat_date`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
   COMMENT='分析纪律小时槽合格台账（闸门/巡检/看板共用）';
+
+-- =============================================================================
+-- 批次12：盘感模拟模块（RAG + LLM Wiki）
+-- -----------------------------------------------------------------------------
+-- 防泄漏核心不变式：ctx_* 列 = 决策当时可见字段（允许进检索与 prompt）；
+-- outcome_*/hit_*/chg_* 列 = 事后才知字段（只做统计计分，永不进 prompt）。
+-- 语料行由 crypto/instinct/corpus_builder.py 幂等生成（uk source+source_ref）。
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS `instinct_corpus` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+  `source` VARCHAR(16) NOT NULL COMMENT 'analysis_record/trade_slot/journal_review',
+  `source_ref` VARCHAR(64) NOT NULL COMMENT '源记录唯一键 tar:123/slot:card_3/note:xxx',
+  `ts` VARCHAR(19) NOT NULL COMMENT '决策时刻 YYYY-MM-DD HH:MM:SS',
+  `inst_id` VARCHAR(32) NOT NULL DEFAULT '' COMMENT '币种（lesson 类为空=全局）',
+  `short_period` VARCHAR(8) NOT NULL DEFAULT '',
+  `long_period` VARCHAR(8) NOT NULL DEFAULT '',
+  `ctx_short_dir` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '当时短周期方向 long/short',
+  `ctx_long_dir` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '当时长周期方向',
+  `ctx_long_dir_prev` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '长周期上一时段方向（实际决策方向）',
+  `ctx_atr_pct` DOUBLE NOT NULL DEFAULT 0 COMMENT '当时 ATR%',
+  `ctx_atr_pctile` DOUBLE NOT NULL DEFAULT -1 COMMENT '该币滚动窗口 ATR 分位 0~1，-1=未知',
+  `ctx_dir_flipped` TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'long_dir 是否刚翻转(prev<>cur)',
+  `ctx_price` DOUBLE NOT NULL DEFAULT 0 COMMENT '快照价（当时可见）',
+  `ctx_text` TEXT COMMENT '当时写下的自由文本（分析原因/行情分析）',
+  `judgment` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '当时决策归一三分类 rise/watch/fall',
+  `decision_text` TEXT COMMENT '决策描述（lesson 类存结论）',
+  `outcome_near` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '近窗口实际 up/flat/down，未回填为空',
+  `outcome_far` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '远窗口实际',
+  `chg_near_pct` DOUBLE NOT NULL DEFAULT 0 COMMENT '近窗口涨跌幅%',
+  `chg_far_pct` DOUBLE NOT NULL DEFAULT 0 COMMENT '远窗口涨跌幅%',
+  `hit_near` TINYINT(1) NULL COMMENT '近窗口命中（与 classify_move 口径对齐）',
+  `hit_far` TINYINT(1) NULL COMMENT '远窗口命中',
+  `labeled` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=已有远窗口结果，可用于 A/B',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_ic_ref` (`source`, `source_ref`),
+  KEY `idx_ic_inst_ts` (`inst_id`, `ts`),
+  KEY `idx_ic_labeled` (`labeled`, `ts`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='盘感语料库（情景记忆，ctx/outcome 防泄漏二分）';
+
+CREATE TABLE IF NOT EXISTS `instinct_wiki_rules` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+  `rule_key` VARCHAR(64) NOT NULL COMMENT '稳定标识：scenario 短码，用于合并去重',
+  `statement` TEXT NOT NULL COMMENT '规则正文（给用户和 LLM 看的一句话）',
+  `kind` VARCHAR(16) NOT NULL DEFAULT 'scenario' COMMENT 'meta/scenario/prohibition',
+  `condition_json` TEXT COMMENT '触发条件（机器可读）{dir_combo,atr_pctile_range,inst}',
+  `stat_basis` VARCHAR(255) NOT NULL DEFAULT '' COMMENT '统计依据，如 远窗口命中33.3%(n=15)',
+  `evidence_refs` TEXT COMMENT '证据语料 id JSON 数组 [corpus_id,...]',
+  `status` VARCHAR(16) NOT NULL DEFAULT 'candidate' COMMENT 'candidate/active/retired',
+  `created_by` VARCHAR(16) NOT NULL DEFAULT 'distiller' COMMENT 'distiller/user',
+  `supersedes_id` BIGINT NULL COMMENT '取代哪条旧规则（合并链）',
+  `valid_until` VARCHAR(19) NULL COMMENT '有效期（过期自动降级 candidate）',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_wiki_key` (`rule_key`),
+  KEY `idx_wiki_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='盘感 Wiki 规则卡（语义记忆，candidate→active 状态机）';
+
+CREATE TABLE IF NOT EXISTS `instinct_predictions` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+  `ts` VARCHAR(19) NOT NULL COMMENT '预测生成时刻',
+  `inst_id` VARCHAR(32) NOT NULL COMMENT '合约ID',
+  `ctx_snapshot_json` TEXT NOT NULL COMMENT '当时可见上下文快照（含检索入参）',
+  `judgment` VARCHAR(8) NOT NULL DEFAULT '' COMMENT 'rise/watch/fall',
+  `confidence` DOUBLE NOT NULL DEFAULT 0 COMMENT '0~1',
+  `rationale` TEXT COMMENT 'LLM 理由（须引用规则/案例编号）',
+  `cited_rule_ids` VARCHAR(255) NOT NULL DEFAULT '' COMMENT '逗号分隔 instinct_wiki_rules.id',
+  `cited_corpus_ids` VARCHAR(255) NOT NULL DEFAULT '' COMMENT '逗号分隔 instinct_corpus.id',
+  `wiki_ids` VARCHAR(255) NOT NULL DEFAULT '' COMMENT '本次注入的 active 规则 id',
+  `retrieved_refs_json` TEXT COMMENT '本次 topK 检索结果与得分（审计用）',
+  `model` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '模型标识',
+  `latency_ms` INT NOT NULL DEFAULT 0 COMMENT 'LLM 调用耗时',
+  `price_at_pred` DOUBLE NOT NULL DEFAULT 0 COMMENT '生成预测时的价格（结算基准）',
+  `status` VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/scored/error',
+  `price_near` DOUBLE NULL COMMENT '近窗口结算价',
+  `price_far` DOUBLE NULL COMMENT '远窗口结算价',
+  `actual_near` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '近窗口实际 up/flat/down',
+  `actual_far` VARCHAR(8) NOT NULL DEFAULT '' COMMENT '远窗口实际',
+  `hit_near` TINYINT(1) NULL COMMENT '近窗口命中（classify_move 口径）',
+  `hit_far` TINYINT(1) NULL COMMENT '远窗口命中',
+  `user_trusted` TINYINT(1) NULL COMMENT '用户反馈：当时会信吗（1/0/NULL）',
+  `user_agree` TINYINT(1) NULL COMMENT '用户反馈：与你自己判断一致吗',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_ip_inst_ts` (`inst_id`, `ts`),
+  KEY `idx_ip_status` (`status`, `ts`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='LLM 影子预测流水与结算';
+
+CREATE TABLE IF NOT EXISTS `instinct_embeddings` (
+  `corpus_id` BIGINT NOT NULL COMMENT 'instinct_corpus.id',
+  `model` VARCHAR(64) NOT NULL COMMENT 'embedding 模型标识，换模型全量重刷',
+  `vec_json` MEDIUMTEXT NOT NULL COMMENT 'JSON 数组（float 列表）',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入库时间',
+  PRIMARY KEY (`corpus_id`, `model`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='语料文本向量（hybrid 检索文本路，v2 启用）';
 
 -- =============================================================================
 -- 增量索引/列补丁（全新建库由上方 CREATE 语句包含；存量库由应用侧

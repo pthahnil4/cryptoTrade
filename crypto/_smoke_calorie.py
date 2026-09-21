@@ -7,8 +7,8 @@
   2. 清空四表后执行全部 API 用例
   3. finally 中无条件恢复快照（无论用例成败）
 
-前置条件：环境变量 CRYPTO_DB_URL 已设置
-  （mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）
+前置条件：环境变量 CRYPTO_TEST_DB_URL 指向专用隔离测试库。
+未配置或不合规时退出码 2 —— 本用例会清空四张业务表，绝不允许在业务库上跑。
 """
 
 import json
@@ -24,17 +24,26 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-if not os.environ.get('CRYPTO_DB_URL', '').strip():
-    print('❌ 请先设置环境变量 CRYPTO_DB_URL（mysql+pymysql://用户:密码@主机:端口/库名?charset=utf8mb4）')
+from crypto.test_isolation import (  # noqa: E402
+    require_isolated_test_db, ensure_test_schema, TestDbNotConfigured)
+
+try:
+    _TEST_DB_URL = require_isolated_test_db()
+except TestDbNotConfigured as e:
+    print(f'❌ {e}')
     sys.exit(2)
 
 from sqlalchemy import select, delete  # noqa: E402
 from crypto import calorie_routes as cr  # noqa: E402
-from crypto.database import session_scope  # noqa: E402
+from crypto.database import session_scope, init_db  # noqa: E402
 from crypto.models import CalorieFood, CalorieRecord, CalorieMealItem, CalorieConfig  # noqa: E402
 from flask import Flask  # noqa: E402
 
-print(f"[Smoke] 目标数据库: {os.environ['CRYPTO_DB_URL'].split('@')[-1]}")
+print(f"[Smoke] 目标数据库（隔离测试库）: {_TEST_DB_URL.split('@')[-1]}")
+# 表结构补齐：全新隔离库（或本地 SQLite 文件）首次跑时表还不存在；只建表不动数据
+ensure_test_schema()
+# 幂等初始化：存量库自动补齐增量列（calorie_meal_items.quantity/unit）
+init_db()
 
 # =============================================================================
 # 真实数据快照 + 清场（测试不污染生产数据）
@@ -52,7 +61,8 @@ def _snapshot():
                     r.calorie_deficit, r.cumulative_deficit,
                     r.created_at, r.updated_at) for r in
                    s.execute(select(CalorieRecord)).scalars()]
-        items = [(i.record_id, i.meal, i.position, i.name, i.calories) for i in
+        items = [(i.record_id, i.meal, i.position, i.name, i.calories,
+                  i.quantity, i.unit) for i in
                  s.execute(select(CalorieMealItem)).scalars()]
         cfg = s.get(CalorieConfig, 1)
         config = None if cfg is None else (cfg.height, cfg.age, cfg.step_frequency,
@@ -89,9 +99,10 @@ def _restore(snap):
                 calorie_deficit=row[14], cumulative_deficit=row[15],
                 created_at=row[16], updated_at=row[17]))
         s.flush()
-        for record_id, meal, position, name, calories in items:
+        for record_id, meal, position, name, calories, quantity, unit in items:
             s.add(CalorieMealItem(record_id=record_id, meal=meal, position=position,
-                                  name=name, calories=calories))
+                                  name=name, calories=calories,
+                                  quantity=quantity, unit=unit))
         if config is not None:
             s.add(CalorieConfig(id=1, height=config[0], age=config[1],
                                 step_frequency=config[2], weight_factor=config[3],
@@ -180,9 +191,43 @@ try:
     check('bmr 计算正确', num_eq(rec['bmr'], 1216.25), str(rec['bmr']))
     check('早餐热量=明细求和', num_eq(rec['breakfast_calories'], 116))
     check('早餐食物名拼接', rec['breakfast_food'] == '白米饭', rec['breakfast_food'])
-    check('三餐明细数组回显', rec['breakfast_foods'] == [{'name': '白米饭', 'calories': 116.0}])
+    check('三餐明细数组回显（缺省数量1）',
+          rec['breakfast_foods'][0]['name'] == '白米饭'
+          and num_eq(rec['breakfast_foods'][0]['calories'], 116)
+          and num_eq(rec['breakfast_foods'][0]['quantity'], 1)
+          and num_eq(rec['breakfast_foods'][0]['total_calories'], 116),
+          str(rec['breakfast_foods']))
     check('摄入缺口=bmr-摄入', num_eq(rec['intake_deficit'], 1216.25 - 116))
     check('已有食物不产生 new_foods', data['new_foods'] == [], str(data['new_foods']))
+
+    print('\n=== 4b. 数量 × 单位热量 = 总热量 ===')
+    body = {
+        'date': '2026-08-01',
+        'morning_weight': 60,
+        'breakfast_foods': [{'name': '白米饭', 'calories': 116, 'quantity': 3, 'unit': '100克'}],
+        'lunch_foods': [{'name': '饭团', 'calories': 134, 'quantity': 2, 'unit': '100克'},
+                        {'name': '鸡蛋(煮)', 'calories': 71, 'quantity': 1, 'total_calories': 71}],
+        'daily_steps': 0
+    }
+    r = post('/calorie/api/record', body)
+    rec_q = r.get_json()['record']
+    check('早餐=单位热量×数量(116×3)', num_eq(rec_q['breakfast_calories'], 348),
+          str(rec_q['breakfast_calories']))
+    check('午餐按明细求和(134×2+71)', num_eq(rec_q['lunch_calories'], 339),
+          str(rec_q['lunch_calories']))
+    it0 = rec_q['breakfast_foods'][0]
+    check('明细回显 quantity/unit/total_calories',
+          num_eq(it0['quantity'], 3) and it0['unit'] == '100克'
+          and num_eq(it0['total_calories'], 348), str(it0))
+    check('摄入缺口随数量重算', num_eq(rec_q['intake_deficit'], 1216.25 - 348 - 339),
+          str(rec_q['intake_deficit']))
+    # 恢复为后续用例基准（无 quantity 字段 → 旧契约按 1 计）
+    r = post('/calorie/api/record', {
+        'date': '2026-08-01', 'morning_weight': 60,
+        'breakfast_foods': [{'name': '白米饭', 'calories': 116}], 'daily_steps': 0})
+    check('无数量字段兼容旧契约(仍116)',
+          num_eq(r.get_json()['record']['breakfast_calories'], 116),
+          str(r.get_json()['record']['breakfast_calories']))
 
     print('\n=== 5. 保存第二条记录（累计重算 + 新食物自动入库）===')
     body = {

@@ -58,6 +58,10 @@
         .badge-recover { background: #d4edda; color: #155724; }
         .badge-price { background: #d1ecf1; color: #0c5460; }
         .badge-pnl { background: #e2d5f1; color: #4a235a; }
+        .badge-profit { background: #d4edda; color: #155724; }
+        .badge-liq { background: #f8d7da; color: #721c24; }
+        .badge-acct { background: #fff3cd; color: #856404; }
+        .badge-liveness { background: #e2e3e5; color: #41464b; }
         .sent-yes { color: var(--success-color, #28a745); font-weight: 600; }
         .sent-no { color: var(--text-muted); }
         .empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); }
@@ -78,7 +82,7 @@
 {% include 'nav.html' %}
 <div class="alert-page">
     <h1>🚨 风险警报</h1>
-    <p class="alert-desc">异常行情（短时剧烈波动）与持仓盈亏极端值监控，命中时邮件报警；同级别重复命中自动抑制，回落后发送缓解通知。</p>
+    <p class="alert-desc">旁路只读监控：行情异动、持仓盈亏（浮亏告警 + 盈利提醒双向）、强平距离、账户保证金率/可用余额、调度轮存活，命中时邮件报警；同级别重复命中自动抑制，回落后发送缓解通知。所有阈值由下方配置决定，保存后热生效。</p>
 
     <!-- 状态卡片 -->
     <div class="card status-card">
@@ -144,7 +148,7 @@
         </div>
 
         <div class="sub-section">
-            <div class="sub-title">💰 持仓盈亏监控（标的价格口径浮动盈亏率）</div>
+            <div class="sub-title">💰 持仓盈亏监控（标的价格口径浮动盈亏率，双向提醒）</div>
             <div class="form-grid">
                 <div class="form-item form-check">
                     <label style="padding-top:0">
@@ -152,12 +156,94 @@
                     </label>
                 </div>
                 <div class="form-item">
-                    <label>预警阈值（浮亏 %，负值）</label>
+                    <label>浮亏预警阈值（% 负值）</label>
                     <input type="number" id="pnlWarning" max="-0.1" step="0.5">
                 </div>
                 <div class="form-item">
-                    <label>严重阈值（浮亏 %，负值）</label>
+                    <label>浮亏严重阈值（% 负值）</label>
                     <input type="number" id="pnlCritical" max="-0.1" step="0.5">
+                </div>
+                <div class="form-item form-check">
+                    <label style="padding-top:0">
+                        <input type="checkbox" id="profitEnabled"> 启用盈利提醒（暴涨/达标）
+                    </label>
+                </div>
+                <div class="form-item">
+                    <label>盈利预警阈值（% 正值）</label>
+                    <input type="number" id="profitWarning" min="0.1" step="0.5">
+                </div>
+                <div class="form-item">
+                    <label>盈利达标阈值（% 正值）</label>
+                    <input type="number" id="profitCritical" min="0.1" step="0.5">
+                </div>
+            </div>
+        </div>
+
+        <div class="sub-section">
+            <div class="sub-title">💥 爆仓风险 · 强平距离预警（现价距强平价百分比，越近越危险）</div>
+            <div class="form-grid">
+                <div class="form-item form-check">
+                    <label style="padding-top:0">
+                        <input type="checkbox" id="liqEnabled"> 启用强平距离监控
+                    </label>
+                </div>
+                <div class="form-item">
+                    <label>预警阈值（距离 ≤ %）</label>
+                    <input type="number" id="liqWarning" min="0.1" step="0.5">
+                </div>
+                <div class="form-item">
+                    <label>严重阈值（距离 ≤ %，更小）</label>
+                    <input type="number" id="liqCritical" min="0.1" step="0.5">
+                </div>
+            </div>
+        </div>
+
+        <div class="sub-section">
+            <div class="sub-title">🏦 账户健康 · 保证金率与可用余额巡检（只读旁路）</div>
+            <div class="form-grid">
+                <div class="form-item form-check">
+                    <label style="padding-top:0">
+                        <input type="checkbox" id="acctEnabled"> 启用账户巡检
+                    </label>
+                </div>
+                <div class="form-item">
+                    <label>保证金率预警（≤ %，越近100越危险）</label>
+                    <input type="number" id="acctMarginWarning" min="100" step="10">
+                </div>
+                <div class="form-item">
+                    <label>保证金率严重（≤ %，更小）</label>
+                    <input type="number" id="acctMarginCritical" min="100" step="10">
+                </div>
+                <div class="form-item">
+                    <label>可用余额预警（≤ USDT）</label>
+                    <input type="number" id="acctAvailWarning" min="0" step="10">
+                </div>
+                <div class="form-item">
+                    <label>可用余额严重（≤ USDT，0=关闭）</label>
+                    <input type="number" id="acctAvailCritical" min="0" step="5">
+                </div>
+            </div>
+        </div>
+
+        <div class="sub-section">
+            <div class="sub-title">🫀 调度轮存活 · 主循环停滞/线程意外死亡旁路告警</div>
+            <div class="form-grid">
+                <div class="form-item form-check">
+                    <label style="padding-top:0">
+                        <input type="checkbox" id="livenessEnabled"> 启用存活检测
+                    </label>
+                </div>
+                <div class="form-item">
+                    <label>停滞预警倍数（× 执行间隔）</label>
+                    <input type="number" id="livenessGrace" min="1" step="1">
+                </div>
+                <div class="form-item">
+                    <label>停滞预警绝对下限（秒）</label>
+                    <input type="number" id="livenessMinStale" min="60" step="60">
+                </div>
+                <div class="form-item">
+                    <label>停滞严重阈值（秒，更大）</label>
+                    <input type="number" id="livenessCritStale" min="60" step="60">
                 </div>
             </div>
         </div>
@@ -175,6 +261,10 @@
                 <option value="">全部类型</option>
                 <option value="price">行情异动</option>
                 <option value="pnl">持仓盈亏</option>
+                <option value="profit">盈利提醒</option>
+                <option value="liq">强平距离</option>
+                <option value="acct">账户健康</option>
+                <option value="liveness">调度存活</option>
             </select>
             <select id="fLevel">
                 <option value="">全部级别</option>
@@ -218,7 +308,7 @@ function showToast(msg, type) {
 }
 
 const LEVEL_CN = { warning: '预警', critical: '严重', recover: '缓解' };
-const TYPE_CN = { price: '行情异动', pnl: '持仓盈亏' };
+const TYPE_CN = { price: '行情异动', pnl: '持仓盈亏', profit: '盈利提醒', liq: '强平距离', acct: '账户健康', liveness: '调度存活' };
 
 // =================================================================
 // 配置
@@ -242,6 +332,24 @@ function loadConfig() {
         document.getElementById('pnlEnabled').checked = !!pnl.enabled;
         document.getElementById('pnlWarning').value = pnl.warning_pct;
         document.getElementById('pnlCritical').value = pnl.critical_pct;
+        document.getElementById('profitEnabled').checked = !!pnl.profit_enabled;
+        document.getElementById('profitWarning').value = pnl.profit_warning_pct;
+        document.getElementById('profitCritical').value = pnl.profit_critical_pct;
+        const liq = cfg.liq || {};
+        document.getElementById('liqEnabled').checked = !!liq.enabled;
+        document.getElementById('liqWarning').value = liq.warning_pct;
+        document.getElementById('liqCritical').value = liq.critical_pct;
+        const acct = cfg.acct || {};
+        document.getElementById('acctEnabled').checked = !!acct.enabled;
+        document.getElementById('acctMarginWarning').value = acct.margin_warning_pct;
+        document.getElementById('acctMarginCritical').value = acct.margin_critical_pct;
+        document.getElementById('acctAvailWarning').value = acct.min_avail_warning;
+        document.getElementById('acctAvailCritical').value = acct.min_avail_critical;
+        const lv = cfg.liveness || {};
+        document.getElementById('livenessEnabled').checked = !!lv.enabled;
+        document.getElementById('livenessGrace').value = lv.grace_multiplier;
+        document.getElementById('livenessMinStale').value = lv.min_stale_seconds;
+        document.getElementById('livenessCritStale').value = lv.critical_stale_seconds;
     }).catch(e => showToast('加载配置失败: ' + e, 'error'));
 }
 
@@ -260,7 +368,28 @@ function saveConfig() {
         pnl: {
             enabled: document.getElementById('pnlEnabled').checked,
             warning_pct: Number(document.getElementById('pnlWarning').value),
-            critical_pct: Number(document.getElementById('pnlCritical').value)
+            critical_pct: Number(document.getElementById('pnlCritical').value),
+            profit_enabled: document.getElementById('profitEnabled').checked,
+            profit_warning_pct: Number(document.getElementById('profitWarning').value),
+            profit_critical_pct: Number(document.getElementById('profitCritical').value)
+        },
+        liq: {
+            enabled: document.getElementById('liqEnabled').checked,
+            warning_pct: Number(document.getElementById('liqWarning').value),
+            critical_pct: Number(document.getElementById('liqCritical').value)
+        },
+        acct: {
+            enabled: document.getElementById('acctEnabled').checked,
+            margin_warning_pct: Number(document.getElementById('acctMarginWarning').value),
+            margin_critical_pct: Number(document.getElementById('acctMarginCritical').value),
+            min_avail_warning: Number(document.getElementById('acctAvailWarning').value),
+            min_avail_critical: Number(document.getElementById('acctAvailCritical').value)
+        },
+        liveness: {
+            enabled: document.getElementById('livenessEnabled').checked,
+            grace_multiplier: Number(document.getElementById('livenessGrace').value),
+            min_stale_seconds: Number(document.getElementById('livenessMinStale').value),
+            critical_stale_seconds: Number(document.getElementById('livenessCritStale').value)
         }
     };
     document.getElementById('btnSave').disabled = true;

@@ -20,6 +20,7 @@ import logging
 import json
 import os
 import hashlib
+import threading
 import time as _time
 from typing import Dict, Optional, Tuple, List
 import traceback
@@ -44,6 +45,22 @@ class MessageNotifier:
         'warning': ('⚠️', '#d32f2f', '预警'),
         'critical': ('🚨', '#b71c1c', '严重'),
         'recover': ('✅', '#388e3c', '缓解'),
+    }
+
+    # =====================================================================
+    # 发信失败兜底（P1）：SMTP 中途挂掉时，_dispatch_email 重试耗尽后把告警
+    # 落盘到死信文件，SMTP 恢复后由旁路补发通道重投——保证"叫醒级"告警不因
+    # 邮件通道故障静默丢失。死信内容落磁盘（跨多个 MessageNotifier 实例共享、
+    # 且重启不丢）；补发节流时间戳用类属性（同一进程内多线程共享）。全程 fail-safe。
+    # =====================================================================
+    _DL_LOCK = threading.Lock()     # 死信文件读写互斥（类级：跨实例共享同一把）
+    _DL_LAST_FLUSH = 0.0            # 上次补发尝试时间戳（类级节流）
+    _DL_DEFAULTS = {
+        'enabled': True,            # 落盘兜底开关（不影响交易，仅保证告警内容不丢）
+        'max_pending': 200,         # 死信文件最多保留条数（超限丢最旧，防无限增长）
+        'max_age_hours': 72,        # 超龄死信补发时丢弃（防陈旧告警恢复后刷屏）
+        'flush_limit': 20,          # 单次补发最多尝试条数
+        'flush_interval_seconds': 240,  # 两次补发尝试最小间隔（防频繁重试）
     }
 
     def __init__(self, config_file: str = None, email_cooldown_minutes: int = 30):
@@ -226,7 +243,195 @@ class MessageNotifier:
         # 全部重试失败：移除指纹，允许后续（新的一次调用）再次尝试
         self._recent_email_fingerprints.pop(fingerprint, None)
         logger.error(f"❌ {log_label}邮件最终发送失败，已重试 {max_retries} 次")
+        # P1 发信失败兜底：落死信文件，SMTP 恢复后由补发通道重投（不丢告警）。fail-safe。
+        self._dead_letter_store(to_emails, subject, html_content, log_label)
         return False
+
+    # =====================================================================
+    # 死信队列：落盘 / 读取 / 补发 / 健康度（跨实例、重启不丢，全程 fail-safe）
+    # =====================================================================
+
+    @staticmethod
+    def _dl_cfg() -> Dict:
+        """死信兜底配置：类级默认值 + 环境变量覆盖（CRYPTO_DL_*）。不抛。"""
+        cfg = dict(MessageNotifier._DL_DEFAULTS)
+        env = os.environ
+
+        def _b(key, default):
+            v = env.get(key)
+            if v is None or str(v).strip() == '':
+                return default
+            return str(v).strip().lower() not in ('0', 'false', 'no', 'off')
+
+        def _i(key, default):
+            v = env.get(key)
+            if not v:
+                return default
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                return default
+
+        cfg['enabled'] = _b('CRYPTO_DL_ENABLED', cfg['enabled'])
+        cfg['max_pending'] = _i('CRYPTO_DL_MAX_PENDING', cfg['max_pending'])
+        cfg['max_age_hours'] = _i('CRYPTO_DL_MAX_AGE_HOURS', cfg['max_age_hours'])
+        cfg['flush_limit'] = _i('CRYPTO_DL_FLUSH_LIMIT', cfg['flush_limit'])
+        cfg['flush_interval_seconds'] = _i('CRYPTO_DL_FLUSH_INTERVAL', cfg['flush_interval_seconds'])
+        return cfg
+
+    @staticmethod
+    def _dead_letter_path() -> str:
+        """死信文件路径：优先 data_paths.resolve_data_file（受 CRYPTO_PLAN_DATA_DIR 控制），
+        独立脚本模式导入失败时回退到 task/config 目录。"""
+        try:
+            from crypto.data_paths import resolve_data_file
+            return resolve_data_file('email_dead_letter.jsonl')
+        except Exception:
+            base = os.environ.get('CRYPTO_PLAN_DATA_DIR', '').strip()
+            if not base:
+                base = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config')
+            return os.path.join(base, 'email_dead_letter.jsonl')
+
+    @staticmethod
+    def _dl_read(path: str) -> List[Dict]:
+        """读取死信 JSONL，逐行解析，坏行/缺文件一律跳过（不抛）。须由调用方持锁。"""
+        out: List[Dict] = []
+        try:
+            if not os.path.exists(path):
+                return out
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if isinstance(rec, dict) and rec.get('subject') is not None:
+                            out.append(rec)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"[EMAIL] 死信文件读取失败: {e}")
+        return out
+
+    @staticmethod
+    def _dl_write(path: str, records: List[Dict]):
+        """原子写回死信文件（先写 .tmp 再 replace，避免崩溃产生半截文件）。须由调用方持锁。"""
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                for r in records:
+                    f.write(json.dumps(r, ensure_ascii=False) + '\n')
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.error(f"[EMAIL] 死信文件写入失败: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _dead_letter_store(self, to_emails: List[str], subject: str,
+                           html_content: str, log_label: str):
+        """SMTP 最终失败后把告警落盘，保证内容不丢。按指纹去重（同一告警积压期不重复堆），
+        按 max_pending 裁剪保留最新。全程 fail-safe，绝不抛出影响主流程。"""
+        cfg = self._dl_cfg()
+        if not cfg['enabled']:
+            return
+        try:
+            fp = hashlib.md5(
+                f"{','.join(sorted(to_emails))}|{subject}|{html_content}".encode('utf-8')
+            ).hexdigest()
+            now = datetime.datetime.now()
+            path = self._dead_letter_path()
+            with MessageNotifier._DL_LOCK:
+                records = self._dl_read(path)
+                if any(r.get('fp') == fp for r in records):
+                    logger.info(f"[EMAIL] 死信已存在(去重): {subject}")
+                    return
+                records.append({
+                    'fp': fp, 'to': list(to_emails), 'subject': subject,
+                    'html': html_content, 'label': log_label,
+                    'ts': now.strftime('%Y-%m-%d %H:%M:%S'), 'ts_epoch': now.timestamp(),
+                })
+                if len(records) > cfg['max_pending']:
+                    records = records[-cfg['max_pending']:]   # 丢最旧，保留最新
+                self._dl_write(path, records)
+                pending = len(records)
+            logger.error(f"📉 邮件已落死信待补发: {subject}（当前积压 {pending}）")
+        except Exception as e:
+            logger.error(f"[EMAIL] 死信落盘失败（不影响主流程）: {e}")
+
+    def flush_dead_letters(self, force: bool = False) -> Dict:
+        """补发死信队列：SMTP 恢复后把积压告警按时间正序重投。由旁路（alert_monitor 每轮）
+        调用，带节流（距上次 < flush_interval_seconds 跳过，force 可绕过）与限条（flush_limit）。
+        - 网络发送阶段绝不持锁（避免阻塞交易线程的落盘）；
+        - 遇首封失败即判定 SMTP 仍不通，停止本轮，剩余下轮再试；
+        - 仅把"确认发送成功"的按 fp 从文件移除，其间新到死信不受影响。
+        返回 {flushed, pending, skipped}。整体 fail-safe。"""
+        cfg = self._dl_cfg()
+        if not cfg['enabled']:
+            return {'flushed': 0, 'pending': 0, 'skipped': True}
+        now_ts = _time.time()
+        path = self._dead_letter_path()
+        with MessageNotifier._DL_LOCK:
+            if not force and (now_ts - MessageNotifier._DL_LAST_FLUSH) < cfg['flush_interval_seconds']:
+                return {'flushed': 0, 'pending': len(self._dl_read(path)), 'skipped': True}
+            MessageNotifier._DL_LAST_FLUSH = now_ts
+            records = self._dl_read(path)     # 持锁仅读快照，随后放开做网络 I/O
+        if not records:
+            return {'flushed': 0, 'pending': 0, 'skipped': False}
+        # 超龄丢弃 + 按时间正序补发最早的 flush_limit 条
+        max_age = cfg['max_age_hours'] * 3600
+        fresh = [r for r in records if (now_ts - float(r.get('ts_epoch') or 0)) <= max_age]
+        dropped = len(records) - len(fresh)
+        if dropped:
+            logger.info(f"[EMAIL] 丢弃超龄死信 {dropped} 条（>{cfg['max_age_hours']}h）")
+        fresh.sort(key=lambda r: float(r.get('ts_epoch') or 0))
+        candidates = fresh[:cfg['flush_limit']]
+        flushed_fps = set()
+        flushed = 0
+        for r in candidates:
+            try:
+                ok = bool(self.email_tool.send_html_email(
+                    to_emails=r.get('to') or [], subject=r.get('subject') or '',
+                    html_content=r.get('html') or ''))
+            except Exception as e:
+                logger.warning(f"[EMAIL] 死信补发异常: {r.get('subject')}: {e}")
+                ok = False
+            if ok:
+                flushed += 1
+                flushed_fps.add(r.get('fp'))
+                logger.info(f"✅ 死信补发成功: {r.get('subject')}")
+            else:
+                logger.warning("[EMAIL] 死信补发失败，SMTP 可能仍不可用，暂停本轮补发")
+                break
+        pending = len(fresh) - flushed
+        if flushed_fps:
+            # 重新持锁按 fp 删除，保留补发期间新落入的死信
+            with MessageNotifier._DL_LOCK:
+                current = self._dl_read(path)
+                current = [r for r in current if r.get('fp') not in flushed_fps]
+                self._dl_write(path, current)
+                pending = len(current)
+            logger.info(f"[EMAIL] 本轮补发死信 {flushed} 封，剩余 {pending} 封")
+        return {'flushed': flushed, 'pending': pending, 'skipped': False}
+
+    def email_channel_health(self) -> Dict:
+        """发信通道健康度（跨实例、读死信文件）：pending 积压数 + 最老/最新时间戳。
+        UI / 状态接口可展示，使"SMTP 中途挂掉"这一元问题可见。不抛。"""
+        try:
+            with MessageNotifier._DL_LOCK:
+                records = self._dl_read(self._dead_letter_path())
+            ts_list = [r.get('ts') for r in records if r.get('ts')]
+            return {
+                'pending': len(records),
+                'oldest_ts': min(ts_list) if ts_list else None,
+                'newest_ts': max(ts_list) if ts_list else None,
+            }
+        except Exception as e:
+            return {'pending': -1, 'error': str(e)}
 
     def send_trade_notification(self, symbol: str, direction: str, price: float, amount: float, 
                                execution_time: str = None, order_type: str = "限价单") -> bool:
@@ -591,6 +796,64 @@ class MessageNotifier:
             log_label='系统告警'
         )
 
+    def send_risk_alert(self, inst_id: str, title: str,
+                        detail_rows: List[Tuple[str, str]] = None,
+                        level: str = 'critical', cooldown_key: str = None) -> bool:
+        """执行类静默失效风险告警邮件（下单被拒/止损未执行/孤儿单待核实等）。
+
+        与 send_system_alert 的区别：支持结构化明细行 + 级别配色 + 可选冷却键。
+        调用方以"连续轮次计数"控制发送节奏（如连续 N 轮才发一封），本方法默认
+        **不叠加 30 分钟冷却**（否则叫醒级告警会被吞掉）；提供 cooldown_key 时才受
+        冷却约束。同一内容的重复发送由 _dispatch_email 指纹去重兜底。
+
+        Args:
+            inst_id: 合约ID
+            title: 告警标题（不含前缀，如"下单连续被拒"）
+            detail_rows: [(字段名, 值)] 明细行
+            level: warning / critical（配色与 emoji，critical 为叫醒级）
+            cooldown_key: 传入则该告警走通用冷却，None 表示豁免冷却
+        """
+        if cooldown_key and not self._check_and_update_cooldown(cooldown_key):
+            return False
+
+        from config.email_config import get_admin_email
+        admin_email = get_admin_email()
+
+        emoji, color, label = self._ALERT_LEVEL_STYLE.get(
+            level, ('🚨', '#b71c1c', '严重'))
+        now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        rows_html = ''
+        for k, v in (detail_rows or []):
+            rows_html += f"""
+            <div class="info-row">
+                <div class="info-label">{k}</div>
+                <div class="info-value">{v}</div>
+            </div>"""
+
+        content_body = f"""
+        <div class="info-group">
+            <div class="info-row">
+                <div class="info-label">合约</div>
+                <div class="info-value highlight-blue">{inst_id}</div>
+            </div>{rows_html}
+            <div class="info-row">
+                <div class="info-label">告警时间</div>
+                <div class="info-value">{now_str}</div>
+            </div>
+        </div>
+        """
+
+        html_content = EmailTemplates._wrap_html(
+            f"{emoji} {label}风控告警 - {title}", content_body, header_color=color)
+        subject = f"{emoji} {label}风控告警 - {inst_id} {title}"
+
+        return self._dispatch_email(
+            to_emails=[admin_email],
+            subject=subject,
+            html_content=html_content,
+            log_label='风控告警'
+        )
+
     # =================================================================
     # 监控告警（异常行情与持仓盈亏监控报警系统）
     # 冷却由监控引擎的级别递进状态机（kv_store alert_runtime_state）控制，
@@ -721,6 +984,147 @@ class MessageNotifier:
             subject=subject,
             html_content=html_content,
             log_label='持仓盈亏告警'
+        )
+
+    def send_liq_distance_alert(self, inst_id: str, dist_pct: float,
+                                liq_px: float, mark_px: float, direction: str,
+                                level: str = 'warning', mgn_mode: str = '') -> bool:
+        """发送"现价逼近强平价"爆仓风险告警邮件（叫醒级）。
+
+        Args:
+            inst_id: 合约ID
+            dist_pct: 标记价距强平价的百分比（越小越危险）
+            liq_px/mark_px: 强平价 / 标记价
+            direction: 多头/空头
+            level: warning / critical / recover
+            mgn_mode: 保证金模式 cross/isolated
+        """
+        from config.email_config import get_admin_email
+        admin_email = get_admin_email()
+
+        emoji, color, label = self._ALERT_LEVEL_STYLE.get(
+            level, ('⚠️', '#d32f2f', '预警'))
+        now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        mode_cn = {'cross': '全仓', 'isolated': '逐仓'}.get(mgn_mode, mgn_mode or '-')
+        if level == 'recover':
+            hint = '价格已远离强平价，爆仓风险解除。'
+        else:
+            hint = ('现价已逼近强平价，随时可能被强制平仓！请立即检查保证金、'
+                    '考虑减仓或追加保证金。逐仓高杠杆仓位尤其危险。')
+
+        content_body = f"""
+        <div class="info-group">
+            <div class="info-row">
+                <div class="info-label">合约</div>
+                <div class="info-value highlight-blue">{inst_id}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">仓位方向</div>
+                <div class="info-value">{direction} / {mode_cn}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">距强平价</div>
+                <div class="info-value" style="color:#d32f2f;font-weight:bold">{dist_pct:.2f}%</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">标记价</div>
+                <div class="info-value">{float(mark_px):.6g}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">强平价</div>
+                <div class="info-value highlight-red">{float(liq_px):.6g}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">触发时间</div>
+                <div class="info-value">{now_str}</div>
+            </div>
+        </div>
+        <p style="color:#888;font-size:12px">{hint}</p>
+        """
+
+        html_content = EmailTemplates._wrap_html(
+            f"{emoji} 爆仓风险{label} - {inst_id}", content_body, header_color=color)
+        subject = f"{emoji} 爆仓风险{label} - {inst_id} {direction} 距强平{dist_pct:.2f}%"
+
+        return self._dispatch_email(
+            to_emails=[admin_email],
+            subject=subject,
+            html_content=html_content,
+            log_label='爆仓风险告警'
+        )
+
+    def send_profit_alert(self, inst_id: str, direction: str, pnl_pct: float,
+                          avg_px: float, last_px: float, level: str = 'warning',
+                          mgn_mode: str = '') -> bool:
+        """发送"持仓盈利达阈值"提醒邮件（正向提醒，非亏损告警）。
+
+        用户诉求：暴涨/盈利到达配置阈值时提醒用户复盘是否止盈，与浮亏告警区分，
+        单独用正向配色；级别含义：warning=盈利预警、critical=盈利达标、recover=回落。
+
+        Args:
+            inst_id: 合约ID
+            direction: 多头/空头
+            pnl_pct: 浮动盈亏率 %（带符号，正常应为正值）
+            avg_px/last_px: 持仓均价 / 现价
+            level: warning / critical / recover
+            mgn_mode: 保证金模式 cross/isolated
+        """
+        from config.email_config import get_admin_email
+        admin_email = get_admin_email()
+
+        # 盈利侧独立配色（复用共享表的亏损语义会误导，故此处单独定义）
+        style = {
+            'warning': ('📈', '#f9a825', '盈利提醒'),
+            'critical': ('🚀', '#388e3c', '盈利达标'),
+            'recover': ('↩️', '#607d8b', '盈利回落'),
+        }.get(level, ('📈', '#f9a825', '盈利提醒'))
+        emoji, color, label = style
+        now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        mode_cn = {'cross': '全仓', 'isolated': '逐仓'}.get(mgn_mode, mgn_mode or '-')
+        if level == 'recover':
+            hint = '浮动盈利已回落至提醒阈值以内，可关注是否已按预期落袋。'
+        else:
+            hint = '持仓浮动盈利已达配置阈值（如突发暴涨），建议评估是否止盈/移动止损锁定利润。'
+
+        content_body = f"""
+        <div class="info-group">
+            <div class="info-row">
+                <div class="info-label">合约</div>
+                <div class="info-value highlight-blue">{inst_id}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">仓位方向</div>
+                <div class="info-value">{direction} / {mode_cn}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">浮动盈利</div>
+                <div class="info-value" style="color:#388e3c;font-weight:bold">{pnl_pct:+.2f}%</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">持仓均价</div>
+                <div class="info-value">{float(avg_px):.6g}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">当前价格</div>
+                <div class="info-value">{float(last_px):.6g}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">触发时间</div>
+                <div class="info-value">{now_str}</div>
+            </div>
+        </div>
+        <p style="color:#888;font-size:12px">{hint}</p>
+        """
+
+        html_content = EmailTemplates._wrap_html(
+            f"{emoji} {label} - {inst_id}", content_body, header_color=color)
+        subject = f"{emoji} {label} - {inst_id} {direction} 盈利{pnl_pct:+.2f}%"
+
+        return self._dispatch_email(
+            to_emails=[admin_email],
+            subject=subject,
+            html_content=html_content,
+            log_label='盈利提醒'
         )
 
     def send_alert_digest(self, items: List[Dict]) -> bool:

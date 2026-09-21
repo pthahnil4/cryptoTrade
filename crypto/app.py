@@ -1,5 +1,5 @@
 import io
-from flask import Flask, render_template, jsonify, request, send_file
+from flask import Flask, render_template, jsonify, request, send_file, Response, stream_with_context
 from .real_strategy_adapter import (
     calculate_strategy_data, 
     calculate_single_coin_data, 
@@ -17,6 +17,9 @@ from .real_strategy_adapter import (
     add_floating_coins,
     remove_floating_coin,
     clear_floating_coins,
+    remove_fixed_coins,
+    promote_floating_to_fixed,
+    sync_fixed_from_csv,
     last_save_db_ok
 )
 from .api_routes import api_bp
@@ -25,6 +28,8 @@ from .calorie_routes import calorie_bp
 from .journal_routes import journal_bp
 from .alert_routes import alert_bp
 from .discipline_routes import discipline_bp
+from .capability_routes import capability_bp
+from .instinct_routes import instinct_bp
 from .strategy_util import get_strategy_detail
 import traceback
 from datetime import datetime, timedelta
@@ -78,6 +83,18 @@ app.register_blueprint(alert_bp)
 app.register_blueprint(discipline_bp)
 
 # =====================================================================
+# 注册 OKX 能力清单阅读页蓝图（/okx-capability：渲染 doc/ 下清单 + 工具矩阵）
+# 纯只读文档页，不碰交易接口；markdown 库缺失时页面自动降级为纯文本
+# =====================================================================
+app.register_blueprint(capability_bp)
+
+# =====================================================================
+# 注册盘感模拟蓝图（/instinct：语料检索 + Wiki 规则卡 + 影子预测 A/B）
+# 只读行情、只写 instinct_* 表；影子预测永不触达交易执行链路
+# =====================================================================
+app.register_blueprint(instinct_bp)
+
+# =====================================================================
 # Web 访问闸门（审计问题#1：原先 0.0.0.0 监听 + 零鉴权，实盘下单/强平接口全暴露）
 # ---------------------------------------------------------------------
 # 必须放在所有蓝图注册之后：before_request 对蓝图路由同样生效，而 /auth/gate
@@ -100,7 +117,8 @@ import threading as _threading
 import os as _os_env
 
 from .database import warmup_async as _db_warmup_async
-_db_warmup_async()
+from .db_performance import init_app as _init_db_performance
+_init_db_performance(app)
 
 # 后台任务总开关：导入 crypto.app 会顺带拉起调度器与两个监控线程，
 # 它们会真发告警邮件、真调 OKX、真写台账。冒烟脚本与 CLI 工具用
@@ -110,7 +128,9 @@ _db_warmup_async()
 _NO_BACKGROUND = str(_os_env.environ.get('CRYPTO_NO_BACKGROUND', '')).strip().lower() \
     in ('1', 'true', 'yes', 'on')
 if _NO_BACKGROUND:
-    print('[Boot] CRYPTO_NO_BACKGROUND 已设置：跳过调度器与监控线程启动')
+    print('[Boot] CRYPTO_NO_BACKGROUND 已设置：跳过数据库预热、调度器与监控线程启动')
+else:
+    _db_warmup_async()
 
 
 def _boot_scheduler_background():
@@ -124,26 +144,44 @@ def _boot_scheduler_background():
         print(f"[Warning] 定时任务调度器启动失败: {_sched_err}")
         return
 
-    # 重启自愈：内存看门狗严重超限时会主动 os._exit 交给 supervisord 拉起，
-    # 而交易调度器原本“只注册不启动”，所以每自愈一次实盘就静默停摆一次。
-    # 下面只在「上次确实是希望它跑着」且页面上打开了 auto_resume 开关时才拉起，
-    # 成/败都发邮件；开关默认关 → 行为与改造前一致。
+    # 重启自愈：先弄明白「这次是怎么起来的」（初次/撞内存/被杀/每日归零/冷启动），
+    # 再把归因结果交给调度器按策略决定起不起、等多久、要不要先发预告信：
+    #   夜间窗口 00:00-08:00 → 直接接回；白天 → 先发预告再留 10 分钟人工否决窗；
+    #   初次上线 / 窗口内反复重启（熔断）→ 只发信不起。
+    # 总闸门仍是页面上的 auto_resume 开关 + 「上次确实在跑」，两者缺一就维持
+    # 人工启动（与改造前行为一致）。
+    _boot_info = None
     try:
-        task_scheduler.schedule_auto_resume()
+        from .process_lifecycle import classify_and_record_boot
+        _boot_info = classify_and_record_boot()
+        print(f"[Boot] 启动归因: {_boot_info.get('reason')} | {_boot_info.get('detail')}")
+    except Exception as _bl_err:
+        print(f"[Warning] 启动归因失败（自愈按未知处理，不自动拉起）: {_bl_err}")
+    try:
+        task_scheduler.schedule_auto_resume(boot_info=_boot_info)
     except Exception as _ar_err:
         print(f"[Warning] 实盘重启自愈任务未能登记: {_ar_err}")
 
 
 if not _NO_BACKGROUND:
+    # SIGTERM 捕获必须在主线程装（signal 只能在主线程注册），所以放在模块导入
+    # 阶段而不是下面的后台线程里：宝塔/面板点“重启”发的是 SIGTERM，不装的话
+    # 这种人工重启会被归因成「异常死亡（崩溃/被系统杀）」，白收一封事故信。
+    try:
+        from .process_lifecycle import install_sigterm_marker
+        install_sigterm_marker()
+    except Exception as _sig_err:
+        print(f"[Warning] SIGTERM 捕获未安装（面板重启会被误判为异常死亡）: {_sig_err}")
     _threading.Thread(target=_boot_scheduler_background, daemon=True,
                       name='scheduler-boot').start()
 
 # =====================================================================
 # 稳定性监控（方案一 + 方案二）
 # ---------------------------------------------------------------------
-# 1. memory_watchdog：进程内内存自监控，每 5 分钟检查 RSS 并写入
-#    logs/memory_history.jsonl，超阈值邮件预警，严重超限主动退出由
-#    外部管理器（supervisord autorestart）自动拉起。
+# 1. memory_watchdog：进程内内存自监控，每 2 分钟检查 RSS 并写入
+#    logs/memory_history.jsonl（这份记录兼作启动归因用的心跳），超阈值
+#    邮件预警，严重超限先落退出标记再主动退出，由外部管理器
+#    （supervisord autorestart）自动拉起。
 # 2. system_monitor：系统级健康检查（进程/内存/磁盘），每 60s 一轮，
 #    异常邮件告警；进程崩溃时该线程随之消亡，完整兜底需另配 cron 独立运行
 #    （python crypto/system_monitor.py，详见文件头说明）。
@@ -206,6 +244,18 @@ def analysis_page():
     return render_template('analysis.html', active_page='analysis')
 
 
+@app.route('/monitor-guide')
+def monitor_guide_page():
+    """监控台操作手册（分页标签式功能说明，静态内容无后端依赖）"""
+    return render_template('monitor_guide.html', active_page='monitor-guide')
+
+
+@app.route('/top-coins')
+def top_coins_guide_page():
+    """市值Top50固定币种导览页（实时行情复用 market-detail 接口 + 内置币种简介）"""
+    return render_template('top_coins_guide.html', active_page='top-coins')
+
+
 @app.route('/plan')
 def plan_page():
     """任务计划页"""
@@ -246,6 +296,17 @@ def _coin_cfg_warn():
     旧值”，不能让用户拿着一个其实没生效的配置继续监控。
     """
     return '' if last_save_db_ok() else '（⚠️ 数据库主存写入失败，仅本地文件已更新，刷新后可能回到旧值）'
+
+
+def _coin_config_payload():
+    """币种配置的统一响应负载：前端任一币种操作成功后据此整体刷新选择器/卡片。"""
+    return {
+        "all_coins": get_all_coins(),
+        "fixed_coins": get_fixed_coins(),
+        "floating_coins": get_floating_coins(),
+        "selected_coins": get_selected_coins(),
+        "starred_coins": get_starred_coins()
+    }
 
 
 @app.route('/api/strategy/config', methods=['POST'])
@@ -360,6 +421,119 @@ def clear_floating_coins_route():
                 "removed": removed
             }
         })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/fixed-coins/remove', methods=['POST'])
+def remove_fixed_coins_route():
+    """从固定列表移除选中的固定币种（下架币种清理），使其变为未监控状态。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        coins = data.get('coins', [])
+        if not isinstance(coins, list) or not coins:
+            return jsonify({"code": 400, "message": "请传入至少一个币种", "data": None})
+        removed = remove_fixed_coins(coins)
+        return jsonify({
+            "code": 200,
+            "message": f"已移除 {len(removed)} 个固定币种" + _coin_cfg_warn(),
+            "data": _coin_config_payload()
+        })
+    except ValueError as ve:
+        # 业务约束（如「至少保留一个固定币种」）→ 400
+        return jsonify({"code": 400, "message": str(ve), "data": None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/fixed-coins/promote', methods=['POST'])
+def promote_fixed_coins_route():
+    """将选中的浮动币种提升为固定币种。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        coins = data.get('coins', [])
+        if not isinstance(coins, list) or not coins:
+            return jsonify({"code": 400, "message": "请传入至少一个币种", "data": None})
+        promoted = promote_floating_to_fixed(coins)
+        msg = (f"已将 {len(promoted)} 个浮动币种提升为固定币种"
+               if promoted else "选中币种已在固定列表中，无需提升")
+        return jsonify({
+            "code": 200,
+            "message": msg + (_coin_cfg_warn() if promoted else ''),
+            "data": _coin_config_payload()
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/fixed-coins/sync-csv', methods=['POST'])
+def sync_fixed_from_csv_route():
+    """以 CSV 为准覆盖固定币种列表（保持 CSV 顺序），浮动币种保持不变。"""
+    try:
+        new_fixed = sync_fixed_from_csv()
+        return jsonify({
+            "code": 200,
+            "message": f"已用 CSV 覆盖固定列表，共 {len(new_fixed)} 个币种" + _coin_cfg_warn(),
+            "data": _coin_config_payload()
+        })
+    except ValueError as ve:
+        return jsonify({"code": 400, "message": str(ve), "data": None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/fixed-coins/refresh-marketcap', methods=['POST'])
+def refresh_fixed_from_marketcap_route():
+    """按 CoinGecko 实时市值榜重建固定币种池（Top50，含宇宙 DB/CSV 同步）。
+
+    外网拉取失败时不做任何改动（口径见 market_cap_updater），回包非 200。
+    """
+    try:
+        from .market_cap_updater import refresh_fixed_coins
+        result = refresh_fixed_coins()
+        label = lambda cs: '、'.join(c.replace('-USDT-SWAP', '') for c in cs) or '无'
+        return jsonify({
+            "code": 200,
+            "message": (f"固定池已更新为市值 Top{result['total']}："
+                        f"新增 {len(result['added'])} 个（{label(result['added'])}），"
+                        f"移除 {len(result['removed'])} 个（{label(result['removed'])}）")
+                       + _coin_cfg_warn(),
+            "data": {
+                "total": result['total'],
+                "added_count": len(result['added']),
+                "removed_count": len(result['removed']),
+                "added": result['added'],
+                "removed": result['removed'],
+                "universe_added": result['universe_added'],
+                "coin_config": _coin_config_payload(),
+            }
+        })
+    except RuntimeError as re_err:
+        # 业务拒绝（市值榜不可达/已有任务在跑）：未发生任何写入
+        return jsonify({"code": 400, "message": str(re_err), "data": None})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"code": 500, "message": str(e), "data": None})
+
+
+@app.route('/api/strategy/fixed-coins/market-detail', methods=['GET'])
+def fixed_coins_market_detail_route():
+    """固定币种实时明细（市值排名/价格/24H涨跌/成交额/流通市值/流动性代理）。
+
+    ?force=1 跳过 120s 缓存强制重拉 CoinGecko。
+    """
+    try:
+        from .market_cap_updater import fixed_coins_detail, _cache_lock, _snapshot_cache
+        if request.args.get('force') in ('1', 'true'):
+            with _cache_lock:      # 失效缓存，下一次取数强制走外网
+                _snapshot_cache['ts'] = 0.0
+        return jsonify({"code": 200, "message": "success", "data": fixed_coins_detail()})
+    except RuntimeError as re_err:
+        return jsonify({"code": 502, "message": f"行情源暂不可用：{re_err}", "data": None})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"code": 500, "message": str(e), "data": None})
@@ -566,6 +740,59 @@ def batch_progress():
             "message": str(e),
             "data": None
         })
+
+
+@app.route('/api/batch/log/stream')
+def batch_log_stream():
+    """SSE 实时推送批量更新进度与日志行（替代前端轮询）。
+
+    前端 EventSource 连接后即可收到：
+      event: progress  → JSON（status/current/total/progress_pct/elapsed_seconds/message）
+      event: log       → JSON（seq/ts/level/msg）逐行日志
+    当批量任务 completed 或 error 时终止推送（关闭连接）。
+    """
+    import json as _json
+    import time as _time
+    from .batch_trend_updater import get_progress, get_batch_logs_since
+
+    def _generate():
+        cursor = 0  # 日志消费游标
+        idle_ticks = 0
+        while True:
+            # 1) 推送新日志行
+            new_lines, cursor = get_batch_logs_since(cursor)
+            for line in new_lines:
+                yield 'event: log\ndata: %s\n\n' % _json.dumps(line, ensure_ascii=False)
+
+            # 2) 推送进度（每轮都带最新 progress）
+            p = get_progress()
+            yield 'event: progress\ndata: %s\n\n' % _json.dumps(p, ensure_ascii=False)
+
+            # 3) 终止条件
+            if p['status'] in ('completed', 'error', 'idle'):
+                yield 'event: done\ndata: {}\n\n'
+                return
+
+            # 4) 无新日志时发心跳注释保持连接（15s 无数据 → 一次 :hb）
+            if not new_lines:
+                idle_ticks += 1
+                if idle_ticks >= 5:  # ~每 2.5s × 5 = 12.5s 无变化 → 心跳
+                    yield ':hb\n\n'
+                    idle_ticks = 0
+            else:
+                idle_ticks = 0
+
+            _time.sleep(2.5)  # 每 2.5s 推送一次（比旧 1.5s 轮询更省，SSE 长连接无握手开销）
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',  # Nginx 不缓冲
+            'Connection': 'keep-alive',
+        },
+    )
 
 
 @app.route('/api/batch/csv-data', methods=['GET'])
@@ -1112,14 +1339,17 @@ _EMAIL_CONFIG_PATH = _os.path.join(
 )
 
 
-def _load_trading_config():
-    """读取交易配置：迁移批次7a 起 DB 优先（kv_store key='strategy_config'），
-    带 TTL 缓存减少重复往返；DB 不可用/无数据时回退本地文件，
-    保证接口契约与容错行为不变"""
+def _load_trading_config(account=None):
+    """读取交易配置：按账号 DB 优先（专属 strategy_config:{account} → 全局），
+    带 TTL 缓存减少重复往返；DB 不可用/无数据时回退本地文件。
+
+    account 为空时取当前实盘运行账号（_resolve_task_account），保证网页未显式
+    指定账号时也与实盘同源；多账号共用一个库时各读各的、互不串味。"""
+    if not account:
+        account = _resolve_task_account()
     try:
         from . import config_store_repo
-        _cfg = config_store_repo.load_json_config_cached(
-            config_store_repo.KEY_STRATEGY_CONFIG)
+        _cfg = config_store_repo.load_strategy_config_cached(account)
         if _cfg is not None:
             return _cfg
     except Exception:
@@ -1128,8 +1358,12 @@ def _load_trading_config():
         return _json.load(f)
 
 
-def _save_trading_config(config):
-    """写入交易配置：DB 主存 + 本地文件双写（文件保留为兜底数据源）
+def _save_trading_config(config, account=None):
+    """写入交易配置：按账号 DB 主存（strategy_config:{account}）+ 本地文件双写。
+
+    account 为空时取当前实盘运行账号（_resolve_task_account）。按账号存是多账号
+    共用一个库不串味的关键：网页给哪个账号改配置，就写进哪个账号的专属 key，
+    不会覆盖别的账号（本地测试账号改 1U 不会动到实盘主账号的 20U）。
 
     返回 (ok, msg)：ok=False 表示改动根本不会生效，调用方必须按失败上报。
 
@@ -1140,18 +1374,21 @@ def _save_trading_config(config):
     - DB 整个读不到（库挂了）→ 交易端会自动回退读文件 → 改动其实生效，
       仅属持久化降级 → ok=True + 降级提醒。
     """
+    if not account:
+        account = _resolve_task_account()
     from .task.utils.logger import get_task_logger
     _log = get_task_logger()
     db_err = None
+    _key = None
     try:
         from .database import session_scope
         from . import config_store_repo
+        _key = config_store_repo.strategy_config_key(account)
         with session_scope() as _s:
-            config_store_repo.save_json_config(
-                _s, config_store_repo.KEY_STRATEGY_CONFIG, config)
+            config_store_repo.save_json_config(_s, _key, config)
     except Exception as e:
         db_err = e
-        _log.error(f"[Config] 交易配置写入数据库失败: {e!r}")
+        _log.error(f"[Config] 交易配置写入数据库失败(account={account}): {e!r}")
 
     # 文件兜底照写（与历史行为一致）；写失败则直接抛出给接口的 except 分支
     with open(_TRADING_CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -1164,7 +1401,7 @@ def _save_trading_config(config):
     # 读得到 = DB 健康但本次写没成功，库里仍是旧参数
     try:
         from . import config_store_repo as _csr
-        probe = _csr.load_json_config_cached(_csr.KEY_STRATEGY_CONFIG)
+        probe = _csr.load_json_config_cached(_key or _csr.KEY_STRATEGY_CONFIG)
     except Exception:
         probe = None
     if probe is not None:
@@ -1175,9 +1412,10 @@ def _save_trading_config(config):
 
 @app.route('/api/task/config/trading', methods=['GET'])
 def get_trading_config():
-    """获取交易配置"""
+    """获取交易配置（按账号：?account=xxx，缺省用当前实盘运行账号）"""
     try:
-        config = _load_trading_config()
+        account = (request.args.get('account') or '').strip() or None
+        config = _load_trading_config(account)
         return jsonify({'code': 200, 'message': 'success', 'data': config})
     except Exception as e:
         traceback.print_exc()
@@ -1317,6 +1555,7 @@ def task_analysis_snapshot():
 
     参数:
         instId: 合约ID（必填，须在交易配置 currencies 中存在）
+        account: 交易账号（可选，缺省用当前实盘运行账号/默认账号，与币种列表同源）
     策略参数（周期/算法/取价/BOLL）自动从该币种交易配置读取，保证与实盘同源。
     """
     try:
@@ -1324,7 +1563,8 @@ def task_analysis_snapshot():
         if not inst_id:
             return jsonify({'code': 400, 'message': '缺少 instId 参数', 'data': None})
 
-        config = _load_trading_config()
+        account = (request.args.get('account') or '').strip() or None
+        config = _load_trading_config(account)
         cur = next((c for c in config.get('currencies', [])
                     if c.get('instId') == inst_id), None)
         if not cur:
@@ -1377,9 +1617,11 @@ def task_analysis_snapshot_batch():
     且实现简单可靠。
 
     返回: data.items 为快照数组（字段与单币快照一致），data.errors 为失败币种。
+    可选参数 account：指定交易账号（与币种列表/单币快照同源），缺省用运行/默认账号。
     """
     try:
-        config = _load_trading_config()
+        account = (request.args.get('account') or '').strip() or None
+        config = _load_trading_config(account)
         currencies = [c for c in config.get('currencies', []) if str(c.get('instId') or '').strip()]
         if not currencies:
             return jsonify({'code': 400, 'message': '交易配置中无币种', 'data': None})
@@ -1611,6 +1853,33 @@ def task_analysis_records_delete(rec_id):
         return jsonify({'code': 500, 'message': str(e), 'data': None})
 
 
+@app.route('/api/task/analysis/records_batch', methods=['DELETE'])
+def task_analysis_records_delete_batch():
+    """批量删除分析记录
+
+    请求体: {"ids": [1, 2, 3]}；不存在的 id 自动忽略，返回实际删除条数。
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get('ids')
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return jsonify({'code': 400, 'message': 'ids 不能为空数组', 'data': None})
+        try:
+            ids = [int(i) for i in raw_ids]
+        except (TypeError, ValueError):
+            return jsonify({'code': 400, 'message': 'ids 必须为整数数组', 'data': None})
+
+        from .database import session_scope
+        from . import analysis_record_repo as repo
+        with session_scope() as s:
+            deleted = repo.delete_records(s, ids)
+        return jsonify({'code': 200, 'message': f'已删除 {deleted} 条记录',
+                        'data': {'deleted': deleted}})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'code': 500, 'message': str(e), 'data': None})
+
+
 @app.route('/api/task/residual-positions', methods=['GET'])
 def task_residual_positions():
     """智能减仓残留仓位查询接口（供人工“扭亏为盈”操作参考）
@@ -1744,10 +2013,26 @@ def task_residual_positions():
 # =============================================================================
 
 def _resolve_task_account():
-    """账号解析：优先取运行中的交易调度器账号，未运行时用默认账号"""
+    """账号解析：优先取运行中的交易调度器账号，未运行时用默认账号 DEFAULT_ACCOUNT。
+
+    这里刻意对齐「交易配置」页下拉的默认口径（list_accounts 的 is_default=main）：
+    网页所有不带 account 参数的配置读接口（分析记录币种列表 / 快照 / 剩余持仓等）
+    都经本函数解析账号。旧实现未运行时返回 None，会回退到「全局 strategy_config」
+    那份遗留配置，而交易配置页实际按账号 key（strategy_config:main）读写，两者
+    币种天然不一致（例：main 只留 BTC、全局仍是 5 币），这正是分析记录页与定时
+    任务页币种对不上的根因。返回 DEFAULT_ACCOUNT 后，未指定账号即落到 main 专属
+    key，与交易配置页完全同源。
+    """
     try:
         from .task.scheduler import task_scheduler
-        return getattr(task_scheduler, '_trading_account', None)
+        acct = getattr(task_scheduler, '_trading_account', None)
+        if acct:
+            return acct
+    except Exception:
+        pass
+    try:
+        from .api_config import DEFAULT_ACCOUNT
+        return DEFAULT_ACCOUNT or None
     except Exception:
         return None
 
@@ -2083,8 +2368,9 @@ def task_coin_library_delete():
 
 @app.route('/api/task/config/trading', methods=['POST'])
 def save_trading_config():
-    """保存交易配置"""
+    """保存交易配置（按账号：?account=xxx，缺省用当前实盘运行账号）"""
     try:
+        account = (request.args.get('account') or '').strip() or None
         new_config = request.get_json()
         if not new_config:
             return jsonify({'code': 400, 'message': '请求数据为空', 'data': None})
@@ -2094,7 +2380,7 @@ def save_trading_config():
         if errors:
             return jsonify({'code': 400, 'message': '配置校验失败', 'data': {'errors': errors}})
 
-        cfg_ok, cfg_msg = _save_trading_config(new_config)
+        cfg_ok, cfg_msg = _save_trading_config(new_config, account)
         # 历史币种库留存：新币建档 / 存量刷新最近使用时间（移除币种不删）
         _upsert_coin_library(
             [str(c.get('instId') or '') for c in (new_config.get('currencies') or [])
@@ -2747,13 +3033,17 @@ def email_test():
 
 @app.route('/api/system/status', methods=['GET'])
 def system_status():
-    """系统概况：内存监控线程状态 + 最近一轮系统检查结果"""
+    """系统概况：内存监控线程状态 + 最近一轮系统检查结果 + 本次启动归因"""
     try:
         from .memory_watchdog import get_memory_status
         from .system_monitor import get_last_result
+        from .process_lifecycle import get_boot_info
         return jsonify({'code': 200, 'data': {
             'watchdog': get_memory_status(),
             'last_check': get_last_result(),
+            # 启动归因由后台启动线程算一次并缓存；CRYPTO_NO_BACKGROUND 或
+            # 归因层坏掉时为 None，前端按“未归因”展示，不能因此报错。
+            'boot': get_boot_info(),
         }})
     except Exception as e:
         traceback.print_exc()

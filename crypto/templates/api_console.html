@@ -288,7 +288,12 @@
                     desc: '查询订单详情',
                     params: [
                         { name: 'instId', desc: '币种ID', example: 'NEAR-USDT-SWAP' },
-                        { name: 'ordId', desc: '订单ID', example: 'ORD20260511001' }
+                        // 示例值留空：这两个是二选一，且默认值必须是"能真查到的形状"。
+                        // 原先 ordId 预填 ORD20260511001（OKX 单号是纯数字，这串永远查不到），
+                        // 直接点执行只会得到"订单不存在"；更糟的是粘了 clOrdId 也白粘，
+                        // 因为后端优先取非空的 ordId。
+                        { name: 'ordId', desc: '交易所订单ID（与 clOrdId 二选一）', example: '' },
+                        { name: 'clOrdId', desc: '本侧打标客户订单号（交易日志里那串，与 ordId 二选一）', example: '' }
                     ]
                 },
                 history: {
@@ -576,7 +581,8 @@
             let html = '<table class="fmt-table"><thead><tr><th>订单ID</th><th>币种</th><th>方向</th><th>价格</th><th>数量</th><th>已成交</th><th>类型</th><th>状态</th><th>杠杆</th><th>创建时间</th></tr></thead><tbody>';
             data.forEach(function(o) {
                 html += '<tr>';
-                html += '<td style="font-size:0.75rem;color:#888;">' + (o.ordId || '') + '</td>';
+                html += '<td style="font-size:0.75rem;color:#888;">' + (o.ordId || '')
+                    + clOrdIdLine(o.clOrdId) + '</td>';
                 html += '<td><strong>' + (o.instId || '') + '</strong></td>';
                 html += '<td>' + sideLabel(o.side) + ' ' + posSideLabel(o.posSide) + '</td>';
                 html += '<td>' + toFixed(o.px, 2) + '</td>';
@@ -595,6 +601,7 @@
         'trade/order_info': function(data) {
             let html = '<div class="fmt-overview">';
             html += '<div class="fmt-card"><span class="fmt-label">📋 订单ID</span><span class="fmt-value" style="font-size:0.85rem;">' + (data.ordId || '') + '</span></div>';
+            html += '<div class="fmt-card"><span class="fmt-label">🏷️ 客户号</span><span class="fmt-value" style="font-size:0.85rem;">' + (data.clOrdId || '(无打标)') + '</span></div>';
             html += '<div class="fmt-card"><span class="fmt-label">📊 币种</span><span class="fmt-value">' + (data.instId || '') + '</span></div>';
             html += '<div class="fmt-card"><span class="fmt-label">🔖 状态</span><span class="fmt-value">' + orderStateLabel(data.state) + '</span></div>';
             html += '</div>';
@@ -620,7 +627,8 @@
             let html = '<table class="fmt-table"><thead><tr><th>订单ID</th><th>币种</th><th>方向</th><th>价格</th><th>数量</th><th>成交价</th><th>成交量</th><th>类型</th><th>状态</th><th>创建时间</th><th>更新时间</th></tr></thead><tbody>';
             data.forEach(function(o) {
                 html += '<tr>';
-                html += '<td style="font-size:0.75rem;color:#888;">' + (o.ordId || '') + '</td>';
+                html += '<td style="font-size:0.75rem;color:#888;">' + (o.ordId || '')
+                    + clOrdIdLine(o.clOrdId) + '</td>';
                 html += '<td><strong>' + (o.instId || '') + '</strong></td>';
                 html += '<td>' + sideLabel(o.side) + '</td>';
                 html += '<td>' + toFixed(o.px, 2) + '</td>';
@@ -744,6 +752,12 @@
     }
     function posSideLabel(s) {
         return s === 'long' ? '多头' : s === 'short' ? '空头' : s === 'net' ? '单向' : (s || '');
+    }
+    // 客户订单号：下单时本侧打标（trade_executor.gen_cl_ord_id），排障时靠它认出
+    // 这笔交易所订单是「哪一轮、哪个篮子」下的。没有打标的（手工单/打标上线前旧单）留空。
+    function clOrdIdLine(cid) {
+        if (!cid) return '';
+        return '<br><span style="color:#5b9fd4;word-break:break-all;" title="客户订单号 clOrdId">' + cid + '</span>';
     }
     function ordTypeLabel(t) {
         const map = { limit: '限价单', market: '市价单', post_only: '只做Maker', fok: '全部成交或取消', ioc: '立即成交并取消', optimal_limit_ioc: '最优限价IOC' };

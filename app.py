@@ -32,12 +32,14 @@ from crypto.app import app
 from crypto.web_auth import configured_token as _web_token
 
 if __name__ == '__main__':
-    # 监听地址/端口可用环境变量覆盖（默认仍 0.0.0.0 + 5000，兼容现有部署）。
+    # 监听地址/端口可用环境变量覆盖（默认 0.0.0.0 + 7777）。
+    # 注：不要用 6000——它被 Chrome/Edge 列入“不安全端口”黑名单（X11），
+    # 浏览器会直接拒连并报 ERR_UNSAFE_PORT；7777 合法。
     # 安全不靠改这里：真正兜底的是 crypto/web_auth.py 的访问闸门——
     # 没配口令时远程一律 403（等价于只绑本机），配了口令时远程输口令进入，
     # 因此绑 0.0.0.0 也不再是“实盘接口裸奔”。
     _host = (os.environ.get('CRYPTO_WEB_HOST') or '0.0.0.0').strip()
-    _port = int(os.environ.get('CRYPTO_WEB_PORT') or 5000)
+    _port = int(os.environ.get('CRYPTO_WEB_PORT') or 7777)
 
     print("[启动] 前后端分离服务已启动！")
     print(f"[启动] 请在浏览器访问: http://127.0.0.1:{_port}")

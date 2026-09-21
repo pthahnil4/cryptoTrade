@@ -112,6 +112,27 @@ def main():
         assert not repo.delete_record(s, 999999999), '不存在的记录应返回 False'
     print('[7] 删除正常，测试数据已清理')
 
+    # 8. 批量删除（delete_records）：新增 3 条一次性删除，混合不存在 id 验证计数
+    batch_ids = []
+    with session_scope() as s:
+        for i in range(3):
+            batch_ids.append(repo.add_record(s, {
+                'ts': ts_now, 'inst_id': 'SMOKE-BATCH-USDT-SWAP', 'price': 1.0 + i,
+                'short_period': '5m', 'long_period': '4H',
+                'short_dir': 'long', 'long_dir': 'long', 'long_dir_prev': None,
+                'atr_pct': 0.5, 'user_judgment': 'watch', 'user_reason': '冒烟-批量删除',
+            }))
+    with session_scope() as s:
+        deleted = repo.delete_records(s, batch_ids + [999999998])  # 含 1 个不存在 id
+        assert deleted == 3, f'批量删除应删除 3 条，实际 {deleted}'
+    with session_scope() as s:
+        left = repo.query_records(s, inst_id='SMOKE-BATCH-USDT-SWAP')
+        assert not left, '批量删除后仍残留记录'
+    with session_scope() as s:
+        assert repo.delete_records(s, []) == 0, '空 id 列表应返回 0 且不报错'
+        assert repo.delete_records(s, [999999997]) == 0, '全部不存在 id 应返回 0'
+    print('[8] 批量删除正常（含不存在 id 自动忽略、空列表安全）')
+
     print('\n===== 冒烟测试通过 =====')
 
 
